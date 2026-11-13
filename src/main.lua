@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.14"
+local VERSION = "0.1.15"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -716,6 +716,15 @@ local function moveTo(x, y, worldName, token, onStep)
     local farmNavigation = App.job == "plant" or App.job == "harvest"
     local timeout = farmNavigation and math.max(90, App.config.options.moveTimeout) or App.config.options.moveTimeout
     local deadline, banned, replans = os.clock() + timeout, {}, 0
+    local function collectionStep(state)
+        if not onStep then return true, 0 end
+        local started = os.clock()
+        local proceed = onStep(state)
+        local waited = os.clock() - started
+        -- Pickup waiting has its own timeout and is not a failed walking step.
+        deadline = deadline + waited
+        return proceed ~= false, waited
+    end
     -- Waypoints and the final destination must agree. A looser waypoint
     -- tolerance can otherwise accept an empty route without ever moving.
     local function reached(state, tx, ty)
@@ -725,7 +734,8 @@ local function moveTo(x, y, worldName, token, onStep)
     while true do
         worldCheck(worldName, token)
         local state = position()
-        if onStep and onStep(state) == false then hold.direction, hold.jump = 0, false; return false end
+        if not collectionStep(state) then hold.direction, hold.jump = 0, false; return false end
+        state = position()
         if reached(state, targetX, targetY) then hold.direction, hold.jump = 0, false; return end
         assert(os.clock() < deadline, "Could not reach the saved position. Check stepping platforms and door access.")
         hold.direction, hold.jump = 0, false
@@ -753,7 +763,10 @@ local function moveTo(x, y, worldName, token, onStep)
             while true do
                 worldCheck(worldName, token)
                 state = position()
-                if onStep and onStep(state) == false then hold.direction, hold.jump = 0, false; return false end
+                local proceed, waited = collectionStep(state)
+                began, movedAt = began + waited, movedAt + waited
+                if not proceed then hold.direction, hold.jump = 0, false; return false end
+                state = position()
                 if reached(state, waypoint.x + 0.5, waypoint.y + 1) then break end
                 assert(os.clock() < deadline, "Returning to the saved position timed out. Check the route.")
                 if UserInputService:GetFocusedTextBox() then
@@ -1175,7 +1188,7 @@ local function runHarvest(token)
         refreshInventory(token)
         local storedBefore = App.stats.stashed
         local attempts, retryAt, needsApproach, approached = {}, {}, {}, {}
-        local sweepRow, sweepX, sweepDirection, movingBatch
+        local sweepRow, sweepX, sweepDirection
         local rangeLimited, emptySince = false, nil
         local deadline = os.clock() + App.config.options.actionTimeout
         local function selected(drop)
@@ -1203,35 +1216,54 @@ local function runHarvest(token)
             end
             return accepted
         end
-        local function finishMovingBatch(wait)
-            if movingBatch and (wait or movingBatch.done) then
-                local request = movingBatch
-                movingBatch = nil
-                applyResults(awaitRequest(request, os.clock() + App.config.options.actionTimeout, token))
-            end
-        end
-        local function collectWhileMoving(state)
-            finishMovingBatch(false)
-            if state.grounded then
-                sweepRow, sweepX = math.floor(state.y - 0.01), state.x
-                if r.inventory:room(id) <= 0 then return false end
-            end
-            if movingBatch then return end
-            local targets = {}
+        local function collectOnRoute(state)
+            if not state.grounded then return end
+            sweepRow, sweepX = math.floor(state.y - 0.01), state.x
+            if r.inventory:room(id) <= 0 then return false end
+            local focus, found = {}, false
             for _, drop in pairs(r.world.dropList()) do
-                if selected(drop) then
-                    retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
-                    if not drop.pending and not drop.taking and near(state, drop) and math.abs(drop.x - state.x) <= 0.55
-                        and os.clock() >= math.max(drop.readyAt or 0, retryAt[drop.uid])
-                        and (attempts[drop.uid] or 0) < 3 then table.insert(targets, drop) end
+                if selected(drop) and near(state, drop) and math.abs(drop.x - state.x) <= 0.55 then
+                    focus[drop.uid], found = true, true
                 end
             end
-            if #targets > 0 then
-                movingBatch = beginRequest(function()
-                    return takeDropBatch(box, targets, attempts, retryAt, function(drop)
-                        return selected(drop) and not drop.pending and not drop.taking and near(position(), drop)
+            if not found then return end
+            -- Stop advancing until these stacks are gone, including late replies,
+            -- partial takes and additional batches at the same pickup position.
+            local hold = takeControls()
+            hold.direction, hold.jump = 0, false
+            local pickupDeadline = os.clock() + App.config.options.actionTimeout
+            while true do
+                worldCheck(box.world, token)
+                state = position()
+                sweepRow, sweepX = math.floor(state.y - 0.01), state.x
+                if r.inventory:room(id) <= 0 then return false end
+                local targets, remaining = {}, false
+                for _, drop in pairs(r.world.dropList()) do
+                    if selected(drop) and near(state, drop) then
+                        if math.abs(drop.x - state.x) <= 0.55 then focus[drop.uid] = true end
+                        if focus[drop.uid] then
+                            remaining = true
+                            retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
+                            assert((attempts[drop.uid] or 0) < 3,
+                                "The server refused harvested drop uid " .. drop.uid .. " at " .. drop.x .. ", " .. drop.y
+                                    .. ". Check pickup reach and access; copy diagnostics.")
+                            if not drop.pending and not drop.taking
+                                and os.clock() >= math.max(drop.readyAt or 0, retryAt[drop.uid]) then
+                                table.insert(targets, drop)
+                            end
+                        end
+                    end
+                end
+                if not remaining then return end
+                assert(os.clock() < pickupDeadline,
+                    "Nearby harvested stacks did not finish collecting. Check pending drops and copy diagnostics.")
+                if #targets > 0 then
+                    local results = takeDropBatch(box, targets, attempts, retryAt, function(drop)
+                        return selected(drop) and focus[drop.uid] and not drop.pending and not drop.taking and near(position(), drop)
                     end, token, function(_, _, amount) App.stats.harvested = App.stats.harvested + amount end)
-                end)
+                    if applyResults(results) then pickupDeadline = os.clock() + App.config.options.actionTimeout
+                    else pause(0.05, token) end
+                else pause(0.05, token) end
             end
         end
         local function returnToStorage()
@@ -1264,7 +1296,6 @@ local function runHarvest(token)
             assert(count(id) == beforeCount, "Backpack blocks changed during respawn. Check inventory before restarting harvest.")
         end
         local function stash()
-            finishMovingBatch(true)
             if count(id) == 0 then return end
             returnToStorage()
             setStatus("Storing harvested " .. r.items[id].name .. " in Farm storage...")
@@ -1374,8 +1405,7 @@ local function runHarvest(token)
                         if math.floor(drop.y) == goal.y and (tileX - goal.x) * sweepDirection > 0
                             and (edge - tileX) * sweepDirection >= 0 then goal.x = tileX end
                     end
-                    moveTo(goal.x, goal.y, box.world, token, collectWhileMoving)
-                    finishMovingBatch(true)
+                    moveTo(goal.x, goal.y, box.world, token, collectOnRoute)
                     needsApproach[nextDrop.uid], approached[nextDrop.uid] = nil, true
                     deadline = os.clock() + App.config.options.actionTimeout
                     pause(0.03, token)

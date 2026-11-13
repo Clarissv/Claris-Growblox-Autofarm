@@ -1901,21 +1901,105 @@ test("A long straight movement keeps heading without braking and reversing at ea
     assert(math.abs(f.avatar.x - 25.5) < 0.16 and f.controls.dir() == 0)
 end)
 
-test("Harvest collects successive row drops while moving in one direction", function()
+test("Harvest clears successive row drops in one direction before continuing", function()
     local f = harvestFixture()
     local map = harvestFloor(f)
     attachPhysics(f,map)
     for uid=1,3 do f.addDrop(uid,954,10,5.5-uid,8.5) end
-    local accepted, moving = {},0
+    local accepted = {}
     f.accept = function(drop,want)
         if math.abs(drop.x-f.avatar.x)>0.6 then return 0 end
         accepted[#accepted+1]=drop.uid
-        if f.controls.dir()<0 then moving=moving+1 end
+        assert(f.controls.dir()==0,"The player must hold position during pickup settlement")
         return want
     end
     f.harvest()
     assert(#accepted==3 and accepted[1]==1 and accepted[2]==2 and accepted[3]==3)
-    assert(moving>=2 and #f.drops==0 and f.app.stats.stashed==30)
+    assert(#f.drops==0 and f.app.stats.stashed==30)
+end)
+
+test("Harvest does not pass a partially collected stack while its pickup replies are delayed", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    attachPhysics(f,map)
+    local stack=f.addDrop(1,954,6,4.5,8.5)
+    f.addDrop(2,954,2,2.5,8.5)
+    f.accept=function(drop,want)
+        if math.abs(drop.x-f.avatar.x)>0.8 then return 0 end
+        task.wait(0.2)
+        return math.min(want,2)
+    end
+    local physics=f.onWait
+    f.onWait=function(dt)
+        physics(dt)
+        assert(f.avatar.x>=3.5 or stack.n==0,"The player passed a stack before all pickup replies removed it")
+    end
+    f.harvest()
+    assert(#f.drops==0 and f.app.stats.stashed==8)
+end)
+
+test("Harvest waits for a not-yet-ready nearby stack before advancing along the row", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    attachPhysics(f,map)
+    local stack=f.addDrop(1,954,10,4.5,8.5)
+    f.addDrop(2,954,2,2.5,8.5)
+    f.accept=function(drop,want) return math.abs(drop.x-f.avatar.x)<=0.8 and want or 0 end
+    local physics,delayed=f.onWait,false
+    f.onWait=function(dt)
+        physics(dt)
+        if not delayed and math.abs(f.avatar.x-stack.x)<=0.6 then
+            stack.readyAt,stack.pending,delayed=os.clock()+1,true,true
+        end
+        if delayed and os.clock()>=stack.readyAt then stack.pending=false end
+        assert(f.avatar.x>=3.5 or stack.n==0,"The player ran past a stack whose readiness delay had not finished")
+    end
+    f.harvest()
+    assert(delayed and #f.drops==0 and f.app.stats.stashed==12)
+end)
+
+test("Harvest clears more than eight nearby UIDs before leaving the pickup position", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    attachPhysics(f,map)
+    for uid=1,12 do f.addDrop(uid,954,1,4.5,8.5) end
+    f.addDrop(13,954,1,2.5,8.5)
+    f.accept=function(drop,want)
+        if math.abs(drop.x-f.avatar.x)>0.8 then return 0 end
+        task.wait(0.3)
+        return want
+    end
+    local physics=f.onWait
+    f.onWait=function(dt)
+        physics(dt)
+        if f.avatar.x<3.5 then
+            for _,drop in ipairs(f.drops) do
+                assert(drop.x~=4.5,"The player left UIDs behind after filling its eight-request batch")
+            end
+        end
+    end
+    f.harvest()
+    assert(#f.drops==0 and f.app.stats.stashed==13)
+    assert(not table.concat(f.app.logs,"\n"):find("Trying another route",1,true),
+        "Waiting for pickup batches must not mark the walking route as failed")
+end)
+
+test("Stopping while a nearby stack is pending keeps it in the world without moving past it", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    attachPhysics(f,map)
+    local stack=f.addDrop(1,954,10,4.5,8.5)
+    f.accept=function() return 0 end
+    local physics,waiting=f.onWait,false
+    f.onWait=function(dt)
+        physics(dt)
+        if math.abs(f.avatar.x-stack.x)<=0.6 then
+            stack.pending,waiting=true,true
+            if f.controls.dir()==0 then f.app:stop() end
+        end
+    end
+    rejects(f.harvest,"Stopped")
+    assert(waiting and stack.n==10 and f.avatar.x>=3.5 and f.app.stats.stashed==0 and f.app.pending==0)
 end)
 
 test("Harvest respawns after pickups settle and deposits the preserved backpack", function()
