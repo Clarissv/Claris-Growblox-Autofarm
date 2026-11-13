@@ -224,10 +224,14 @@ test("Mixed farm storage is rejected before a mutating withdrawal", function()
     rejects(function() f.hooks.withdraw(f.app.config.points.farmBox, 954, 1) end, "different item")
 end)
 
-test("Optimistic placement without a server acknowledgment cannot advance the farm", function()
+test("Optimistic placement without server inventory consumption cannot advance the farm", function()
     local f = fixture()
     f.inventory:add(954, 5)
     local called = false
+    f.server = function(name)
+        assert(name == "GetInventory")
+        return { slots = {{954, 5}}, capacity = 54 }
+    end
     f.app.runtime.handlers = {
         canPlace = function() return true end,
         setTile = function(layer, x, y, id)
@@ -236,32 +240,90 @@ test("Optimistic placement without a server acknowledgment cannot advance the fa
             f.world.fg[y][x] = id
         end,
     }
-    rejects(function() f.hooks.placeTile({x = 10, y = 7}, 954, 1) end, "No server confirmation")
+    f.hooks.takeControls()
+    rejects(function() f.hooks.placeTile({x = 10, y = 7}, 954, 1) end, "server did not consume")
     assert(called and f.world.fg[7][10] == 954)
-    assert(f.inventory:count(954) == 4 and f.app.stats.broken == 0)
+    assert(f.inventory:count(954) == 5 and f.app.stats.broken == 0)
+    assert(not f.app.controls.pausePickup)
 end)
 
-test("A fresh acknowledgment from the current grid confirms placement", function()
+test("Several placements continue without tile echoes when the server consumes each block", function()
     local f = fixture()
     f.inventory:add(954, 5)
+    local serverCount, placements = 5, 0
+    f.server = function(name)
+        assert(name == "GetInventory")
+        return { slots = {{954, serverCount}}, capacity = 54 }
+    end
     f.app.runtime.handlers = {
         canPlace = function() return true end,
         setTile = function(_, x, y, id)
             f.world.fg[y][x] = id
-            f.onWait = function()
-                f.app.tileEvents[y * f.world.w + x] = {serial = 1, id = id, world = "BREAK", fg = f.world.fg}
-            end
+            serverCount, placements = serverCount - 1, placements + 1
         end,
     }
-    f.hooks.placeTile({x = 10, y = 7}, 954, 1)
-    assert(f.inventory:count(954) == 4)
+    f.hooks.takeControls()
+    for x = 8, 10 do f.hooks.placeTile({x = x, y = 7}, 954, 1) end
+    assert(serverCount == 2 and placements == 3 and f.inventory:count(954) == 2)
+    assert(not f.app.controls.pausePickup)
 end)
 
-test("Acknowledgments from an old world grid are ignored", function()
+test("A correction during the settling period stops the action", function()
     local f = fixture()
     f.world.fg[7][10] = 954
-    f.app.tileEvents[7 * f.world.w + 10] = {serial = 3, id = 954, world = "BREAK", fg = {}}
-    rejects(function() f.hooks.waitTile(10, 7, 954, 0, "BREAK", 1) end, "No server confirmation")
+    f.onWait = function() f.world.fg[7][10] = 0 end
+    rejects(function() f.hooks.settleTile(10, 7, 954, 0.2, "BREAK", 1) end, "changed while the action settled")
+end)
+
+test("One full ten-block PNB batch places and breaks without tile echoes", function()
+    local f = fixture()
+    f.inventory:add(954, 10)
+    f.avatar.x = 10.5
+    f.app.config.points.blockBox.standX = 10
+    f.boxes[12] = {}
+    local serverCount, placements, hits = 10, 0, {}
+    f.server = function(name)
+        assert(name == "GetInventory", "Empty storage should not cause a withdrawal request")
+        return {slots = {{954, serverCount}}, capacity = 54}
+    end
+    f.app.runtime.handlers = {
+        canPlace = function() return true end,
+        setTile = function(layer, x, y, id)
+            assert(layer == "fg" and f.world.fg[y][x] == 0)
+            f.world.fg[y][x] = id
+            serverCount, placements = serverCount - 1, placements + 1
+        end,
+        hit = function(x, y)
+            local key = y * f.world.w + x
+            hits[key] = (hits[key] or 0) + 1
+            if hits[key] == 2 then f.world.fg[y][x] = 0 end
+        end,
+    }
+    f.hooks.takeControls()
+    f.hooks.runPNB(1)
+    assert(placements == 10 and f.app.stats.broken == 10 and serverCount == 0)
+    for _, cell in ipairs(f.hooks.Core.grid(f.app.config.points.pnb)) do
+        assert(f.world.fg[cell.y][cell.x] == 0 and hits[cell.y * f.world.w + cell.x] == 2)
+    end
+end)
+
+test("Stop during placement releases pickup suppression and prevents another placement", function()
+    local f = fixture()
+    f.inventory:add(954, 5)
+    local serverCount, placements = 5, 0
+    f.server = function() return {slots = {{954, serverCount}}, capacity = 54} end
+    f.app.runtime.handlers = {
+        canPlace = function() return true end,
+        setTile = function(_, x, y, id)
+            f.world.fg[y][x] = id
+            serverCount, placements = serverCount - 1, placements + 1
+        end,
+    }
+    local originalTake = f.world.takeDrop
+    f.hooks.takeControls()
+    f.onWait = function() f.onWait = nil; f.app:stop() end
+    rejects(function() f.hooks.placeTile({x = 10, y = 7}, 954, 1) end, "Stopped")
+    assert(placements == 1 and f.app.controls == nil and f.world.takeDrop == originalTake)
 end)
 
 local function moduleMap(f)

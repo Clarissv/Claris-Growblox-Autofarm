@@ -131,7 +131,7 @@ end
 return Core
 
 end)()
-local VERSION = "0.1.1"
+local VERSION = "0.1.2"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -189,7 +189,7 @@ end
 local App = {
     alive = true, job = nil, token = 0, pending = 0, configuring = false,
     config = Core.defaults(), profile = "Default", status = "Connecting to Growblox...",
-    logs = {}, controls = nil, runtime = nil, resume = nil, tileEvents = {},
+    logs = {}, controls = nil, runtime = nil, resume = nil,
     connectionError = nil, discoveryReport = {},
     stats = { broken = 0, trips = 0, moved = 0 },
 }
@@ -458,16 +458,8 @@ local function discover()
         readInventoryView = readInventoryView, ready = #issues == 0 }
     table.insert(App.discoveryReport, "Inventory: " .. (readInventoryView and "readable snapshot" or "live backpack"))
     table.insert(App.discoveryReport, "Farming hooks: " .. (#issues == 0 and "ready" or table.concat(issues, " ")))
-    -- ByteNet's listener teardown contract is unknown; invalidate callbacks on reconnect/unload.
-    packets.tileChanged.listen(function(message)
-        if App.alive and App.runtime == runtime and message.layer == 1
-            and message.w == packets.worldTag(world.name or "") then
-            local key = message.y * world.w + message.x
-            local previous = App.tileEvents[key]
-            App.tileEvents[key] = { serial = (previous and previous.serial or 0) + 1,
-                id = message.id, world = world.name, fg = world.fg }
-        end
-    end)
+    -- The game already owns tileChanged handling. Own actions are optimistic and
+    -- need not receive an echo; do not add a listener or require an acknowledgment.
     return runtime
 end
 
@@ -568,13 +560,14 @@ local function takeControls()
     local controls = runtime().controls
     local world = runtime().world
     local hold = { table = controls, dir = controls.dir, jumping = controls.jumping, direction = 0, jump = false,
-        world = world, displayTake = world.displayTake, takeDrop = world.takeDrop, autoTakes = 0, syncing = false }
+        world = world, displayTake = world.displayTake, takeDrop = world.takeDrop, autoTakes = 0,
+        syncing = false, pausePickup = false }
     hold.dirOverride = function() return hold.direction end
     hold.jumpOverride = function() return hold.jump end
     controls.dir, controls.jumping = hold.dirOverride, hold.jumpOverride
     hold.displayOverride = function() end
     hold.takeOverride = function(...)
-        if hold.syncing then return 0 end
+        if hold.syncing or hold.pausePickup then return 0 end
         hold.autoTakes = hold.autoTakes + 1
         local result = table.pack(pcall(hold.takeDrop, ...))
         task.defer(function() hold.autoTakes = hold.autoTakes - 1 end)
@@ -732,44 +725,56 @@ local function enterDoor(door, destination, nextPhase, cargo, token)
     end
     pause(0.5, token)
     worldCheck(destination.world, token)
-    App.tileEvents = {}
 end
 
-local function tileSerial(x, y)
-    local r = runtime()
-    local event = App.tileEvents[y * r.world.w + x]
-    return event and event.serial or 0
-end
-local function waitTile(x, y, id, serial, worldName, token)
-    local r = runtime()
-    local grid = r.world.fg
-    local deadline = os.clock() + App.config.options.actionTimeout
-    while true do
+local function settleTile(x, y, id, seconds, worldName, token)
+    local deadline = os.clock() + seconds
+    repeat
         worldCheck(worldName, token)
-        local event = App.tileEvents[y * r.world.w + x]
-        if event and event.serial > serial and event.id == id and event.world == worldName
-            and event.fg == grid and tileAt(x, y) == id then return end
-        assert(os.clock() < deadline, "No server confirmation for tile " .. x .. ", " .. y .. ". Stopping.")
+        assert(tileAt(x, y) == id, "Tile " .. x .. ", " .. y .. " changed while the action settled. Stopping.")
         pause(0.03, token)
-    end
+    until os.clock() >= deadline
+end
+local function withoutPickups(fn)
+    local hold = App.controls
+    local previous = hold and hold.pausePickup
+    if hold then hold.pausePickup = true end
+    local result = table.pack(pcall(fn))
+    if hold then hold.pausePickup = previous end
+    assert(result[1], tostring(result[2]))
+    return table.unpack(result, 2, result.n)
 end
 local function placeTile(point, id, token)
-    local r = worldCheck(App.config.points.pnb.world, token)
-    assert(tileAt(point.x, point.y) == 0, "The PNB grid contains another block.")
-    assert(r.handlers.canPlace(r.items[id], point.x, point.y),
-        "Cannot place at " .. point.x .. ", " .. point.y .. ". Check reach, access, and empty tiles.")
-    assert(count(id) > 0, "No blocks are left in your backpack.")
-    local serial = tileSerial(point.x, point.y)
-    r.handlers.setTile("fg", point.x, point.y, id, false, (position().facing or 1) < 0)
-    r.inventory:remove(id, 1)
-    waitTile(point.x, point.y, id, serial, r.world.name, token)
-    pause(App.config.options.placeDelay, token)
+    return withoutPickups(function()
+        local name = App.config.points.pnb.world
+        local r = worldCheck(name, token)
+        -- Quiesce automatic pickups so a server inventory delta identifies this
+        -- placement rather than a concurrently collected copy of the same block.
+        local before = refreshInventory(token)[id] or 0
+        assert(tileAt(point.x, point.y) == 0, "The PNB grid contains another block.")
+        assert(r.handlers.canPlace(r.items[id], point.x, point.y),
+            "Cannot place at " .. point.x .. ", " .. point.y .. ". Check reach, access, and empty tiles.")
+        assert(before > 0, "No blocks are left in your backpack.")
+        r.handlers.setTile("fg", point.x, point.y, id, false, (position().facing or 1) < 0)
+        r.inventory:remove(id, 1)
+        pause(App.config.options.placeDelay, token)
+        local deadline = os.clock() + App.config.options.actionTimeout
+        while true do
+            worldCheck(name, token)
+            local after = refreshInventory(token)[id] or 0
+            if after == before - 1 then break end
+            assert(after == before, "Backpack changed unexpectedly while placing. Stopping.")
+            assert(os.clock() < deadline, "The server did not consume a block for tile "
+                .. point.x .. ", " .. point.y .. ". Check placement access and range.")
+            pause(0.15, token)
+        end
+        settleTile(point.x, point.y, id, 0.12, name, token)
+    end)
 end
 local function breakTile(point, id, token)
     local name = App.config.points.pnb.world
     local r = worldCheck(name, token)
     assert(tileAt(point.x, point.y) == id, "The target tile changed. Stopping before punching another block.")
-    local serial = tileSerial(point.x, point.y)
     local deadline = os.clock() + App.config.options.actionTimeout + (r.items[id].hits or 1) * App.config.options.punchDelay
     pause(0.32, token) -- Growblox ignores hits during its initial placement grace period.
     while tileAt(point.x, point.y) == id do
@@ -783,7 +788,10 @@ local function breakTile(point, id, token)
         pause(App.config.options.punchDelay, token)
     end
     assert(tileAt(point.x, point.y) == 0, "The block changed while breaking.")
-    waitTile(point.x, point.y, 0, serial, name, token)
+    -- Match the normal client's hit completion. Allow its optimistic deletion to
+    -- settle and observe corrections; the following cycle reconciles inventory.
+    -- A tileChanged echo is not a required response to an own-player break.
+    settleTile(point.x, point.y, 0, math.max(0.18, App.config.options.punchDelay), name, token)
     App.stats.broken = App.stats.broken + 1
 end
 
@@ -961,7 +969,7 @@ if env.ClarisGrowbloxTest then
         runTransfer = runTransfer, runPNB = runPNB, refreshInventory = refreshInventory,
         withdraw = withdraw, deposit = deposit, releaseControls = releaseControls,
         takeControls = takeControls, collectDrops = collectDrops, enterDoor = enterDoor,
-        waitTile = waitTile, placeTile = placeTile, resolveRegistry = resolveRegistry,
+        settleTile = settleTile, placeTile = placeTile, breakTile = breakTile, resolveRegistry = resolveRegistry,
         discover = discover, connectGame = connectGame, runtime = runtime }
 end
 
@@ -1254,7 +1262,6 @@ end
 ui.diagnostics = settingsTab:Paragraph({ Title = "Game connection", Desc = "Connecting..." })
 local function reconnect()
     releaseControls()
-    App.tileEvents = {}
     App.runtime = connectGame()
     App.syncingUI = true
     refreshBlocks()

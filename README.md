@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.1.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.2.
+
+Version 0.1.2 fixes Place & Break stopping after one block while waiting for a `tileChanged` echo. Placement is confirmed by a server inventory delta while automatic pickups are paused. Breaking uses the normal client hit completion and a short correction-settling period. The script leaves the game's existing tile-change listener intact.
 
 Version 0.1.1 fixes startup when Delta's `shared` table differs from the game's `shared` table. It resolves the module map through the game's runtime environment or GC tables, loads the inventory independently of missing farming hooks, and retains the original connection error in diagnostics.
 
