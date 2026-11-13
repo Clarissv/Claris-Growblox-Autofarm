@@ -2,7 +2,7 @@
 local Core = {}
 Core.VERSION = 1
 Core.REPO = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/"
-Core.POINTS = { "pnb", "blockBox", "seedBox", "farmBox", "farmDoor", "breakDoor" }
+Core.POINTS = { "pnb", "blockBox", "seedBox", "farmBox", "farmDoor", "breakDoor", "plantBox" }
 Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest" }
 Core.LIMITS = {
     placeDelay = { 0.15, 2 }, punchDelay = { 0.22, 2 },
@@ -17,6 +17,7 @@ function Core.defaults()
             actionTimeout = 10, moveTimeout = 30, seedThreshold = 200, antiAFK = true, autoRejoin = true,
             moveAfterHarvest = false },
         webhook = { url = "", enabled = false, intervalMinutes = 5, includeBoxes = true },
+        planting = {seedId = 0, storageWorld = "", worlds = {}},
     }
 end
 
@@ -61,12 +62,49 @@ function Core.validateWebhook(input)
     return out
 end
 
+function Core.worldName(value)
+    assert(type(value) == "string", "Enter a world name.")
+    local name = value:match("^%s*(.-)%s*$"):upper()
+    assert(#name > 0 and #name <= 48 and name:match("^[%w_%-]+$"), "Use a world name with 1-48 letters, digits, underscores, or hyphens.")
+    return name
+end
+
+function Core.parseWorlds(value)
+    assert(type(value) == "string", "Enter farm worlds separated by commas.")
+    local worlds, seen = {}, {}
+    for part in value:gmatch("[^,;\r\n]+") do
+        if part:match("%S") then
+            local name = Core.worldName(part)
+            if not seen[name] then table.insert(worlds, name); seen[name] = true end
+        end
+    end
+    assert(#worlds <= 50, "Use at most 50 farm worlds.")
+    return worlds
+end
+
+function Core.validatePlanting(input)
+    if input == nil then return Core.defaults().planting end
+    assert(type(input) == "table" and integer(input.seedId, 0, 65535)
+        and type(input.storageWorld) == "string" and type(input.worlds) == "table", "Invalid planting settings.")
+    local out = {seedId = input.seedId, storageWorld = input.storageWorld == "" and "" or Core.worldName(input.storageWorld), worlds = {}}
+    local seen = {}
+    for index, value in pairs(input.worlds) do
+        assert(integer(index, 1, #input.worlds), "Invalid farm world list.")
+        local name = Core.worldName(value)
+        assert(not seen[name], "Duplicate farm world: " .. name)
+        seen[name], out.worlds[index] = true, name
+    end
+    assert(#out.worlds <= 50, "Use at most 50 farm worlds.")
+    return out
+end
+
 function Core.validate(input)
     assert(type(input) == "table" and input.version == Core.VERSION, "Unsupported or damaged profile.")
     assert(integer(input.blockId, 0, 65535), "Invalid block ID in profile.")
     assert(type(input.points) == "table" and type(input.options) == "table", "Incomplete profile.")
     local out = Core.defaults()
     out.webhook = Core.validateWebhook(input.webhook)
+    out.planting = Core.validatePlanting(input.planting)
     out.blockId = input.blockId
     for key, limits in pairs(Core.LIMITS) do
         local value = input.options[key]
@@ -146,8 +184,39 @@ function Core.itemCount(rows, itemId)
     return total
 end
 
+function Core.plantingTile(world, items, x, y)
+    if x < 0 or x >= world.w or y < 0 or y >= world.h - 1 then return false end
+    if not world.fg[y] or world.fg[y][x] ~= 0 then return false end
+    local below = items[world.fg[y + 1] and world.fg[y + 1][x] or 0]
+    return below ~= nil and (below.solid == true or below.platform == true)
+end
+
+function Core.plantingTiles(world, items)
+    local tiles, rows = {}, 0
+    for y = 0, world.h - 2 do
+        local row = {}
+        for x = 0, world.w - 1 do
+            if Core.plantingTile(world, items, x, y) then table.insert(row, {x = x, y = y}) end
+        end
+        if #row > 0 then
+            rows = rows + 1
+            for n = 1, #row do table.insert(tiles, row[rows % 2 == 1 and n or #row - n + 1]) end
+        end
+    end
+    return tiles
+end
+
 function Core.checkSetup(config, mode, items)
-    assert(mode == "pnb" or mode == "transfer" or mode == "harvest", "Unknown farming task.")
+    assert(mode == "pnb" or mode == "transfer" or mode == "harvest" or mode == "plant", "Unknown farming task.")
+    if mode == "plant" then
+        local p = Core.validatePlanting(config.planting)
+        assert(items[p.seedId] and items[p.seedId].kind == "seed", "Choose a seed on the Planting tab.")
+        assert(p.storageWorld ~= "" and config.points.plantBox, "Save the planting seed Display Box and storage world first.")
+        assert(config.points.plantBox.world:upper() == p.storageWorld, "The saved seed Display Box must be in the entered storage world.")
+        assert(#p.worlds > 0, "Enter at least one dirt farm world.")
+        for _, name in ipairs(p.worlds) do assert(name ~= p.storageWorld, "Seed storage and dirt farm worlds must be different.") end
+        return true
+    end
     assert(Core.farmable(items[config.blockId]), "Choose a farmable block from your inventory.")
     local keys = mode == "pnb" and { "pnb", "blockBox", "seedBox" }
         or mode == "harvest" and { "farmBox" }

@@ -62,9 +62,14 @@ local function fixture()
             return seconds
         end,
     }
-    local hooks = (function()
+    local function loadScript()
 -- CLARIS_RUNTIME_SOURCE
-    end)()
+    end
+    local hooks = loadScript()
+    context.reload = function(keepPrevious)
+        if not keepPrevious then env.ClarisGrowbloxApp = nil end
+        return loadScript()
+    end
     context.hooks, context.env, context.files = hooks, env, files
     context.encoded = encoded
     local app = hooks.App
@@ -1182,7 +1187,7 @@ test("Pickup hook failures clear taking and restore native pickup suppression", 
 end)
 
 local function installToggles(f)
-    for _, mode in ipairs({"pnb", "transfer", "harvest"}) do
+    for _, mode in ipairs({"pnb", "transfer", "harvest", "plant"}) do
         local control = {Value = false, history = {}}
         function control:Set(value, callback, instant)
             assert(callback == false and instant == false)
@@ -1994,6 +1999,357 @@ test("Stopping during the empty-harvest settling check cancels automatic transfe
     f.hooks.start("harvest")
     assert(f.doors == 0 and not f.app.lastError and f.app.job == nil)
     assert(not f.app.runToggles.harvest.Value and not f.app.runToggles.transfer.Value)
+end)
+
+test("Unsaved current settings survive a fresh script instance through the session file", function()
+    local f = fixture()
+    f.app.profile, f.app.config.options.placeDelay = "My Farm", 0.6
+    f.app.config.planting = {seedId = 955, storageWorld = "STOCK", worlds = {"FARM1", "FARM2"}}
+    f.hooks.saveSession()
+    local next = f.reload()
+    assert(next.App.profile == "My Farm" and next.App.config.blockId == 954)
+    assert(next.App.config.options.placeDelay == 0.6 and next.App.config.points.farmDoor.world == "FARM")
+    assert(next.App.config.points.blockBox.x == 12 and next.App.config.planting.worlds[2] == "FARM2")
+    next.App.config.planting.worlds[1] = "OTHER"
+    assert(f.app.config.planting.worlds[1] == "FARM1")
+end)
+
+test("Reloading an existing idle app preserves its newest configuration", function()
+    local f = fixture()
+    f.hooks.saveSession()
+    f.app.job, f.app.config.options.collectDelay = nil, 0.8
+    f.app.profile = "Newest Setup"
+    local next = f.reload(true)
+    assert(next.App.profile == "Newest Setup" and next.App.config.options.collectDelay == 0.8 and not f.app.alive)
+end)
+
+test("A session from another account or a damaged profile cannot replace defaults", function()
+    local f = fixture()
+    f.hooks.saveSession()
+    f.player.UserId = 888
+    local next = f.reload()
+    assert(next.App.config.blockId == 0 and next.App.sessionRestoreError:find("another account", 1, true))
+    f.player.UserId = 1234
+    local record = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/session.json"])
+    record.config.options.placeDelay = -1
+    next = f.reload()
+    assert(next.App.config.blockId == 0 and next.App.sessionRestoreError:find("placeDelay", 1, true))
+end)
+
+test("Session write errors are visible and prevent an unprotected transfer entry", function()
+    local f = fixture()
+    writefile = function() error("disk full") end
+    f.hooks.pollSession()
+    assert(f.app.sessionSaveError:find("disk full", 1, true))
+    local used = false
+    f.world.call = function() used = true end
+    f.avatar.x, f.avatar.y = 13.5, 9
+    rejects(function() f.hooks.enterDoor(f.app.config.points.breakDoor, f.app.config.points.farmBox, "return", 0, 1) end, "disk full")
+    assert(not used)
+end)
+
+local function plantingFixture(seedCount, stockCount, worlds)
+    local f = fixture()
+    f.app.job, f.app.jobToken = nil, nil
+    f.app.config.planting = {seedId = 955, storageWorld = "STOCK", worlds = worlds or {"FARM1"}}
+    f.app.config.points.plantBox = {world = "STOCK", x = 6, y = 5, standX = 5, standY = 5}
+    f.world.w, f.world.h = 7, 8
+    f.grids, f.entries, f.plantCalls, f.withdrawals = {}, {}, {}, 0
+    for _, name in ipairs({"STOCK", "FARM1", "FARM2"}) do
+        local grid = {}
+        for y = 0, 7 do
+            grid[y] = {}
+            for x = 0, 6 do grid[y][x] = y == 6 and 2 or 0 end
+        end
+        f.grids[name] = grid
+    end
+    f.grids.STOCK[5][6] = 1422
+    f.world.name, f.world.fg = "FARM1", f.grids.FARM1
+    f.serverSeeds, f.stock = seedCount or 0, stockCount or 0
+    if f.serverSeeds > 0 then f.inventory:add(955, f.serverSeeds) end
+    f.world.displays.get = function(x, y)
+        if f.world.name == "STOCK" and x == 6 and y == 5 then return {{955, f.stock}} end
+    end
+    local function enter(name)
+        f.entries[#f.entries + 1] = name
+        f.world.name, f.world.fg = name, assert(f.grids[name])
+        f.avatar.active, f.avatar.dead, f.avatar.grounded = true, false, true
+        f.avatar.x, f.avatar.y, f.avatar.vx, f.avatar.vy = 0.5, 6, 0, 0
+        if f.onEnter then return f.onEnter(name) end
+        return true
+    end
+    f.world.enter = enter
+    f.nativeEnter = enter
+    f.avatar.x, f.avatar.y = 0.5, 6
+    f.app.runtime.body.solidAt = function(x, y)
+        if x < 0 or x >= f.world.w or y >= f.world.h then return true end
+        local item = f.app.runtime.items[f.world.fg[y] and f.world.fg[y][x] or 0]
+        return item and item.solid == true or false
+    end
+    f.server = function(name, x, y, id)
+        if name == "GetInventory" then return {slots = f.serverSeeds > 0 and {{955, f.serverSeeds}} or {}, capacity = 54} end
+        assert(name == "DisplayItem" and f.world.name == "STOCK" and x == 6 and y == 5 and id == nil)
+        f.withdrawals = f.withdrawals + 1
+        if f.denyStorage then return false, "Seed box access denied" end
+        local n = math.min(200 - f.serverSeeds, f.stock)
+        f.serverSeeds, f.stock = f.serverSeeds + n, f.stock - n
+        return true, {taken = {{955, n}}}
+    end
+    f.app.runtime.handlers = {
+        canPlace = function(item, x, y)
+            local a = f.avatar
+            return item.kind == "seed" and f.hooks.Core.plantingTile(f.world, f.app.runtime.items, x, y)
+                and math.abs(x + 0.5 - a.x) < 2 and math.abs(y + 0.5 - (a.y - 0.475)) < 2
+                and not (f.deniedX == x)
+        end,
+        plantSeed = function(id, x, y)
+            assert(f.app.runtime.handlers.canPlace(f.app.runtime.items[id], x, y))
+            assert(id == 955 and f.world.fg[y][x] == 0)
+            f.plantCalls[#f.plantCalls + 1] = {world = f.world.name, x = x, y = y}
+            f.world.fg[y][x] = id
+            f.inventory:remove(id, 1) -- The real native helper owns this optimistic removal.
+            if f.rejectPlant then f.world.fg[y][x] = 0 else f.serverSeeds = f.serverSeeds - 1 end
+            if f.onPlant then f.onPlant(id, x, y) end
+        end,
+    }
+    attachPhysics(f, f.hooks.navigationMap(f.app.runtime))
+    installToggles(f)
+    return f
+end
+
+test("Planting walks to empty supported cells while skipping doors, vents, trees, and floating corners", function()
+    local f = plantingFixture(20, 100)
+    f.app.runtime.items[100] = {name = "Air Vent", solid = false}
+    f.grids.FARM1[5][1], f.grids.FARM1[5][2], f.grids.FARM1[5][3] = 12, 100, 955
+    f.grids.FARM1[6][6] = 0
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(f.app.stats.planted == 3 and #f.plantCalls == 3 and f.withdrawals == 0)
+    for _, x in ipairs({0, 4, 5}) do assert(f.grids.FARM1[5][x] == 955) end
+    assert(f.grids.FARM1[5][1] == 12 and f.grids.FARM1[5][2] == 100 and f.grids.FARM1[5][6] == 0)
+    assert(f.app.job == nil and not f.app.runToggles.plant.Value and f.hooks.readPlantResume() == nil)
+end)
+
+test("Planting refills at zero seeds and advances through multiple farm worlds", function()
+    local f = plantingFixture(2, 400, {"FARM1", "FARM2"})
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(f.app.stats.planted == 14 and #f.plantCalls == 14 and f.withdrawals == 1)
+    assert(f.entries[1] == "STOCK" and f.entries[2] == "FARM1" and f.entries[3] == "FARM2")
+    assert(f.stock == 200 and f.serverSeeds == 188 and f.app.profile == "Default" and f.app.config.blockId == 954)
+    for _, name in ipairs({"FARM1", "FARM2"}) do for x = 0, 6 do assert(f.grids[name][5][x] == 955) end end
+end)
+
+test("An empty seed box ends planting without pretending remaining farms are full", function()
+    local f = plantingFixture(1, 0, {"FARM1", "FARM2"})
+    f.hooks.start("plant")
+    assert(not f.app.lastError and f.app.stats.planted == 1 and f.withdrawals == 0)
+    assert(f.app.status:find("seed storage box is empty", 1, true) and f.grids.FARM2[5][0] == 0)
+    assert(f.hooks.readPlantResume() == nil and not f.app.runToggles.plant.Value)
+end)
+
+test("Already filled farms advance without fetching unnecessary seeds", function()
+    local f = plantingFixture(0, 100, {"FARM1", "FARM2"})
+    for x = 0, 6 do f.grids.FARM1[5][x], f.grids.FARM2[5][x] = 955, 955 end
+    f.hooks.start("plant")
+    assert(not f.app.lastError and f.withdrawals == 0 and #f.plantCalls == 0 and f.world.name == "FARM2")
+end)
+
+test("Denied planting cells are skipped without consuming seeds or modifying obstacles", function()
+    local f = plantingFixture(10, 100)
+    f.deniedX = 2
+    f.hooks.start("plant")
+    assert(not f.app.lastError and f.app.stats.planted == 6 and f.grids.FARM1[5][2] == 0)
+    assert(f.serverSeeds == 4 and table.concat(f.app.logs, "\n"):find("1 tiles skipped", 1, true))
+end)
+
+test("Server seed rejection stops at one attempt and can be safely reconciled before retry", function()
+    local f = plantingFixture(10, 100)
+    f.rejectPlant = true
+    f.hooks.start("plant")
+    assert(f.app.lastError:find("did not confirm a planted seed", 1, true) and #f.plantCalls == 1)
+    local saved = f.hooks.readPlantResume()
+    assert(saved.state.pending.x == 0 and f.serverSeeds == 10 and f.app.stats.planted == 0)
+    f.rejectPlant = false
+    f.hooks.start("plant", saved)
+    assert(not f.app.lastError and f.app.stats.planted == 7 and f.serverSeeds == 3)
+end)
+
+test("Stopping immediately after native planting prevents further planting and restores controls", function()
+    local f = plantingFixture(10, 100)
+    local originalTake = f.world.takeDrop
+    f.onPlant = function() f.app:stop() end
+    f.hooks.start("plant")
+    assert(#f.plantCalls == 1 and not f.app.lastError and f.app.job == nil and f.app.controls == nil)
+    assert(f.world.takeDrop == originalTake and f.hooks.readPlantResume() == nil and not f.app.runToggles.plant.Value)
+end)
+
+test("A picker interruption after a consumed seed rejoins and reconciles before continuing", function()
+    local f = plantingFixture(10, 100)
+    f.onPlant = function()
+        f.onPlant = nil
+        f.world.name, f.avatar.active = "", false
+    end
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(f.app.stats.planted == 7 and #f.plantCalls == 7 and #f.entries == 1 and f.entries[1] == "FARM1")
+    assert(f.serverSeeds == 3 and not f.app.runToggles.plant.Value)
+end)
+
+test("Denied seed storage retains an ambiguous withdrawal checkpoint and refuses replay", function()
+    local f = plantingFixture(0, 100)
+    f.denyStorage = true
+    f.hooks.start("plant")
+    assert(f.app.lastError:find("Seed box access denied", 1, true) and f.withdrawals == 1)
+    local saved = f.hooks.readPlantResume()
+    assert(saved.state.phase == "pickupPending")
+    f.hooks.start("plant", saved)
+    assert(f.withdrawals == 1 and f.app.lastError:find("storage withdrawal was interrupted", 1, true))
+end)
+
+test("A server teleport stores farm index and restores the full configuration in a fresh instance", function()
+    local f = plantingFixture(0, 100, {"FARM1", "FARM2"})
+    f.app.profile = "Sugar Cane Farms"
+    f.onEnter = function() return true, nil, true end
+    local queued
+    queue_on_teleport = function(code) queued = code end
+    f.env.ClarisGrowbloxLoaderURL = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/loader.lua"
+    f.hooks.start("plant")
+    queue_on_teleport = nil
+    assert(f.app.teleporting and f.withdrawals == 0 and queued:find("ClarisGrowbloxAutoResume", 1, true))
+    local next = f.reload()
+    local saved = next.readPlantResume()
+    assert(next.App.profile == "Sugar Cane Farms" and next.App.config.points.farmDoor.world == "FARM")
+    assert(next.App.config.planting.seedId == 955 and next.App.config.planting.worlds[2] == "FARM2")
+    assert(saved.state.phase == "stock" and saved.state.worldIndex == 1 and saved.config.points.plantBox.x == 6)
+end)
+
+test("Planting checkpoints validate account, expiry, index, and pending placement evidence", function()
+    local f = plantingFixture(10, 100)
+    f.hooks.savePlantResume({worldIndex = 1, phase = "farm", skipped = {}, pending = {world = "FARM1", x = 0, y = 5, before = 10}})
+    local saved = f.hooks.readPlantResume()
+    saved.state.pending.world = "OTHER"
+    f.hooks.savePlantResume(saved.state)
+    rejects(function() f.hooks.readPlantResume() end, "pending seed world")
+    f.hooks.savePlantResume({worldIndex = 1, phase = "farm", skipped = {}})
+    local record = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/plant-resume.json"])
+    record.userId = 99
+    rejects(function() f.hooks.readPlantResume() end, "another account")
+    record.userId, record.updatedAt = 1234, os.time() - 21601
+    rejects(function() f.hooks.readPlantResume() end, "six hours")
+end)
+
+test("A consumed seed with missing tile evidence cannot be silently retried", function()
+    local f = plantingFixture(9, 100)
+    f.app.job, f.app.jobToken = "plant", 1
+    local state = {worldIndex = 1, phase = "farm", skipped = {}, pending = {world = "FARM1", x = 0, y = 5, before = 10}}
+    rejects(function() f.hooks.reconcilePlant(state, 1) end, "Cannot reconcile")
+    assert(state.pending and #f.plantCalls == 0)
+end)
+
+test("Full-world planting navigation reaches the row through a distant side corridor", function()
+    local f = fixture()
+    local map = {w = 42, h = 8, solid = function(x, y) return y == 6 or (y == 3 and x <= 37) end,
+        platform = function(x, y) return x == 38 and y == 4 or x == 39 and y == 3 end}
+    local start, goal = {x = 2, y = 5}, {x = 2, y = 2}
+    assert(not f.hooks.Navigation.plan(map, start, goal))
+    local route, message = f.hooks.Navigation.plan(map, start, goal, {fullWorld = true, maxNodes = 4000})
+    assert(route, message)
+    local edge = false
+    for _, step in ipairs(route) do if step.x >= 38 then edge = true end end
+    assert(edge)
+end)
+
+test("Planting on platforms uses the same follower and native support checks", function()
+    local f = plantingFixture(10, 100)
+    f.app.runtime.items[102] = {name = "Platform", platform = true}
+    f.grids.FARM1[6][5], f.grids.FARM1[6][6] = 102, 0
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(f.app.stats.planted == 6 and f.grids.FARM1[5][5] == 955 and f.grids.FARM1[5][6] == 0)
+end)
+
+test("Unreachable supported tiles are reported without claiming every tile was filled", function()
+    local f = plantingFixture(10, 100)
+    for y = 0, 5 do f.grids.FARM1[y][3] = 2 end
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(f.app.stats.planted == 3 and f.grids.FARM1[5][4] == 0 and f.serverSeeds == 7)
+    assert(table.concat(f.app.logs, "\n"):find("3 tiles skipped due to access or route", 1, true))
+end)
+
+test("Mixed seed boxes are rejected before requesting a withdrawal", function()
+    local f = plantingFixture(0, 100)
+    f.world.displays.get = function() return {{955, 100}, {627, 20}} end
+    f.hooks.start("plant")
+    assert(f.app.lastError:find("different item", 1, true) and f.withdrawals == 0)
+    assert(#f.plantCalls == 0 and f.hooks.readPlantResume().state.phase == "stock")
+end)
+
+test("The actual planting follower travels around a distant row edge", function()
+    local f = fixture()
+    f.world.w, f.world.h = 82, 8
+    f.world.fg = {}
+    f.app.runtime.items[102] = {platform = true}
+    for y = 0, 7 do
+        f.world.fg[y] = {}
+        for x = 0, 81 do f.world.fg[y][x] = (y == 6 or y == 3 and x <= 77) and 2 or 0 end
+    end
+    f.world.fg[4][78], f.world.fg[3][79] = 102, 102
+    f.app.runtime.body.solidAt = function(x, y)
+        if x < 0 or x >= 82 or y >= 8 then return true end
+        return f.world.fg[y] and f.world.fg[y][x] == 2 or false
+    end
+    f.avatar.x, f.avatar.y, f.app.job = 2.5, 6, "plant"
+    local visited = attachPhysics(f, f.hooks.navigationMap(f.app.runtime))
+    f.hooks.moveTo(2, 2, "BREAK", 1)
+    assert(math.abs(f.avatar.x - 2.5) < 0.16 and math.abs(f.avatar.y - 3) < 0.22)
+    local edge = false
+    for key in pairs(visited) do if tonumber(key:match("^(%d+):")) >= 78 then edge = true end end
+    assert(edge)
+end)
+
+test("Discovery exposes a unique native plantSeed hook belonging to the active world", function()
+    local f = fixture()
+    prepareDiscovery(f, true)
+    attachWorldHandlers(f, f.app.runtime.items)
+    local world = f.world
+    local plantSeed = function(id, x, y) world.fg[y][x] = id end
+    table.insert(f.discoveryObjects, plantSeed)
+    local names = getinfo
+    getinfo = function(fn) return fn == plantSeed and {name = "plantSeed"} or names(fn) end
+    local r = f.hooks.connectGame()
+    assert(r.ready and r.handlers.plantSeed == plantSeed)
+end)
+
+test("Ambiguous native planting hooks stay unavailable without disabling existing PNB", function()
+    local f = fixture()
+    prepareDiscovery(f, true)
+    attachWorldHandlers(f, f.app.runtime.items)
+    local world = f.world
+    local first = function(id, x, y) world.fg[y][x] = id end
+    local second = function(id, x, y) world.fg[y][x] = id end
+    table.insert(f.discoveryObjects, first)
+    table.insert(f.discoveryObjects, second)
+    local names = getinfo
+    getinfo = function(fn) return (fn == first or fn == second) and {name = "plantSeed"} or names(fn) end
+    local r = f.hooks.connectGame()
+    assert(r.ready and r.handlers.plantSeed == nil)
+    assert(table.concat(f.app.discoveryReport, "\n"):find("Planting hook: ambiguous", 1, true))
+end)
+
+test("More than a stack of planting seeds triggers another refill in the current farm", function()
+    local f = plantingFixture(0, 400, {"FARM1", "FARM2"})
+    f.world.w = 121
+    for _, grid in pairs(f.grids) do
+        for y = 0, 7 do for x = 7, 120 do grid[y][x] = y == 6 and 2 or 0 end end
+    end
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(f.app.stats.planted == 242 and #f.plantCalls == 242 and f.withdrawals == 2)
+    assert(f.stock == 0 and f.serverSeeds == 158)
+    assert(f.entries[4] == "STOCK" and f.entries[5] == "FARM2")
+    for _, name in ipairs({"FARM1", "FARM2"}) do for x = 0, 120 do assert(f.grids[name][5][x] == 955) end end
 end)
 
 return string.format("%d actual-script runtime tests passed (mock services/server)", passed)

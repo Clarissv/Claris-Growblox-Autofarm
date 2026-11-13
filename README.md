@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.10.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.11.
+
+Version 0.1.11 adds Planting: choose a seed, save its dedicated Display Box, and enter an ordered list of dirt farm worlds. It fills supported empty foreground tiles, refills at zero seeds, and continues through the list. Settings and saved places now restore from a local session file after script reloads and server teleports, including Moving Drops setups.
 
 Version 0.1.10 fixes startup's dependence on three exact module keys. It can recover the registry from protected proxy method upvalues, use item definitions captured by the active world's functions, or find one validated definition table in GC. It only loads the known item module when needed. Diagnostics show registry availability, discovered world/controller counts, and the item-definition source or failure.
 
@@ -27,6 +29,7 @@ Version 0.1.1 fixes startup when Delta's `shared` table differs from the game's 
 - **Place & Break:** choose a block from your inventory, place one directly above your saved PNB position, break it, collect nearby loose gems, seeds, and returned blocks, and repeat. Refill from the right Display Box when the backpack runs out. Put seeds in the left Display Box at the configured count, which defaults to 200. Stop when both backpack and block storage are empty.
 - **Moving Drops:** take the selected blocks from a dedicated farm Display Box, use the linked door to the breaking world, deposit the trip's blocks in the PNB storage box, and return through the other linked door. Continue until stopped or the farm box is empty. Harvesting remains manual.
 - **Harvest Drops:** collect the selected block's loose drops after manual tree harvesting. Store backpack blocks in the saved Farm storage box, collect up to eight drop requests at a time with stack-room reservations, deposit when full, and finish with the remaining blocks stored. Optionally start Moving Drops afterward. Seeds, gems, and other loose item types are outside this collection task.
+- **Planting:** fill supported empty tiles with the selected seed across multiple dirt farms. Refill from a dedicated seed Display Box, skip occupied/floating/denied/unreachable cells, and preserve progress across server changes. It never punches obstacles or combines existing trees with another seed.
 - **Named configurations:** Save, Load, New, and Delete multiple profiles containing the chosen block, every saved world and tile, the position from which to access each box/door, and timing settings.
 - **Discord reports:** send stats manually or automatically every 1-1440 minutes, defaulting to five. Include selected block/seed counts from the saved storage boxes in the current world. Reporting runs independently of farming and respects Discord cooldowns.
 - **Anti-AFK:** responds to Roblox's idle event while the script is loaded. Disable it in Settings or unload the script to stop it. The setting is saved per profile.
@@ -67,7 +70,7 @@ For an existing checkout with the GitHub remote configured, upload this rebuilt 
 ```powershell
 Set-Location -LiteralPath 'F:\VSCode\Luau\Claris Growblox Autofarm\logic'
 git add .
-git commit -m "Add harvested drop collection into Farm storage"
+git commit -m "Add planting across farm worlds and persistent sessions"
 git push
 ```
 
@@ -130,15 +133,33 @@ Reports include Roblox player name, Growblox level and gem balance, current worl
 
 Automatic reporting continues while the script is loaded, including when the farm is Off or recovering. Turn its reporting toggle Off or unload the script to end future reports. A request already sent can still finish. **Webhook status** shows delivery results, last successful send, and the next interval. HTTP errors and Discord rate limits do not stop farming. Reports wait for unsettled requests before sending again. Delta must expose `request`, `http_request`, or a supported equivalent for Discord delivery.
 
-The webhook URL is saved in the local profile and farm recovery files. Keep those files and the URL private. The URL is excluded from reports and copied diagnostics; the project's gitignore excludes the local `ClarisGrowblox` data folder.
+The webhook URL is saved in the local profile, session, and task recovery files. Keep those files and the URL private. The URL is excluded from reports and copied diagnostics; the project's gitignore excludes the local `ClarisGrowblox` data folder.
+
+## Set up Planting
+
+1. Enter your seed storage world and stand beside a Display Box dedicated to one seed type.
+2. Open **Planting → Save seed Display Box**. This saves the box, standing position, and storage world. A box containing seeds also selects its seed automatically. Use **Seed to plant** to choose or change the seed type.
+3. Enter farm names under **Dirt farm worlds (in order)**, separated by commas, for example `FARM1, FARM2, FARM3`. Duplicate names are removed while preserving order. The storage world must be different from the farm worlds.
+4. Turn **Plant seeds** On. The script enters the first farm, plants empty supported tiles, and refills from storage when its backpack runs out. It returns to the unfinished farm after each refill, then moves to the next farm when the current scan is complete.
+5. Turn the toggle Off to stop. Named profiles also save the seed type, storage box, and farm list.
+
+Planting requires an empty foreground tile with a solid block or platform directly underneath, matching the native seed placement rule. Doors, air vents, existing trees, and other occupied tiles are skipped; empty air without support is skipped too. Native placement checks still enforce access and reach. The script walks and jumps to each planting tile. Planting routes can search the whole world and have up to 90 seconds to reach a tile, allowing detours to distant edge platforms. Access-denied or unreachable supported tiles are counted in Recent activity; a completed scan does not claim those tiles were filled.
+
+An empty seed box ends the task and identifies the unfinished farm. A mixed box or failed server confirmation stops with a diagnostic. An interrupted seed placement is reconciled from the live tile and backpack before retrying. An interrupted storage withdrawal is not replayed automatically: check the backpack and box, then use **Clear saved planting** before starting again.
+
+Planting saves its farm index before world changes and tracks interrupted seed actions. When Delta's teleport queue is available, the GitHub loader resumes planting after a server change. Otherwise, execute the loader again and use **Planting → Resume planting**. Normal Stop or successful completion clears the planting checkpoint. Settings remain saved.
 
 ## Configuration files
 
 Profiles are saved in Delta's local `ClarisGrowblox/profiles/<name>.json` files. Saving again under a different name creates another profile. Loading a profile changes the script's selected block, saved locations, and settings; it does not move the player.
 
+The current configuration and profile name are also saved automatically to `ClarisGrowblox/session.json`, including changes not yet saved under a named profile. The script restores this account-bound session before building the UI after a reload or server teleport. It saves before task/world transitions and checks for setting changes every second. An existing idle script's newest configuration takes precedence during an in-place reload. Copied diagnostics show session save/restore failures.
+
 Saved files are validated before loading. Profile names accept letters, numbers, spaces, underscores, and hyphens. Each save is checked by reading it back; an existing file is backed up as `.json.bak`. Transfer recovery uses `ClarisGrowblox/resume.json`, tied to the Roblox account and expiring after six hours.
 
 Automatic PNB recovery uses `ClarisGrowblox/pnb-resume.json`, containing the running farm's profile and configuration. It refreshes every two minutes during a running farm and is checked against the account and a six-hour expiry. Normal Stop or completion clears it. A pending server teleport preserves it for the queued loader or **Resume saved farm**.
+
+Planting recovery uses `ClarisGrowblox/plant-resume.json`, with the configuration, farm index, refill phase, skipped cells, and any pending seed action. It is checked against the account and a six-hour expiry. Counters such as Seeds planted describe the current loaded script instance.
 
 ## Development
 
@@ -152,7 +173,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.10 passes 137 offline checks: 21 configuration/layout/storage tests, 114 tests executing the generated runtime against mock services and a mock server, and two release checks. Attachment fixtures cover isolated shared environments, protected registry proxies, missing/renamed module keys, known-module loading and failure, missing Qz, complete attachment from world-function upvalues, GC fallback, ambiguous tables, and rejection of incomplete definitions without requiring unrelated modules. Harvest fixtures cover held blocks plus loose drops, repeated deposits of a 450-block stack, eight concurrent requests with room reservations, walking under a proximity-enforcing mock server, readiness/cooldown handling, unreachable/refused drops, denied deposits, late pickup settlement after Stop, and collection-to-transfer toggle/checkpoint behavior. Existing PNB, webhook, navigation, recovery, anti-AFK, and storage checks remain. Live attachment, pickup reach, farm-platform traversal, Delta behavior, and Discord delivery still need in-game verification.
+Version 0.1.11 passes 167 offline checks: 27 configuration/layout/storage tests, 138 tests executing the generated runtime against mock services and a mock server, and two release checks. New fixtures cover profile migration, world-list validation, seed support/occupancy, actual planting with the movement follower, repeated refills across 242 tiles, ordered farm transitions, platforms, unreachable and denied cells, native planting hook ambiguity, session restoration after reload/teleport, checkpoint validation, Stop, picker recovery, and interrupted-action reconciliation. An 82-column edge-detour fixture exposed the original 30-second movement deadline and passes with the planting allowance. Existing attachment, PNB, harvest, webhook, navigation, recovery, anti-AFK, and storage checks remain. Live planting reach, route geometry, world permissions, Delta teleport queue behavior, and Discord delivery still need in-game verification.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 

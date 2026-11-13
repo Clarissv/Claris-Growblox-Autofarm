@@ -232,4 +232,66 @@ test("Older profiles keep automatic harvest transfer Off and validate explicit c
     rejects(function() Core.validate(config) end, "moveAfterHarvest")
 end)
 
+test("Old profiles receive empty planting settings and planting validates independent of PNB", function()
+    local config = Core.defaults()
+    config.planting = nil
+    assert(Core.validate(config).planting.seedId == 0)
+    config.planting = {seedId = 955, storageWorld = "STOCK", worlds = {"FARM1", "FARM2"}}
+    config.points.plantBox = box("STOCK", 8, 8)
+    assert(Core.checkSetup(config, "plant", items) and config.blockId == 0)
+    local copy = Core.validate(config)
+    copy.planting.worlds[1] = "OTHER"
+    assert(config.planting.worlds[1] == "FARM1")
+end)
+
+test("World input retains order while normalizing and removing duplicate names", function()
+    local list = Core.parseWorlds(" farm1, FARM2; farm1\r\n farm3 ")
+    assert(#list == 3 and list[1] == "FARM1" and list[3] == "FARM3")
+    rejects(function() Core.parseWorlds("farm 1") end, "world name")
+    assert(#Core.parseWorlds("") == 0)
+end)
+
+test("Planting setup rejects nonseeds, mismatched storage, and planting the storage world", function()
+    local config = Core.defaults()
+    config.planting = {seedId = 954, storageWorld = "STOCK", worlds = {"FARM1"}}
+    config.points.plantBox = box("STOCK", 8, 8)
+    rejects(function() Core.checkSetup(config, "plant", items) end, "Choose a seed")
+    config.planting.seedId = 955
+    config.points.plantBox.world = "OTHER"
+    rejects(function() Core.checkSetup(config, "plant", items) end, "entered storage world")
+    config.points.plantBox.world = "STOCK"
+    config.planting.worlds[1] = "STOCK"
+    rejects(function() Core.checkSetup(config, "plant", items) end, "must be different")
+end)
+
+test("Damaged planting lists and seed IDs cannot enter saved profiles", function()
+    local config = Core.defaults()
+    config.planting.worlds = {[2] = "FARM"}
+    rejects(function() Core.validate(config) end, "world list")
+    config.planting.worlds = {"farm", "FARM"}
+    rejects(function() Core.validate(config) end, "Duplicate")
+    config.planting.worlds = {}
+    config.planting.seedId = 0.5
+    rejects(function() Core.validate(config) end, "planting settings")
+end)
+
+test("Planting skips occupied doors, vents, existing seeds, and floating corners", function()
+    local defs = {[0] = {}, [2] = {solid = true}, [102] = {platform = true}, [12] = {door = true},
+        [100] = {name = "Air Vent", solid = false}, [955] = {kind = "seed"}}
+    local world = {w = 6, h = 3, fg = {[0] = {[0]=0,[1]=12,[2]=100,[3]=955,[4]=0,[5]=0},
+        [1] = {[0]=2,[1]=2,[2]=2,[3]=2,[4]=102,[5]=0}, [2] = {}}}
+    assert(Core.plantingTile(world, defs, 0, 0) and Core.plantingTile(world, defs, 4, 0))
+    for _, x in ipairs({1, 2, 3, 5}) do assert(not Core.plantingTile(world, defs, x, 0)) end
+    assert(not Core.plantingTile(world, defs, 6, 0) and not Core.plantingTile(world, defs, 0, 2))
+end)
+
+test("Supported planting rows alternate direction despite unequal row spacing", function()
+    local world = {w = 3, h = 6, fg = {}}
+    for y = 0, 5 do world.fg[y] = {[0]=0,[1]=0,[2]=0} end
+    for x = 0, 2 do world.fg[1][x], world.fg[4][x] = 2, 2 end
+    local tiles = Core.plantingTiles(world, {[0] = {}, [2] = {solid = true}})
+    assert(#tiles == 6 and tiles[1].x == 0 and tiles[3].x == 2)
+    assert(tiles[4].y == 3 and tiles[4].x == 2 and tiles[6].x == 0)
+end)
+
 return string.format("%d configuration/layout/storage tests passed", passed)

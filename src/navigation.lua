@@ -15,6 +15,7 @@ function Navigation.plan(map, start, goal, options)
     local maxX = math.min(map.w - 1, math.max(start.x, goal.x) + 12)
     local minY = math.max(0, math.min(start.y, goal.y) - 5)
     local maxY = math.min(map.h - 2, math.max(start.y, goal.y) + 12)
+    if options.fullWorld then minX, maxX, minY, maxY = 0, map.w - 1, 0, map.h - 2 end
     local solids, supports, stands = {}, {}, {}
     local function key(x, y) return y * map.w + x end
     local function solid(x, y)
@@ -102,6 +103,7 @@ function Navigation.plan(map, start, goal, options)
                 return route
             end
             closed[nodeKey], expansions = true, expansions + 1
+            if options.step and expansions % 64 == 0 then options.step() end
             local function offer(x, y, jumping)
                 if not standable(x, y) then return end
                 local destinationKey = key(x, y)

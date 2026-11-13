@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.10"
+local VERSION = "0.1.11"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -12,6 +12,9 @@ local ROOT = "ClarisGrowblox"
 local PROFILE_DIR = ROOT .. "/profiles"
 local RESUME_FILE = ROOT .. "/resume.json"
 local PNB_RESUME_FILE = ROOT .. "/pnb-resume.json"
+local SESSION_FILE = ROOT .. "/session.json"
+local PLANT_RESUME_FILE = ROOT .. "/plant-resume.json"
+local previousSession = env.ClarisGrowbloxApp
 
 if env.ClarisGrowbloxApp then
     -- Reloading an idle script should preserve a paused transfer checkpoint.
@@ -63,13 +66,38 @@ local App = {
     config = Core.defaults(), profile = "Default", status = "Connecting to Growblox...",
     logs = {}, controls = nil, runtime = nil, resume = nil,
     connectionError = nil, discoveryReport = {},
-    stats = { broken = 0, trips = 0, moved = 0, gems = 0, harvested = 0, stashed = 0 }, runToggles = {},
+    stats = { broken = 0, trips = 0, moved = 0, gems = 0, harvested = 0, stashed = 0, planted = 0 }, runToggles = {},
     webhookState = { pending = 0, generation = 0, status = "Automatic reports are Off." },
     loadedAt = os.clock(),
 }
 env.ClarisGrowbloxApp = App
 local WindUI
 local ui = {}
+
+local function saveSession()
+    local config, profile = Core.validate(App.config), Core.profileName(App.profile)
+    local signature = encode({config = config, profile = profile})
+    if signature == App.sessionSignature then return end
+    writeJSON(SESSION_FILE, {version = 1, userId = player.UserId, config = config, profile = profile})
+    App.sessionSignature, App.sessionSaveError = signature, nil
+end
+local function restoreSession(previous)
+    local record
+    if previous and previous.config then
+        record = {version = 1, userId = player.UserId, config = previous.config, profile = previous.profile}
+    elseif exists(SESSION_FILE) then record = decode(readfile(SESSION_FILE)) end
+    if not record then return false end
+    assert(type(record) == "table" and record.version == 1 and record.userId == player.UserId,
+        "The saved session belongs to another account or script version.")
+    App.config, App.profile = Core.validate(record.config), Core.profileName(record.profile)
+    return true
+end
+local function pollSession()
+    if App.alive and not App.configuring then
+        local ok, problem = pcall(saveSession)
+        App.sessionSaveError = not ok and tostring(problem) or nil
+    end
+end
 
 local function syncRunToggles()
     App.syncingRunToggles = true
@@ -444,13 +472,14 @@ local function discover()
         readInventoryView()
         table.insert(issues, "Backpack is readable; its live mutation hooks are unavailable.")
     end
-    local handlers = {}
+    local handlers, ambiguousHandlers = {}, {}
     for _, object in pairs(objects) do
         if type(object) == "function" then
             local name = functionName(object)
-            if (name == "setTile" or name == "hit" or name == "canPlace") and owns(object, world) then
-                if handlers[name] then
-                    table.insert(issues, "Multiple " .. name .. " handlers match the world.")
+            if (name == "setTile" or name == "hit" or name == "canPlace" or name == "plantSeed") and owns(object, world) then
+                if handlers[name] or ambiguousHandlers[name] then
+                    handlers[name], ambiguousHandlers[name] = nil, true
+                    if name ~= "plantSeed" then table.insert(issues, "Multiple " .. name .. " handlers match the world.") end
                 else
                     handlers[name] = object
                 end
@@ -469,6 +498,8 @@ local function discover()
     table.insert(App.discoveryReport, "Inventory: " .. (readInventoryView and "readable snapshot" or "live backpack"))
     table.insert(App.discoveryReport, "Farming hooks: " .. (#issues == 0 and "ready" or table.concat(issues, " ")))
     table.insert(App.discoveryReport, "World picker: " .. (runtime.picker and "UI cleanup ready" or "UI hook unavailable"))
+    table.insert(App.discoveryReport, "Planting hook: " .. (ambiguousHandlers.plantSeed and "ambiguous"
+        or handlers.plantSeed and "ready" or "unavailable"))
     -- The game already owns tileChanged handling. Own actions are optimistic and
     -- need not receive an echo; do not add a listener or require an acknowledgment.
     return runtime
@@ -632,7 +663,8 @@ local function moveTo(x, y, worldName, token)
     tileAt(x, y)
     local hold = takeControls()
     local targetX, targetY = x + 0.5, y + 1
-    local deadline, banned, replans = os.clock() + App.config.options.moveTimeout, {}, 0
+    local timeout = App.job == "plant" and math.max(90, App.config.options.moveTimeout) or App.config.options.moveTimeout
+    local deadline, banned, replans = os.clock() + timeout, {}, 0
     -- Waypoints and the final destination must agree. A looser waypoint
     -- tolerance can otherwise accept an empty route without ever moving.
     local function reached(state, tx, ty)
@@ -653,7 +685,11 @@ local function moveTo(x, y, worldName, token)
             state = position()
         end
         local start = {x = math.floor(state.x), y = math.floor(state.y - 0.01)}
-        local route, message = Navigation.plan(navigationMap(r), start, {x = x, y = y}, {banned = banned})
+        local route, message = Navigation.plan(navigationMap(r), start, {x = x, y = y}, {
+            banned = banned, fullWorld = App.job == "plant",
+            maxNodes = App.job == "plant" and math.min(12000, r.world.w * r.world.h) or 1600,
+            step = function() pause(0, token); worldCheck(worldName, token) end,
+        })
         assert(route, message)
         if #route == 0 then route = {{x = x, y = y, fromX = start.x, fromY = start.y, jump = false, duration = 0.2}} end
         App.navigationDebug = "Planned " .. #route .. " walking/jumping steps to " .. x .. ", " .. y
@@ -772,6 +808,7 @@ local function clearPNBResume()
     end
 end
 local function savePNBResume()
+    saveSession()
     writeJSON(PNB_RESUME_FILE, {version = 1, active = true, userId = player.UserId, updatedAt = os.time(),
         config = Core.validate(App.config), profile = App.profile})
     App.lastPNBSave = os.clock()
@@ -795,6 +832,7 @@ local function readPNBResume()
     return record
 end
 local function saveResume(phase, cargo)
+    saveSession()
     local record = { version = 1, active = true, userId = player.UserId, updatedAt = os.time(),
         config = Core.validate(App.config), profile = App.profile, phase = phase, cargo = cargo or 0 }
     writeJSON(RESUME_FILE, record)
@@ -820,6 +858,7 @@ local function enterDoor(door, destination, nextPhase, cargo, token)
     local metadata = r.items[tileAt(door.x, door.y)]
     assert(metadata and (metadata.door or metadata.entrance or metadata.vip), "Saved door no longer exists.")
     saveResume(nextPhase, cargo)
+    saveSession()
     local canResume = queueResume()
     local ok, response = bounded(r.world.call, App.config.options.actionTimeout, token,
         "UseDoor", door.x, door.y)
@@ -1419,6 +1458,193 @@ local function runTransfer(token, saved)
     end
 end
 
+local function clearPlantResume()
+    App.plantState = nil
+    if exists(PLANT_RESUME_FILE) then
+        if type(delfile) == "function" then delfile(PLANT_RESUME_FILE)
+        else writeJSON(PLANT_RESUME_FILE, {version = 1, active = false}) end
+    end
+end
+local function savePlantResume(state)
+    saveSession()
+    local copy = {worldIndex = state.worldIndex, phase = state.phase, skipped = {}, pending = state.pending}
+    for key, reason in pairs(state.skipped or {}) do copy.skipped[key] = reason end
+    writeJSON(PLANT_RESUME_FILE, {version = 1, active = true, userId = player.UserId, updatedAt = os.time(),
+        config = Core.validate(App.config), profile = App.profile, state = copy})
+    App.plantState = state
+end
+local function readPlantResume()
+    if not exists(PLANT_RESUME_FILE) then return nil end
+    local record = decode(readfile(PLANT_RESUME_FILE))
+    if not record.active then return nil end
+    assert(record.version == 1 and record.userId == player.UserId, "The saved planting task belongs to another account or script version.")
+    assert(type(record.updatedAt) == "number" and os.time() - record.updatedAt < 21600, "Saved planting is over six hours old. Start it again.")
+    record.config, record.profile = Core.validate(record.config), Core.profileName(record.profile)
+    local state = record.state
+    assert(type(state) == "table" and type(state.worldIndex) == "number" and state.worldIndex == math.floor(state.worldIndex)
+        and state.worldIndex >= 1 and state.worldIndex <= #record.config.planting.worlds + 1
+        and (state.phase == "farm" or state.phase == "stock" or state.phase == "pickupPending")
+        and type(state.skipped) == "table", "Invalid saved planting progress.")
+    for key, reason in pairs(state.skipped) do
+        assert(type(key) == "string" and key:match("^%d+:%d+$") and type(reason) == "string", "Invalid skipped planting tile.")
+    end
+    if state.pending then
+        local point = state.pending
+        assert(state.phase == "farm" and point.world == record.config.planting.worlds[state.worldIndex], "Invalid pending seed world.")
+        for _, key in ipairs({"x", "y", "before"}) do
+            assert(type(point[key]) == "number" and point[key] == math.floor(point[key])
+                and point[key] >= 0 and point[key] <= 65535, "Invalid pending seed placement.")
+        end
+        assert(point.before >= 1 and point.before <= 200, "Invalid pending seed count.")
+    end
+    return record
+end
+local function enterPlantWorld(name, state, token)
+    local r = runtime()
+    local attempts, nextEntry, stableSince = 0, 0, nil
+    local deadline = os.clock() + App.config.options.actionTimeout + 15
+    releaseControls()
+    while true do
+        checkpoint(token)
+        if (r.world.name ~= name or pickerOpen(r)) and os.clock() >= nextEntry then
+            attempts = attempts + 1
+            assert(attempts <= 3, "Planting world repeatedly returned to the picker: " .. name)
+            assert(type(r.world.enter) == "function", "The world entry hook is unavailable.")
+            savePlantResume(state)
+            local queued = queueResume()
+            setStatus("Entering planting world " .. name .. "...")
+            local entered, message, teleport = bounded(r.world.enter, App.config.options.actionTimeout + 15, token, name)
+            if teleport then
+                App.teleporting = true
+                setStatus(queued and "Changing servers; planting will resume after loading."
+                    or "Changing servers. Run the loader after arrival, then use Resume planting.")
+                local teleportDeadline = os.clock() + 45
+                while os.clock() < teleportDeadline do pause(0.2, token) end
+                error("Server teleport did not finish. Use Resume planting after arrival.")
+            end
+            if not entered then assert(attempts < 3, tostring(message or "Could not enter " .. name))
+            elseif r.picker and r.world.name == name then r.picker.complete() end
+            nextEntry, stableSince = os.clock() + 2, nil
+            deadline = os.clock() + App.config.options.actionTimeout + 15
+        end
+        local avatar = r.body and r.body.state()
+        if r.world.name == name and not pickerOpen(r) and avatar and avatar.active and not avatar.dead
+            and not player:GetAttribute("Frozen") then
+            stableSince = stableSince or os.clock()
+            if os.clock() - stableSince >= 1 then break end
+        else stableSince = nil end
+        assert(os.clock() < deadline, "Planting world or avatar did not finish loading: " .. name)
+        pause(0.1, token)
+    end
+    App.teleporting = false
+    takeControls()
+    refreshInventory(token)
+end
+local function reconcilePlant(state, token)
+    local point = state.pending
+    if not point then return end
+    worldCheck(point.world, token)
+    local id = App.config.planting.seedId
+    local actual, tile = refreshInventory(token)[id] or 0, tileAt(point.x, point.y)
+    if actual == point.before - 1 and tile == id then
+        App.stats.planted = App.stats.planted + 1
+    else
+        assert(actual == point.before and tile == 0,
+            "Cannot reconcile the interrupted seed placement. Check the backpack and tile, then clear saved planting.")
+    end
+    state.pending = nil
+    savePlantResume(state)
+end
+local function plantTile(point, state, token)
+    return withoutPickups(function()
+        local name, id = App.config.planting.worlds[state.worldIndex], App.config.planting.seedId
+        local r = worldCheck(name, token)
+        local before = refreshInventory(token)[id] or 0
+        if not Core.plantingTile(r.world, r.items, point.x, point.y) then return false end
+        if not r.handlers.canPlace(r.items[id], point.x, point.y) then return false end
+        assert(before > 0, "No planting seeds are left in the backpack.")
+        state.pending = {world = name, x = point.x, y = point.y, before = before}
+        savePlantResume(state)
+        r.handlers.plantSeed(id, point.x, point.y)
+        pause(math.max(0.2, App.config.options.placeDelay), token)
+        local deadline = os.clock() + App.config.options.actionTimeout
+        while true do
+            worldCheck(name, token)
+            local after = refreshInventory(token)[id] or 0
+            assert(after == before or after == before - 1, "Seed count changed unexpectedly while planting. Check diagnostics before resuming.")
+            if after == before - 1 and tileAt(point.x, point.y) == id then break end
+            assert(os.clock() < deadline, "The server did not confirm a planted seed at " .. point.x .. ", " .. point.y .. ".")
+            pause(0.15, token)
+        end
+        settleTile(point.x, point.y, id, 0.12, name, token)
+        App.stats.planted = App.stats.planted + 1
+        state.pending = nil
+        savePlantResume(state)
+        return true
+    end)
+end
+local function runPlant(token, saved)
+    Core.checkSetup(App.config, "plant", runtime().items)
+    local settings, id = App.config.planting, App.config.planting.seedId
+    local state = saved and saved.state or {worldIndex = 1, phase = "farm", skipped = {}}
+    assert(state.phase ~= "pickupPending", "A seed storage withdrawal was interrupted. Check the backpack and box, then clear saved planting.")
+    savePlantResume(state)
+    while state.worldIndex <= #settings.worlds do
+        checkpoint(token)
+        if state.phase == "stock" then
+            enterPlantWorld(settings.storageWorld, state, token)
+            local box = App.config.points.plantBox
+            if storageCount(box, id) == 0 then
+                clearPlantResume()
+                setStatus("Planting stopped: the seed storage box is empty. Unfinished farm: " .. settings.worlds[state.worldIndex])
+                return
+            end
+            state.phase = "pickupPending"
+            savePlantResume(state)
+            withdraw(box, id, token)
+            state.phase = "farm"
+            savePlantResume(state)
+        end
+        local name = settings.worlds[state.worldIndex]
+        enterPlantWorld(name, state, token)
+        reconcilePlant(state, token)
+        local r, refill = runtime(), false
+        setStatus("Planting " .. r.items[id].name .. " in " .. name .. " (" .. state.worldIndex .. "/" .. #settings.worlds .. ")...")
+        for _, point in ipairs(Core.plantingTiles(r.world, r.items)) do
+            checkpoint(token)
+            worldCheck(name, token)
+            local key = point.x .. ":" .. point.y
+            if not state.skipped[key] and Core.plantingTile(r.world, r.items, point.x, point.y) then
+                if count(id) == 0 then refill = true; break end
+                local permitted = not r.world.areas or type(r.world.areas.canEdit) ~= "function" or r.world.areas.canEdit(point.x, point.y)
+                local arrived, issue = true, nil
+                if permitted then arrived, issue = pcall(moveTo, point.x, point.y, name, token) end
+                checkpoint(token)
+                worldCheck(name, token)
+                if not arrived then
+                    if type(issue) == "table" and issue.recoverable then error(issue, 0) end
+                    local text = tostring(issue)
+                    assert(text:find("route", 1, true) or text:find("position", 1, true) or text:find("support", 1, true)
+                        or text:find("platform", 1, true) or text:find("timed out", 1, true), text)
+                    state.skipped[key] = "unreachable"
+                elseif not permitted or not plantTile(point, state, token) then state.skipped[key] = "not permitted" end
+                if state.skipped[key] then savePlantResume(state) end
+            end
+        end
+        if refill then
+            state.phase = "stock"
+        else
+            local skipped = 0
+            for _ in pairs(state.skipped) do skipped = skipped + 1 end
+            setStatus("Processed " .. name .. ": " .. skipped .. " tiles skipped due to access or route. Moving to the next farm.")
+            state.worldIndex, state.skipped = state.worldIndex + 1, {}
+        end
+        savePlantResume(state)
+    end
+    clearPlantResume()
+    setStatus("Finished planting all configured farms. Seeds planted this session: " .. App.stats.planted)
+end
+
 function App:stop()
     self.token = self.token + 1
     self.teleporting = false
@@ -1427,6 +1653,8 @@ function App:stop()
     releaseControls()
     clearResume()
     clearPNBResume()
+    clearPlantResume()
+    pcall(saveSession)
     setStatus(self.pending > 0 and "Stopped; waiting for a pending server request." or "Stopped.")
 end
 function App:destroy()
@@ -1440,16 +1668,20 @@ end
 local function start(mode, saved)
     idle()
     local r = runtime()
-    if mode == "harvest" then
+    if mode == "harvest" or mode == "plant" then
         assert(r.body and r.controls and type(r.inventory.room) == "function" and type(r.inventory.add) == "function"
-            and type(r.inventory.remove) == "function", "Harvest collection needs the live backpack and movement hooks.")
+            and type(r.inventory.remove) == "function", "Collection and planting need the live backpack and movement hooks.")
+        if mode == "plant" then assert(r.handlers and type(r.handlers.canPlace) == "function" and type(r.handlers.plantSeed) == "function",
+            "The seed planting hooks are unavailable. Copy diagnostics from Settings.") end
     else
         assert(r.ready ~= false, "Inventory loaded, but farming hooks are unavailable: " .. table.concat(r.issues or {}, " "))
     end
     Core.checkSetup(App.config, mode, runtime().items)
+    if mode == "plant" then clearResume() else clearPlantResume() end
     if mode == "harvest" and App.config.options.moveAfterHarvest then Core.checkSetup(App.config, "transfer", r.items) end
     if mode == "pnb" and App.config.options.autoRejoin then savePNBResume(); queueResume()
     else clearPNBResume() end
+    saveSession()
     App.token = App.token + 1
     local token = App.token
     App.job = mode
@@ -1481,6 +1713,18 @@ local function start(mode, saved)
                             assert(interruptions < 3, "Recovery was interrupted three times. Check the saved world and connection.")
                             problem = nextProblem
                         end
+                    else error(problem, 0) end
+                end
+            elseif mode == "plant" then
+                local progress = saved
+                while true do
+                    local completed, problem = pcall(runPlant, token, progress)
+                    if completed then break end
+                    checkpoint(token)
+                    if type(problem) == "table" and problem.recoverable and App.config.options.autoRejoin then
+                        progress = {state = App.plantState}
+                        assert(progress.state and progress.state.phase ~= "pickupPending", "Seed withdrawal was interrupted. Check the backpack before resuming.")
+                        setStatus("Planting interrupted; returning to its saved world...")
                     else error(problem, 0) end
                 end
             elseif mode == "harvest" then
@@ -1603,7 +1847,7 @@ local function webhookPayload(config, profile, metrics)
     field("Level", metrics.level or "Unavailable", true)
     field("Gems", metrics.gems or "Unavailable", true)
     local mode = App.job == "pnb" and "Place & Break" or App.job == "transfer" and "Moving Drops"
-        or App.job == "harvest" and "Collect harvest" or "Off"
+        or App.job == "harvest" and "Collect harvest" or App.job == "plant" and "Planting" or "Off"
     field("Farm status", mode .. (App.recovering and " (recovering)" or "") .. "\n" .. reportText(App.status, 600))
     local item = r and blockId and r.items[blockId]
     field("Selected block", item and (reportText(item.name or blockId, 100) .. " [" .. blockId .. "]") or "Not selected", true)
@@ -1611,7 +1855,13 @@ local function webhookPayload(config, profile, metrics)
     local minutes = math.floor((os.clock() - App.loadedAt) / 60)
     field("This script session", "Time loaded: " .. minutes .. " min\nBlocks broken: " .. App.stats.broken
         .. "\nGems collected: " .. App.stats.gems .. "\nBlocks moved: " .. App.stats.moved .. "\nTrips: " .. App.stats.trips
-        .. "\nHarvest blocks collected: " .. App.stats.harvested .. "\nBlocks stashed in Farm storage: " .. App.stats.stashed)
+        .. "\nHarvest blocks collected: " .. App.stats.harvested .. "\nBlocks stashed in Farm storage: " .. App.stats.stashed
+        .. "\nSeeds planted: " .. App.stats.planted)
+    if App.job == "plant" then
+        field("Planting seed", r and r.items[config.planting.seedId] and r.items[config.planting.seedId].name or "Not selected", true)
+        field("Planting seeds in backpack", backpack(config.planting.seedId), true)
+        if config.webhook.includeBoxes then field("Planting seed Display Box", reportBox(config.points.plantBox, config.planting.seedId), true) end
+    end
     if config.webhook.includeBoxes then
         field("Block Display Box", reportBox(config.points.blockBox, blockId), true)
         field("Seed Display Box", reportBox(config.points.seedBox, seedId), true)
@@ -1727,6 +1977,10 @@ local function pollWebhook()
     end
 end
 
+local sessionOK, sessionProblem = pcall(restoreSession, previousSession)
+App.sessionRestoreError = not sessionOK and tostring(sessionProblem) or nil
+previousSession = nil
+
 if env.ClarisGrowbloxTest then
     return { App = App, Core = Core, start = start, checkpoint = checkpoint,
         runTransfer = runTransfer, runPNB = runPNB, refreshInventory = refreshInventory,
@@ -1740,7 +1994,11 @@ if env.ClarisGrowbloxTest then
         savePNBResume = savePNBResume, readPNBResume = readPNBResume, refreshPNBCheckpoint = refreshPNBCheckpoint,
         webhookPayload = webhookPayload, setWebhookSetting = setWebhookSetting,
         resetWebhookSchedule = resetWebhookSchedule, sendWebhook = sendWebhook, pollWebhook = pollWebhook,
-        findWorldPicker = findWorldPicker, pickerOpen = pickerOpen, runHarvest = runHarvest }
+        findWorldPicker = findWorldPicker, pickerOpen = pickerOpen, runHarvest = runHarvest,
+        saveSession = saveSession, restoreSession = restoreSession, pollSession = pollSession,
+        runPlant = runPlant, plantTile = plantTile, enterPlantWorld = enterPlantWorld,
+        readPlantResume = readPlantResume, savePlantResume = savePlantResume, clearPlantResume = clearPlantResume,
+        reconcilePlant = reconcilePlant }
 end
 
 local function loadWindUI()
@@ -1761,6 +2019,7 @@ App.window = window
 window:OnDestroy(function() App:destroy() end)
 local pnbTab = window:Tab({ Title = "Place & Break", Icon = "hammer" })
 local harvestTab = window:Tab({ Title = "Harvest Drops", Icon = "package" })
+local plantTab = window:Tab({ Title = "Planting", Icon = "sprout" })
 local transferTab = window:Tab({ Title = "Moving Drops", Icon = "truck" })
 local profileTab = window:Tab({ Title = "Configurations", Icon = "save" })
 local webhookTab = window:Tab({ Title = "Discord Webhook", Icon = "bell" })
@@ -1784,6 +2043,7 @@ local function updatePoints()
         paragraphSet(paragraph, ui.pointTitles[key], pointText(key))
     end
     paragraphSet(ui.harvestPoint, "Farm storage", pointText("farmBox"))
+    paragraphSet(ui.plantPoint, "Planting seed storage", pointText("plantBox"))
 end
 local function uiAction(fn)
     return function()
@@ -1793,6 +2053,7 @@ local function uiAction(fn)
             App.configuring = true
             ok, message = xpcall(fn, function(err) return tostring(err) end)
             App.configuring = false
+            if ok then ok, message = pcall(saveSession) end
             if not ok then setStatus(message); notify(message) end
         end)
     end
@@ -1870,6 +2131,7 @@ end
 ui.points, ui.pointTitles = {}, {
     pnb = "PNB spot", blockBox = "Block storage (breaking world)", seedBox = "Seed storage (left box)",
     farmBox = "Farm storage", farmDoor = "Farm door to breaking world", breakDoor = "Breaking door to farm world",
+    plantBox = "Planting seed storage",
 }
 ui.status = pnbTab:Paragraph({ Title = "Status", Desc = App.status })
 blockDropdown = pnbTab:Dropdown({
@@ -1935,6 +2197,69 @@ settingsControls.moveAfterHarvest = harvestTab:Toggle({ Title = "Start Moving Dr
 App.runToggles.harvest = harvestTab:Toggle({ Title = "Collect harvest", Value = false,
     Desc = "On collects and stores harvested blocks. Off stops. Turns Off when collection finishes or encounters a problem.",
     Callback = function(enabled) setRunningEnabled("harvest", enabled) end })
+local plantControls, seedLabels = {}, {}
+local function refreshSeeds()
+    if not App.runtime then return end
+    App.syncingPlantUI = true
+    local labels, selected = {}, nil
+    seedLabels = {}
+    for id, item in pairs(App.runtime.items) do
+        if type(id) == "number" and type(item) == "table" and item.kind == "seed" then
+            local label = (item.name or ("Seed " .. id)) .. " [" .. id .. "]"
+            seedLabels[label] = id
+            table.insert(labels, label)
+            if id == App.config.planting.seedId then selected = label end
+        end
+    end
+    table.sort(labels)
+    plantControls.seed:Refresh(labels)
+    plantControls.seed:Select(selected)
+    plantControls.storageWorld:Set(App.config.planting.storageWorld)
+    plantControls.worlds:Set(table.concat(App.config.planting.worlds, ", "))
+    App.syncingPlantUI = false
+end
+local function changePlantSetting(key, value)
+    if App.syncingPlantUI or App.syncingUI then return end
+    local ok, message = pcall(function()
+        idle()
+        if key == "seedId" then value = assert(seedLabels[value], "Choose a seed.")
+        elseif key == "worlds" then value = Core.parseWorlds(value)
+        elseif value ~= "" then value = Core.worldName(value) end
+        local candidate = Core.validate(App.config)
+        candidate.planting[key] = value
+        App.config.planting = Core.validatePlanting(candidate.planting)
+        saveSession()
+    end)
+    if not ok then notify(tostring(message)) end
+end
+ui.plantStatus = plantTab:Paragraph({ Title = "Status", Desc = App.status })
+plantTab:Paragraph({ Title = "Fill dirt farms with seeds", Desc = "Plant the selected seed on empty tiles with solid ground or a platform below. Doors, vents, existing trees, and floating tiles are skipped. Refill from the saved seed Display Box, then continue through your farm world list." })
+App.syncingPlantUI = true
+plantControls.seed = plantTab:Dropdown({ Title = "Seed to plant", Values = {}, SearchBarEnabled = true,
+    Callback = function(value) changePlantSetting("seedId", value) end })
+plantControls.storageWorld = plantTab:Input({ Title = "Seed storage world", Value = App.config.planting.storageWorld,
+    Placeholder = "e.g. ZZ4", Callback = function(value) changePlantSetting("storageWorld", value) end })
+plantControls.worlds = plantTab:Input({ Title = "Dirt farm worlds (in order)", Value = table.concat(App.config.planting.worlds, ", "),
+    Placeholder = "FARM1, FARM2, FARM3", Callback = function(value) changePlantSetting("worlds", value) end })
+ui.plantPoint = plantTab:Paragraph({ Title = "Planting seed storage", Desc = pointText("plantBox") })
+plantTab:Button({ Title = "Save seed Display Box", Desc = "Stand beside the seed box in the storage world. A dedicated box also selects its seed type.",
+    Callback = uiAction(function()
+        captureNearby("plantBox", "box")
+        App.config.planting.storageWorld = Core.worldName(runtime().world.name)
+        local rows, seed = boxRows(App.config.points.plantBox), nil
+        for _, row in pairs(rows) do
+            assert(runtime().items[row[1]] and runtime().items[row[1]].kind == "seed", "Use a Display Box containing seeds only.")
+            assert(not seed or seed == row[1], "Use a Display Box dedicated to one seed type.")
+            seed = row[1]
+        end
+        if seed then App.config.planting.seedId = seed end
+        refreshSeeds()
+    end) })
+plantTab:Button({ Title = "Refresh seed choices", Callback = uiAction(refreshSeeds) })
+App.runToggles.plant = plantTab:Toggle({ Title = "Plant seeds", Value = false,
+    Desc = "On plants and refills automatically. Off stops. Unreachable or denied tiles are reported and skipped.",
+    Callback = function(enabled) setRunningEnabled("plant", enabled) end })
+App.syncingPlantUI = false
 local webhookControls = {}
 local function syncWebhookControls()
     App.syncingWebhookUI = true
@@ -1949,6 +2274,7 @@ local function syncUI()
     for key, control in pairs(settingsControls) do control:Set(App.config.options[key]) end
     profileNameInput:Set(App.profile)
     if App.runtime then refreshBlocks() end
+    refreshSeeds()
     updatePoints()
     resetWebhookSchedule()
     syncWebhookControls()
@@ -2047,6 +2373,19 @@ profileTab:Button({ Title = "Resume saved transfer", Callback = function()
     local ok, message = pcall(resumeTransfer)
     if not ok then notify(tostring(message)) end
 end })
+local function resumePlant()
+    idle()
+    local saved = readPlantResume()
+    assert(saved, "No saved planting task is available.")
+    assert(saved.state.phase ~= "pickupPending", "A seed withdrawal was interrupted. Check the backpack and storage, then clear saved planting.")
+    App.config, App.profile = saved.config, saved.profile
+    syncUI()
+    start("plant", saved)
+end
+plantTab:Button({ Title = "Resume planting", Desc = "Restore the seed, world list, and progress after a server change or interruption.",
+    Callback = function() local ok, message = pcall(resumePlant); if not ok then notify(tostring(message)) end end })
+plantTab:Button({ Title = "Clear saved planting", Desc = "Use after checking an interrupted storage withdrawal or seed placement.",
+    Callback = uiAction(function() clearPlantResume(); setStatus("Cleared saved planting.") end) })
 profileTab:Button({ Title = "Clear saved transfer", Desc = "Use after checking an interrupted storage request. Items stay where they are.", Callback = uiAction(function()
     clearResume()
     setStatus("Cleared saved transfer.")
@@ -2122,6 +2461,7 @@ local function reconnect()
     App.runtime = connectGame()
     App.syncingUI = true
     refreshBlocks()
+    refreshSeeds()
     App.syncingUI = false
     paragraphSet(ui.diagnostics, "Game connection", "Attached to " .. App.runtime.world.name
         .. "\n" .. table.concat(App.discoveryReport, "\n"))
@@ -2138,6 +2478,8 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nAnti-AFK: " .. (App.antiAFKError or "ready")
         .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
         .. "\nRecovery save: " .. (App.recoverySaveError or "ready")
+        .. "\nSession save: " .. (App.sessionSaveError or App.sessionRestoreError or "ready")
+        .. "\nPlanting hook: " .. (App.runtime and App.runtime.handlers.plantSeed and "ready" or "unavailable")
         .. "\nWebhook: " .. App.webhookState.status .. "\nWebhook pending requests: " .. App.webhookState.pending
         .. "\nWorld picker: " .. (App.runtime and App.runtime.picker and (pickerOpen(App.runtime) and "visible" or "hidden") or "UI hook unavailable")
         .. "\nRecent world selection: " .. (App.recentWorldDebug or "not requested")
@@ -2157,6 +2499,10 @@ task.spawn(function()
     local ok, message = pcall(function()
         reconnect()
         listProfiles()
+        if App.sessionRestoreError then notify(App.sessionRestoreError) end
+        local plantingOK, planting = pcall(readPlantResume)
+        if plantingOK and planting then setStatus("Saved planting found. Use Resume planting on Planting.")
+        elseif not plantingOK then notify(tostring(planting)) end
         local farmOK, farm = pcall(readPNBResume)
         if farmOK and farm then setStatus("Saved farm found. Use Resume saved farm from Configurations.")
         elseif not farmOK then notify(tostring(farm)) end
@@ -2178,7 +2524,8 @@ task.spawn(function()
     elseif env.ClarisGrowbloxAutoResume then
         env.ClarisGrowbloxAutoResume = nil
         local resumed, problem = pcall(function()
-            if readPNBResume() then resumeFarm()
+            if readPlantResume() then resumePlant()
+            elseif readPNBResume() then resumeFarm()
             elseif App.resume then resumeTransfer() end
         end)
         if not resumed then setStatus(tostring(problem)); notify(tostring(problem)) end
@@ -2188,15 +2535,18 @@ task.spawn(function()
     while App.alive do
         syncRunToggles()
         refreshPNBCheckpoint()
+        pollSession()
         pollWebhook()
         local suffix = "\nProfile: " .. App.profile .. "  |  Blocks broken: " .. App.stats.broken
             .. "  |  Trips: " .. App.stats.trips .. "  |  Blocks moved: " .. App.stats.moved
             .. "  |  Gems collected: " .. App.stats.gems
             .. "\nHarvest blocks collected: " .. App.stats.harvested .. "  |  Blocks stashed: " .. App.stats.stashed
+            .. "  |  Seeds planted: " .. App.stats.planted
         pcall(function()
             paragraphSet(ui.status, "Status", App.status .. suffix)
             paragraphSet(ui.transferStatus, "Status", App.status .. suffix)
             paragraphSet(ui.harvestStatus, "Status", App.status .. suffix)
+            paragraphSet(ui.plantStatus, "Status", App.status .. suffix)
             paragraphSet(ui.log, "Recent activity", table.concat(App.logs, "\n"))
             local state = App.webhookState
             local details = state.status .. "\nInterval: " .. App.config.webhook.intervalMinutes .. " min"
