@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.11"
+local VERSION = "0.1.12"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -165,15 +165,30 @@ local function bounded(fn, seconds, token, ...)
     return awaitRequest(beginRequest(fn, ...), deadline, token)
 end
 
-local function upvalues(fn)
+local function newScan()
+    return {values = {}, names = {}, work = 0, yields = 0, reads = 0, lastYield = os.clock()}
+end
+local function scanStep(scan, stage)
+    assert(App.alive, "This script was unloaded during discovery.")
+    App.startupStage = stage
+    scan.work = scan.work + 1
+    if scan.work >= 2048 or os.clock() - scan.lastYield >= 0.006 then
+        task.wait()
+        assert(App.alive, "This script was unloaded during discovery.")
+        scan.work, scan.lastYield, scan.yields = 0, os.clock(), scan.yields + 1
+    end
+end
+local function upvalues(fn, scan)
+    if scan and scan.values[fn] then return scan.values[fn] end
+    local result
     local getAll = getupvalues or (debug and debug.getupvalues)
     if type(getAll) == "function" then
         local ok, values = pcall(getAll, fn)
-        if ok and type(values) == "table" then return values end
+        if ok and type(values) == "table" then result = values end
     end
     local getOne = getupvalue or (debug and debug.getupvalue)
-    local result = {}
-    if type(getOne) == "function" then
+    if not result and type(getOne) == "function" then
+        result = {}
         for index = 1, 100 do
             local ok, first, second = pcall(getOne, fn, index)
             if not ok or first == nil then break end
@@ -181,22 +196,32 @@ local function upvalues(fn)
             if second ~= nil then result[index] = second else result[index] = first end
         end
     end
+    result = result or {}
+    if scan then scan.values[fn], scan.reads = result, scan.reads + 1 end
     return result
 end
-local function functionName(fn)
+local function functionName(fn, scan)
+    if scan and scan.names[fn] ~= nil then return scan.names[fn] or nil end
     if debug and type(debug.info) == "function" then
         local ok, name = pcall(debug.info, fn, "n")
-        if ok and name and name ~= "" then return name end
+        if ok and name and name ~= "" then
+            if scan then scan.names[fn] = name end
+            return name
+        end
     end
     local getInfo = getinfo or (debug and debug.getinfo)
     if type(getInfo) == "function" then
         local ok, info = pcall(getInfo, fn)
-        if ok and type(info) == "table" then return info.name end
+        if ok and type(info) == "table" then
+            if scan then scan.names[fn] = info.name or false end
+            return info.name
+        end
     end
+    if scan then scan.names[fn] = false end
     return nil
 end
-local function owns(fn, world)
-    for _, value in pairs(upvalues(fn)) do
+local function owns(fn, world, scan)
+    for _, value in pairs(upvalues(fn, scan)) do
         if value == world then return true end
     end
     return false
@@ -205,15 +230,17 @@ local function readField(value, key)
     local ok, field = pcall(function() return value[key] end)
     if ok then return field end
 end
-local function findWorldPicker(world, objects)
+local function findWorldPicker(world, objects, scan)
+    scan = scan or newScan()
     if type(world.enter) ~= "function" then return nil end
     local found
     for _, fn in pairs(objects or {}) do
-        if type(fn) == "function" and functionName(fn) == "enter" then
+        scanStep(scan, "Finding world picker")
+        if type(fn) == "function" and functionName(fn, scan) == "enter" then
             local adapter, panel, hud, input
-            for _, value in pairs(upvalues(fn)) do
+            for _, value in pairs(upvalues(fn, scan)) do
                 if type(value) == "table" and rawget(value, "enter") == world.enter then adapter = value end
-                if type(value) == "function" and functionName(value) == "hud" then hud = value end
+                if type(value) == "function" and functionName(value, scan) == "hud" then hud = value end
                 local isInstance = type(typeof) == "function" and typeof(value) == "Instance"
                 if isInstance then
                     if value:IsA("GuiObject") and value:FindFirstChild("recent", true)
@@ -240,7 +267,7 @@ local function pickerOpen(r)
     return ok and visible == true
 end
 
-local function registryMap(candidate)
+local function registryMap(candidate, scan)
     if type(candidate) ~= "table" then return nil end
     local function matches(value)
         return type(value) == "table" and rawget(value, "RnyflzPbj74") ~= nil
@@ -263,14 +290,15 @@ local function registryMap(candidate)
     if type(rawget(candidate, "WaitForChild")) == "function"
         and type(rawget(candidate, "FindFirstChild")) == "function" then
         for _, method in ipairs({ "WaitForChild", "FindFirstChild" }) do
-            for _, value in pairs(upvalues(rawget(candidate, method))) do
+            for _, value in pairs(upvalues(rawget(candidate, method), scan)) do
                 if matches(value) then return value end
             end
         end
     end
 end
 
-local function resolveRegistry(objects)
+local function resolveRegistry(objects, scan)
+    scan = scan or newScan()
     local key = ReplicatedStorage:GetAttribute("Qz")
     local containers = { { label = "executor shared", value = shared },
         { label = "executor globals", value = env.shared } }
@@ -282,15 +310,16 @@ local function resolveRegistry(objects)
     end
     for _, container in ipairs(containers) do
         if key ~= nil and type(container.value) == "table" then
-            local map = registryMap(rawget(container.value, key))
+            local map = registryMap(rawget(container.value, key), scan)
             if map then return map, container.label end
         end
     end
     for _, object in pairs(objects or {}) do
-        local map = registryMap(object)
+        scanStep(scan, "Finding module registry")
+        local map = registryMap(object, scan)
         if map then return map, "GC module map" end
         if key ~= nil and type(object) == "table" then
-            map = registryMap(rawget(object, key))
+            map = registryMap(rawget(object, key), scan)
             if map then return map, "GC shared table" end
         end
     end
@@ -315,7 +344,8 @@ local function itemDefinitions(candidate)
         and display and rawget(display, "display") == true then return candidate end
 end
 
-local function resolveItems(world, objects, registry)
+local function resolveItems(world, objects, registry, scan)
+    scan = scan or newScan()
     local found, sources, seen = {}, {}, {}
     local function consider(candidate, source)
         local items = itemDefinitions(candidate)
@@ -326,13 +356,17 @@ local function resolveItems(world, objects, registry)
         end
     end
     local function inspect(fn)
-        for _, value in pairs(upvalues(fn)) do consider(value, "live world function upvalues") end
+        for _, value in pairs(upvalues(fn, scan)) do consider(value, "live world function upvalues") end
     end
     -- A definition table captured by this world's functions has stronger
     -- ownership evidence than a copied or stale table elsewhere in GC.
-    for _, value in pairs(world) do if type(value) == "function" then inspect(value) end end
-    for _, object in pairs(objects) do
-        if type(object) == "function" and owns(object, world) then inspect(object) end
+    for _, value in pairs(world) do
+        scanStep(scan, "Finding item definitions")
+        if type(value) == "function" then inspect(value) end
+    end
+    for _, object in pairs(scan.owned or objects) do
+        scanStep(scan, "Finding item definitions")
+        if type(object) == "function" and (scan.owned or owns(object, world, scan)) then inspect(object) end
     end
     if #found > 1 then
         table.insert(App.discoveryReport, "Item definitions: ambiguous live world tables (" .. #found .. ")")
@@ -354,7 +388,10 @@ local function resolveItems(world, objects, registry)
         end
     end
     table.insert(App.discoveryReport, "Registry item lookup: " .. registryIssue)
-    for _, object in pairs(objects) do consider(object, "GC item definitions") end
+    for _, object in pairs(objects) do
+        scanStep(scan, "Finding item definitions")
+        consider(object, "GC item definitions")
+    end
     if #found == 1 then return found[1], sources[found[1]] end
     table.insert(App.discoveryReport, "Item definitions: " .. (#found > 1 and "ambiguous GC tables (" .. #found .. ")" or "not found"))
     error(#found > 1
@@ -372,11 +409,16 @@ end
 
 local function discover()
     assert(type(getgc) == "function", "Delta must expose getgc(true) to read Growblox's 2D client.")
+    local scan = newScan()
+    App.startupStage = "Reading game objects"
+    task.wait() -- Let the window render before taking the executor's GC snapshot.
+    assert(App.alive, "This script was unloaded during discovery.")
     local objects = getgc(true)
-    local registry, registrySource = resolveRegistry(objects)
+    local registry, registrySource = resolveRegistry(objects, scan)
     App.discoveryReport = { "Registry: " .. registrySource }
     local worlds, physics, controls = {}, {}, {}
     for _, object in pairs(objects) do
+        scanStep(scan, "Finding world and controls")
         if type(object) == "table" then
             if type(rawget(object, "backpackNow")) == "function"
                 and type(rawget(object, "displayPut")) == "function"
@@ -406,18 +448,19 @@ local function discover()
     local issues = {}
     local gemHud
     for _, candidate in pairs(objects) do
+        scanStep(scan, "Finding player HUD")
         if type(candidate) == "table" and type(rawget(candidate, "setGems")) == "function"
             and type(rawget(candidate, "addGems")) == "function"
             and type(rawget(candidate, "setWorld")) == "function"
             and type(rawget(candidate, "isTyping")) == "function" then
-            if not gemHud or (type(rawget(candidate, "onMessage")) == "function" and owns(candidate.onMessage, world)) then
+            if not gemHud or (type(rawget(candidate, "onMessage")) == "function" and owns(candidate.onMessage, world, scan)) then
                 gemHud = candidate
             end
         end
     end
     local body
     for _, candidate in ipairs(physics) do
-        if owns(candidate.state, world) then
+        if owns(candidate.state, world, scan) then
             if body then
                 body = nil
                 table.insert(issues, "Multiple avatar controllers match the active world.")
@@ -429,7 +472,7 @@ local function discover()
     if not body then table.insert(issues, "Local avatar state hook is unavailable.") end
     if #controls ~= 1 then table.insert(issues, "Expected one touch controller; found " .. #controls .. ".") end
     local inventory
-    for _, candidate in pairs(upvalues(world.backpackNow)) do
+    for _, candidate in pairs(upvalues(world.backpackNow, scan)) do
         if inventoryObject(candidate) then
             inventory = candidate
         end
@@ -441,6 +484,7 @@ local function discover()
             local counts = {}
             for _, slot in pairs(snapshot) do counts[slot[1]] = (counts[slot[1]] or 0) + slot[2] end
             for _, candidate in pairs(objects) do
+                scanStep(scan, "Finding backpack")
                 if inventoryObject(candidate) then
                     local identical, seen = true, {}
                     for _, slot in pairs(candidate.slots) do
@@ -473,10 +517,13 @@ local function discover()
         table.insert(issues, "Backpack is readable; its live mutation hooks are unavailable.")
     end
     local handlers, ambiguousHandlers = {}, {}
+    scan.owned = {}
     for _, object in pairs(objects) do
-        if type(object) == "function" then
-            local name = functionName(object)
-            if (name == "setTile" or name == "hit" or name == "canPlace" or name == "plantSeed") and owns(object, world) then
+        scanStep(scan, "Finding game handlers")
+        if type(object) == "function" and owns(object, world, scan) then
+            table.insert(scan.owned, object)
+            local name = functionName(object, scan)
+            if name == "setTile" or name == "hit" or name == "canPlace" or name == "plantSeed" then
                 if handlers[name] or ambiguousHandlers[name] then
                     handlers[name], ambiguousHandlers[name] = nil, true
                     if name ~= "plantSeed" then table.insert(issues, "Multiple " .. name .. " handlers match the world.") end
@@ -489,17 +536,20 @@ local function discover()
     for _, name in ipairs({ "setTile", "hit", "canPlace" }) do
         if not handlers[name] then table.insert(issues, "Missing farming handler: " .. name) end
     end
-    local items, itemSource = resolveItems(world, objects, registry)
+    local items, itemSource = resolveItems(world, objects, registry, scan)
     table.insert(App.discoveryReport, "Item definitions: " .. itemSource)
     local runtime = { world = world, body = body, controls = controls[1], inventory = inventory,
         items = items, handlers = handlers, issues = issues,
         readInventoryView = readInventoryView, ready = #issues == 0, gemHud = gemHud,
-        picker = findWorldPicker(world, objects) }
+        picker = findWorldPicker(world, objects, scan) }
     table.insert(App.discoveryReport, "Inventory: " .. (readInventoryView and "readable snapshot" or "live backpack"))
     table.insert(App.discoveryReport, "Farming hooks: " .. (#issues == 0 and "ready" or table.concat(issues, " ")))
     table.insert(App.discoveryReport, "World picker: " .. (runtime.picker and "UI cleanup ready" or "UI hook unavailable"))
     table.insert(App.discoveryReport, "Planting hook: " .. (ambiguousHandlers.plantSeed and "ambiguous"
         or handlers.plantSeed and "ready" or "unavailable"))
+    App.startupStage = "Attached"
+    App.discoveryPerformance = {yields = scan.yields, upvalueReads = scan.reads}
+    table.insert(App.discoveryReport, "Discovery: " .. scan.yields .. " frame yields; " .. scan.reads .. " function upvalue reads")
     -- The game already owns tileChanged handling. Own actions are optimistic and
     -- need not receive an echo; do not add a listener or require an acknowledgment.
     return runtime
@@ -1977,6 +2027,53 @@ local function pollWebhook()
     end
 end
 
+local function seedChoices(query)
+    local r = runtime()
+    local scan, candidates, seen, relevant = newScan(), {}, {}, {}
+    query = (query or ""):match("^%s*(.-)%s*$"):lower()
+    local selectedId, selected = App.config.planting.seedId, nil
+    for _, slot in pairs(r.inventory.slots) do relevant[slot.id] = true end
+    local box = App.config.points.plantBox
+    if box and box.world == r.world.name then
+        local ok, rows = pcall(boxRows, box)
+        if ok then for _, row in pairs(rows) do relevant[row[1]] = true end end
+    end
+    if App.config.blockId > 0 then
+        local ok, id = pcall(Core.seedId, r.items, App.config.blockId)
+        if ok then relevant[id] = true end
+    end
+    local function consider(id)
+        if seen[id] or type(id) ~= "number" then return end
+        seen[id] = true
+        local item = r.items[id]
+        if type(item) ~= "table" or item.kind ~= "seed" then return end
+        local name = item.name or ("Seed " .. id)
+        if id == selectedId or query == "" or name:lower():find(query, 1, true) or tostring(id) == query then
+            local label = name .. " [" .. id .. "]"
+            table.insert(candidates, {id = id, label = label, rank = id == selectedId and 0 or relevant[id] and 1 or 2})
+            if id == selectedId then selected = label end
+        end
+    end
+    consider(selectedId)
+    for id in pairs(relevant) do consider(id) end
+    if query ~= "" then
+        for id in pairs(r.items) do
+            scanStep(scan, "Finding seed choices")
+            consider(id)
+        end
+    end
+    table.sort(candidates, function(a, b) return a.rank < b.rank or a.rank == b.rank and a.label < b.label end)
+    local labels, lookup = {}, {}
+    for index = 1, math.min(40, #candidates) do
+        local choice = candidates[index]
+        labels[index], lookup[choice.label] = choice.label, choice.id
+    end
+    table.sort(labels)
+    App.seedChoiceCount, App.seedChoiceMatches = #labels, #candidates
+    App.startupStage = "Ready"
+    return labels, lookup, selected, #candidates > #labels
+end
+
 local sessionOK, sessionProblem = pcall(restoreSession, previousSession)
 App.sessionRestoreError = not sessionOK and tostring(sessionProblem) or nil
 previousSession = nil
@@ -1998,7 +2095,7 @@ if env.ClarisGrowbloxTest then
         saveSession = saveSession, restoreSession = restoreSession, pollSession = pollSession,
         runPlant = runPlant, plantTile = plantTile, enterPlantWorld = enterPlantWorld,
         readPlantResume = readPlantResume, savePlantResume = savePlantResume, clearPlantResume = clearPlantResume,
-        reconcilePlant = reconcilePlant }
+        reconcilePlant = reconcilePlant, seedChoices = seedChoices }
 end
 
 local function loadWindUI()
@@ -2125,8 +2222,8 @@ local function refreshBlocks()
         table.insert(labels, label)
         if id == selected then selectedLabel = label end
     end
+    blockDropdown.Value = selectedLabel
     blockDropdown:Refresh(labels)
-    blockDropdown:Select(selectedLabel)
 end
 ui.points, ui.pointTitles = {}, {
     pnb = "PNB spot", blockBox = "Block storage (breaking world)", seedBox = "Seed storage (left box)",
@@ -2198,24 +2295,20 @@ App.runToggles.harvest = harvestTab:Toggle({ Title = "Collect harvest", Value = 
     Desc = "On collects and stores harvested blocks. Off stops. Turns Off when collection finishes or encounters a problem.",
     Callback = function(enabled) setRunningEnabled("harvest", enabled) end })
 local plantControls, seedLabels = {}, {}
-local function refreshSeeds()
+local seedSearch, seedSearchGeneration = "", 0
+local function refreshSeeds(syncInputs)
     if not App.runtime then return end
+    local labels, lookup, selected, more = seedChoices(seedSearch)
     App.syncingPlantUI = true
-    local labels, selected = {}, nil
-    seedLabels = {}
-    for id, item in pairs(App.runtime.items) do
-        if type(id) == "number" and type(item) == "table" and item.kind == "seed" then
-            local label = (item.name or ("Seed " .. id)) .. " [" .. id .. "]"
-            seedLabels[label] = id
-            table.insert(labels, label)
-            if id == App.config.planting.seedId then selected = label end
-        end
-    end
-    table.sort(labels)
+    seedLabels = lookup
+    plantControls.seed.Value = selected
     plantControls.seed:Refresh(labels)
-    plantControls.seed:Select(selected)
-    plantControls.storageWorld:Set(App.config.planting.storageWorld)
-    plantControls.worlds:Set(table.concat(App.config.planting.worlds, ", "))
+    if syncInputs ~= false then
+        plantControls.storageWorld:Set(App.config.planting.storageWorld)
+        plantControls.worlds:Set(table.concat(App.config.planting.worlds, ", "))
+    end
+    paragraphSet(ui.seedChoices, "Seed choices", more and "Showing up to 40 choices. Narrow the search to find another seed."
+        or "Showing backpack seeds, the selected seed, and seeds in your saved box. Search by name or exact ID for other seeds.")
     App.syncingPlantUI = false
 end
 local function changePlantSetting(key, value)
@@ -2235,6 +2328,19 @@ end
 ui.plantStatus = plantTab:Paragraph({ Title = "Status", Desc = App.status })
 plantTab:Paragraph({ Title = "Fill dirt farms with seeds", Desc = "Plant the selected seed on empty tiles with solid ground or a platform below. Doors, vents, existing trees, and floating tiles are skipped. Refill from the saved seed Display Box, then continue through your farm world list." })
 App.syncingPlantUI = true
+plantControls.search = plantTab:Input({ Title = "Find seed by name or ID", Value = "", Placeholder = "e.g. Sugar Cane or 955",
+    Callback = function(value)
+        if App.syncingPlantUI or App.syncingUI then return end
+        seedSearch, seedSearchGeneration = tostring(value or ""), seedSearchGeneration + 1
+        local generation = seedSearchGeneration
+        task.spawn(function()
+            task.wait(0.25)
+            if not App.alive or generation ~= seedSearchGeneration then return end
+            local ok, issue = pcall(refreshSeeds, false)
+            if not ok and App.alive then notify(tostring(issue)) end
+        end)
+    end })
+ui.seedChoices = plantTab:Paragraph({ Title = "Seed choices", Desc = "Backpack and saved seed choices load after connecting. Search to find other seeds." })
 plantControls.seed = plantTab:Dropdown({ Title = "Seed to plant", Values = {}, SearchBarEnabled = true,
     Callback = function(value) changePlantSetting("seedId", value) end })
 plantControls.storageWorld = plantTab:Input({ Title = "Seed storage world", Value = App.config.planting.storageWorld,
@@ -2292,8 +2398,8 @@ local function listProfiles()
         if basename then table.insert(names, basename) end
     end
     table.sort(names)
+    profileDropdown.Value = selectedProfile
     profileDropdown:Refresh(names)
-    if selectedProfile then profileDropdown:Select(selectedProfile) end
     return names
 end
 profileTab:Paragraph({ Title = "Named configurations", Desc = "Each profile saves the chosen block, saved locations, timing settings, and Discord webhook settings. Give each farm setup its own name. Files stay in Delta's ClarisGrowblox/profiles folder." })
@@ -2480,6 +2586,8 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nRecovery save: " .. (App.recoverySaveError or "ready")
         .. "\nSession save: " .. (App.sessionSaveError or App.sessionRestoreError or "ready")
         .. "\nPlanting hook: " .. (App.runtime and App.runtime.handlers.plantSeed and "ready" or "unavailable")
+        .. "\nStartup stage: " .. (App.startupStage or "Building interface")
+        .. "\nSeed choices rendered: " .. (App.seedChoiceCount or 0)
         .. "\nWebhook: " .. App.webhookState.status .. "\nWebhook pending requests: " .. App.webhookState.pending
         .. "\nWorld picker: " .. (App.runtime and App.runtime.picker and (pickerOpen(App.runtime) and "visible" or "hidden") or "UI hook unavailable")
         .. "\nRecent world selection: " .. (App.recentWorldDebug or "not requested")

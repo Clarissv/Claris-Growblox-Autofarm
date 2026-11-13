@@ -54,6 +54,7 @@ local function fixture()
         end,
         defer = function(fn) queue[#queue + 1] = fn end,
         wait = function(seconds)
+            context.waits = (context.waits or 0) + 1
             ticks = ticks + (seconds or 0.03)
             local pending = queue
             queue = {}
@@ -2350,6 +2351,136 @@ test("More than a stack of planting seeds triggers another refill in the current
     assert(f.stock == 0 and f.serverSeeds == 158)
     assert(f.entries[4] == "STOCK" and f.entries[5] == "FARM2")
     for _, name in ipairs({"FARM1", "FARM2"}) do for x = 0, 120 do assert(f.grids[name][5][x] == 955) end end
+end)
+
+local function largeSeedCatalog(f)
+    for n = 1, 10000 do f.app.runtime.items[n + 2000] = {name = string.format("Bulk Seed %05d", n), kind = "seed"} end
+end
+
+test("Actual UI startup limits seed entries, renders once, and supports a bounded catalog search", function()
+    local f = fixture()
+    largeSeedCatalog(f)
+    f.app.job, f.app.jobToken, f.app.config.planting.seedId = nil, nil, 955
+    f.inventory:add(955, 5)
+    prepareDiscovery(f, true)
+    local getter, firstGCWait = getgc, nil
+    getgc = function() firstGCWait = firstGCWait or (f.waits or 0); return getter() end
+    local controls, workers = {}, {}
+    local tab = {}
+    local function control(props)
+        local c = {Value = props.Value, Values = props.Values or {}, Props = props, refreshes = 0, maxRows = 0}
+        function c:Set(value)
+            self.Value = value
+            if props.Callback then props.Callback(value) end
+        end
+        function c:Refresh(values)
+            self.Values, self.refreshes = values, self.refreshes + 1
+            self.maxRows = math.max(self.maxRows, #values)
+            if props.Callback then props.Callback(self.Value) end
+        end
+        function c:Select(value) self.Value = value; self:Refresh(self.Values) end
+        controls[props.Title] = c
+        return c
+    end
+    for _, kind in ipairs({"Button", "Input", "Toggle", "Slider"}) do tab[kind] = function(_, props) return control(props) end end
+    function tab:Dropdown(props) local c = control(props); c:Refresh(c.Values); return c end
+    function tab:Paragraph(props)
+        local c = control(props)
+        c.ParagraphFrame = {SetTitle = function() end, SetDesc = function(_, text) c.Desc = text end}
+        return c
+    end
+    local window = {OnDestroy = function() end, Tab = function() return tab end, Destroy = function() end}
+    f.env.ClarisGrowbloxWindUI = {CreateWindow = function() return window end, Notify = function() end}
+    UDim2 = {fromOffset = function(x, y) return {x, y} end}
+    listfiles = function() return {} end
+    f.player.Idled = {Connect = function() return {Disconnect = function() end} end}
+    f.spawn = function(fn) workers[#workers + 1] = fn end
+    f.env.ClarisGrowbloxTest = false
+    local app = f.reload(true) -- Execute the actual UI path, beyond the usual test hooks.
+    assert(#workers == 2 and app.window == window)
+    workers[1]() -- Run connection/bootstrap; leave the perpetual status loop scheduled.
+    local seeds = controls["Seed to plant"]
+    assert(seeds.maxRows <= 40, "Startup built " .. seeds.maxRows .. " seed rows")
+    assert(seeds.refreshes == 2, "Seed list was rebuilt more than once after initial creation")
+    assert(firstGCWait > 0, "The GC snapshot ran before yielding a frame to the window")
+    assert(seeds.Value == "Sugar Cane Seed [955]" and app.config.planting.seedId == 955)
+    controls["Seed storage world"].Value = "UNSUBMITTED"
+    controls["Find seed by name or ID"].Props.Callback("Bulk Seed")
+    workers[3]()
+    assert(seeds.maxRows <= 40 and #seeds.Values == 40 and seeds.Value == "Sugar Cane Seed [955]")
+    assert(controls["Seed storage world"].Value == "UNSUBMITTED", "Searching overwrote another input")
+    controls["Find seed by name or ID"].Props.Callback("10001")
+    workers[4]()
+    local label
+    for _, value in ipairs(seeds.Values) do if value:find("[10001]", 1, true) then label = value end end
+    assert(label and #seeds.Values == 2)
+    seeds.Value = label
+    seeds.Props.Callback(label)
+    assert(app.config.planting.seedId == 10001 and app.config.points.farmDoor.world == "FARM")
+end)
+
+test("Default seed choices use inventory, the saved seed, box contents, and related block seed", function()
+    local f = fixture()
+    largeSeedCatalog(f)
+    f.inventory:add(955, 5)
+    f.app.config.planting.seedId = 3000
+    f.app.config.points.plantBox = f.app.config.points.blockBox
+    f.boxes[12] = {{4000, 5000}}
+    local labels, lookup, selected = f.hooks.seedChoices("")
+    assert(#labels == 3 and lookup[selected] == 3000)
+    local ids = {}
+    for _, id in pairs(lookup) do ids[id] = true end
+    assert(ids[955] and ids[3000] and ids[4000] and not ids[5000])
+end)
+
+test("Catalog searches yield and keep selection visible within a fixed render limit", function()
+    local f = fixture()
+    largeSeedCatalog(f)
+    f.app.config.planting.seedId = 955
+    local before = f.waits or 0
+    local labels, lookup, selected, more = f.hooks.seedChoices("bulk seed")
+    assert(#labels == 40 and more and lookup[selected] == 955 and (f.waits or 0) > before)
+    labels, lookup, selected = f.hooks.seedChoices("12000")
+    assert(#labels == 2 and lookup["Bulk Seed 10000 [12000]"] == 12000 and lookup[selected] == 955)
+end)
+
+test("A large discovery snapshot yields and reads each function's upvalues at most once", function()
+    local f = fixture()
+    prepareDiscovery(f, true)
+    attachWorldHandlers(f, f.app.runtime.items)
+    for n = 1, 10000 do table.insert(f.discoveryObjects, {noise = n}) end
+    for n = 1, 5000 do
+        local noise = n
+        table.insert(f.discoveryObjects, function() return noise end)
+    end
+    local reads = {}
+    getupvalues = function(fn)
+        reads[fn] = (reads[fn] or 0) + 1
+        local values = {}
+        for n = 1, 100 do
+            local name, value = debug.getupvalue(fn, n)
+            if not name then break end
+            if value ~= nil then values[n] = value end
+        end
+        return values
+    end
+    local r = f.hooks.connectGame()
+    assert(r.ready and f.app.discoveryPerformance.yields > 0)
+    for _, n in pairs(reads) do assert(n == 1, "A function's upvalues were repeatedly scanned") end
+end)
+
+test("Discovery stops at its next frame boundary when the app is unloaded", function()
+    local f = fixture()
+    prepareDiscovery(f, true)
+    for n = 1, 10000 do table.insert(f.discoveryObjects, {noise = n}) end
+    local waits = 0
+    f.onWait = function()
+        waits = waits + 1
+        if waits == 2 then f.app.alive = false end
+    end
+    f.app.runtime = nil
+    rejects(function() f.hooks.connectGame() end, "unloaded during discovery")
+    assert(f.app.runtime == nil and waits == 2)
 end)
 
 return string.format("%d actual-script runtime tests passed (mock services/server)", passed)

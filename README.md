@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.11.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.12.
+
+Version 0.1.12 reduces startup work after a reported freeze before the UI appeared. Discovery yields between batches and caches function metadata for the duration of attachment. The seed dropdown shows up to 40 relevant or matching choices, builds them once per refresh, and includes a separate search field for other seeds. Diagnostics include the current startup stage, discovery yields, and rendered seed count.
 
 Version 0.1.11 adds Planting: choose a seed, save its dedicated Display Box, and enter an ordered list of dirt farm worlds. It fills supported empty foreground tiles, refills at zero seeds, and continues through the list. Settings and saved places now restore from a local session file after script reloads and server teleports, including Moving Drops setups.
 
@@ -70,7 +72,7 @@ For an existing checkout with the GitHub remote configured, upload this rebuilt 
 ```powershell
 Set-Location -LiteralPath 'F:\VSCode\Luau\Claris Growblox Autofarm\logic'
 git add .
-git commit -m "Add planting across farm worlds and persistent sessions"
+git commit -m "Reduce startup discovery and seed menu work"
 git push
 ```
 
@@ -138,7 +140,7 @@ The webhook URL is saved in the local profile, session, and task recovery files.
 ## Set up Planting
 
 1. Enter your seed storage world and stand beside a Display Box dedicated to one seed type.
-2. Open **Planting → Save seed Display Box**. This saves the box, standing position, and storage world. A box containing seeds also selects its seed automatically. Use **Seed to plant** to choose or change the seed type.
+2. Open **Planting → Save seed Display Box**. This saves the box, standing position, and storage world. A box containing seeds also selects its seed automatically. **Seed to plant** shows backpack seeds, the saved selection, available source-box seeds, and the seed related to the selected PNB block. Use **Find seed by name or ID** to find other types. Searches show at most 40 choices and retain your current selection.
 3. Enter farm names under **Dirt farm worlds (in order)**, separated by commas, for example `FARM1, FARM2, FARM3`. Duplicate names are removed while preserving order. The storage world must be different from the farm worlds.
 4. Turn **Plant seeds** On. The script enters the first farm, plants empty supported tiles, and refills from storage when its backpack runs out. It returns to the unfinished farm after each refill, then moves to the next farm when the current scan is complete.
 5. Turn the toggle Off to stop. Named profiles also save the seed type, storage box, and farm list.
@@ -173,7 +175,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.11 passes 167 offline checks: 27 configuration/layout/storage tests, 138 tests executing the generated runtime against mock services and a mock server, and two release checks. New fixtures cover profile migration, world-list validation, seed support/occupancy, actual planting with the movement follower, repeated refills across 242 tiles, ordered farm transitions, platforms, unreachable and denied cells, native planting hook ambiguity, session restoration after reload/teleport, checkpoint validation, Stop, picker recovery, and interrupted-action reconciliation. An 82-column edge-detour fixture exposed the original 30-second movement deadline and passes with the planting allowance. Existing attachment, PNB, harvest, webhook, navigation, recovery, anti-AFK, and storage checks remain. Live planting reach, route geometry, world permissions, Delta teleport queue behavior, and Discord delivery still need in-game verification.
+Version 0.1.12 passes 172 offline checks: 27 configuration/layout/storage tests, 143 tests executing the generated runtime against mock services and a mock server, and two release checks. The new UI fixture executes startup beyond the usual test hooks, loads a 10,000-seed synthetic catalog, verifies bounded rendering with one rebuild, searches the catalog, changes the selected seed, and checks that another input is preserved. Large discovery fixtures cover 10,000 unrelated tables and 5,000 unrelated functions, frame yields, one upvalue read per function, and cancellation on unload. Existing attachment, planting, PNB, harvest, webhook, navigation, recovery, anti-AFK, and storage checks remain. These mocks do not establish live Delta frame times, planting reach, route geometry, world permissions, teleport queue behavior, or Discord delivery.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 
