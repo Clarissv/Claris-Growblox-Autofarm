@@ -232,6 +232,16 @@ test("Older profiles keep automatic harvest transfer Off and validate explicit c
     rejects(function() Core.validate(config) end, "moveAfterHarvest")
 end)
 
+test("Harvest respawn preference survives profiles and defaults On for older profiles", function()
+    local config = setup()
+    config.options.harvestRespawn = nil
+    assert(Core.validate(config).options.harvestRespawn)
+    config.options.harvestRespawn = false
+    assert(not Core.validate(config).options.harvestRespawn)
+    config.options.harvestRespawn = "yes"
+    rejects(function() Core.validate(config) end, "harvestRespawn")
+end)
+
 test("Old profiles receive empty planting settings and planting validates independent of PNB", function()
     local config = Core.defaults()
     config.planting = nil

@@ -7,6 +7,37 @@ function Navigation.steer(dx, vx, braking)
     return dx > 0 and 1 or -1
 end
 
+function Navigation.straightRuns(route)
+    local runs = {}
+    for _, step in ipairs(route) do
+        local last = runs[#runs]
+        local direction = step.x - step.fromX
+        if last and not last.jump and not step.jump and step.y == step.fromY
+            and last.y == last.fromY and last.y == step.y and last.x == step.fromX
+            and last.x - last.fromX == direction * #last.edges
+            and math.abs(direction) == 1 then
+            last.x, last.duration = step.x, last.duration + step.duration
+            table.insert(last.edges, step)
+        else
+            table.insert(runs, {x = step.x, y = step.y, fromX = step.fromX, fromY = step.fromY,
+                jump = step.jump, duration = step.duration, edges = {step}})
+        end
+    end
+    return runs
+end
+
+function Navigation.rowEnd(map, start, direction)
+    local x = start.x
+    while true do
+        local nextX = x + direction
+        if nextX < 0 or nextX >= map.w or map.solid(nextX, start.y)
+            or map.danger and (map.danger(nextX, start.y) or map.danger(nextX, start.y + 1))
+            or not (map.solid(nextX, start.y + 1) or map.platform and map.platform(nextX, start.y + 1)) then break end
+        x = nextX
+    end
+    return x
+end
+
 function Navigation.plan(map, start, goal, options)
     options = options or {}
     local speed, gravity = map.speed or 7.2, map.gravity or 55

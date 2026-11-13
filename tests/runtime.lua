@@ -921,7 +921,7 @@ local function pickupFixture()
     f.world.takeDrop = function(uid, want)
         assert(f.allowLatePickup or (f.app.controls and f.app.controls.pausePickup),
             "Direct collection must quiesce native pickups")
-        assert(f.allowLatePickup or (f.controls.dir() == 0 and not f.controls.jumping()),
+        assert(f.allowLatePickup or f.allowMovingPickup or (f.controls.dir() == 0 and not f.controls.jumping()),
             "Floating drops must not require walking")
         local drop
         for _, candidate in pairs(f.drops) do if candidate.uid == uid then drop = candidate end end
@@ -1775,6 +1775,7 @@ end)
 
 local function harvestFixture()
     local f = pickupFixture()
+    f.allowMovingPickup = true
     f.app.job, f.world.name = "harvest", "FARM"
     f.app.config.points.farmBox = {world = "FARM", x = 12, y = 8, standX = 10, standY = 8}
     f.boxes[12] = {}
@@ -1865,6 +1866,152 @@ test("Harvest collection walks to distant drops when the server requires proximi
     assert(rejected == 1 and visited["4:8"] and #f.drops == 0)
     assert(f.hooks.Core.storageCount(f.boxes[12], 954) == 20 and f.app.stats.stashed == 20)
     assert(math.abs(f.avatar.x - 10.5) < 0.16 and f.controls.dir() == 0)
+end)
+
+test("Straight walking segments merge without merging turns, jumps, or falls", function()
+    local f = fixture()
+    local route = {
+        {fromX=2,fromY=8,x=3,y=8,jump=false,duration=0.2},
+        {fromX=3,fromY=8,x=4,y=8,jump=false,duration=0.2},
+        {fromX=4,fromY=8,x=3,y=8,jump=false,duration=0.2},
+        {fromX=3,fromY=8,x=5,y=8,jump=true,duration=0.7},
+        {fromX=5,fromY=8,x=6,y=12,jump=false,duration=0.8},
+        {fromX=6,fromY=12,x=7,y=12,jump=false,duration=0.2},
+    }
+    local runs = f.hooks.Navigation.straightRuns(route)
+    assert(#runs == 5 and runs[1].x == 4 and #runs[1].edges == 2 and runs[1].duration == 0.4)
+    assert(runs[2].x == 3 and runs[3].jump and runs[4].y == 12 and runs[5].fromX == 6)
+    assert(#route == 6 and route[1].x == 3)
+end)
+
+test("A long straight movement keeps heading without braking and reversing at each tile", function()
+    local f = fixture()
+    local map = {w=30,h=20,solid=function(_,y) return y>=9 end,platform=function() return false end}
+    f.app.runtime.body.solidAt = map.solid
+    f.avatar.x, f.avatar.y, f.app.job = 3.5, 8.999, "harvest"
+    local visited = attachPhysics(f, map)
+    local physics, right = f.onWait, 0
+    f.onWait = function(dt)
+        assert(f.controls.dir() >= 0, "A straight rightward run must not reverse to recenter intermediate tiles")
+        if f.controls.dir() > 0 then right = right + 1 end
+        physics(dt)
+    end
+    f.hooks.moveTo(25,8,"BREAK",1)
+    assert(right > 0 and visited["25:8"] and os.clock() < 4.5)
+    assert(math.abs(f.avatar.x - 25.5) < 0.16 and f.controls.dir() == 0)
+end)
+
+test("Harvest collects successive row drops while moving in one direction", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    attachPhysics(f,map)
+    for uid=1,3 do f.addDrop(uid,954,10,5.5-uid,8.5) end
+    local accepted, moving = {},0
+    f.accept = function(drop,want)
+        if math.abs(drop.x-f.avatar.x)>0.6 then return 0 end
+        accepted[#accepted+1]=drop.uid
+        if f.controls.dir()<0 then moving=moving+1 end
+        return want
+    end
+    f.harvest()
+    assert(#accepted==3 and accepted[1]==1 and accepted[2]==2 and accepted[3]==3)
+    assert(moving>=2 and #f.drops==0 and f.app.stats.stashed==30)
+end)
+
+test("Harvest respawns after pickups settle and deposits the preserved backpack", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    attachPhysics(f,map)
+    f.addDrop(1,954,20,4.5,8.5)
+    f.accept = function(drop,want) return math.abs(drop.x-f.avatar.x)<=0.6 and want or 0 end
+    f.respawns=0
+    local physics, readyAt = f.onWait
+    f.world.respawn=function()
+        assert(f.app.pending==1 and f.app.stats.harvested==20 and f.serverItems[954]==20)
+        for _,drop in pairs(f.drops) do assert(not drop.taking) end
+        f.respawns=f.respawns+1
+        f.avatar.dead,readyAt=true,os.clock()+0.2
+    end
+    f.onWait=function(dt)
+        if readyAt and os.clock()>=readyAt then
+            f.avatar.x,f.avatar.y,f.avatar.vx,f.avatar.vy,f.avatar.dead=10.5,8.999,0,0,false
+            readyAt=nil
+        end
+        physics(dt)
+    end
+    f.harvest()
+    assert(f.respawns==1 and #f.deposits==1 and f.deposits[1]==20 and f.inventory:count(954)==0)
+    assert(not f.avatar.dead and f.app.pending==0)
+end)
+
+test("Disabling harvest respawn preserves the walking return to storage", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    attachPhysics(f,map)
+    f.app.config.options.harvestRespawn=false
+    f.world.respawn=function() error("Respawn is disabled") end
+    f.addDrop(1,954,20,4.5,8.5)
+    f.accept=function(drop,want) return math.abs(drop.x-f.avatar.x)<=0.6 and want or 0 end
+    f.harvest()
+    assert(f.app.stats.stashed==20 and math.abs(f.avatar.x-10.5)<0.16)
+end)
+
+test("Moving harvest batches respect backpack capacity and resume after a respawn deposit", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    attachPhysics(f,map)
+    f.addDrop(1,954,190,6.5,8.5)
+    f.addDrop(2,954,30,4.5,8.5)
+    f.accept=function(drop,want)
+        assert((f.serverItems[954] or 0)+want<=200)
+        return math.abs(drop.x-f.avatar.x)<=0.6 and want or 0
+    end
+    f.world.respawn=function()
+        assert(f.app.pending==1)
+        f.avatar.x,f.avatar.y,f.avatar.vx,f.avatar.vy=10.5,8.999,0,0
+    end
+    f.harvest()
+    assert(#f.deposits==2 and f.deposits[1]==200 and f.deposits[2]==20)
+    assert(#f.drops==0 and f.serverItems[954]==0 and f.app.stats.stashed==220 and f.app.pending==0)
+end)
+
+test("Respawn storage return waits for an asynchronous moving pickup batch", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    attachPhysics(f,map)
+    f.addDrop(1,954,20,4.5,8.5)
+    local acceptedAt,returnedAt,respawned
+    f.accept=function(drop,want)
+        if math.abs(drop.x-f.avatar.x)>0.6 then return 0 end
+        acceptedAt=os.clock()
+        task.wait(0.1)
+        returnedAt=os.clock()
+        return want
+    end
+    f.spawn=function(fn) task.defer(fn) end
+    f.world.respawn=function()
+        assert(f.app.pending==1 and returnedAt and os.clock()>=returnedAt)
+        assert(f.inventory:count(954)==20 and f.serverItems[954]==20)
+        respawned=true
+        f.avatar.x,f.avatar.y,f.avatar.vx,f.avatar.vy=10.5,8.999,0,0
+    end
+    f.harvest()
+    assert(respawned and returnedAt>acceptedAt and f.app.stats.stashed==20 and f.app.pending==0)
+end)
+
+test("Stopping during a storage respawn retains harvested blocks without depositing", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    attachPhysics(f,map)
+    f.addDrop(1,954,20,4.5,8.5)
+    f.accept=function(drop,want) return math.abs(drop.x-f.avatar.x)<=0.6 and want or 0 end
+    f.world.respawn=function() f.avatar.dead=true end
+    local physics=f.onWait
+    f.onWait=function(dt)
+        if f.avatar.dead then f.app:stop() else physics(dt) end
+    end
+    rejects(f.harvest,"Stopped")
+    assert(f.serverItems[954]==20 and f.inventory:count(954)==20 and #f.deposits==0 and f.app.pending==0)
 end)
 
 test("Harvest collection uses distant edge platforms and returns to storage from a lower row", function()

@@ -1,0 +1,3244 @@
+-- Built by build.mjs. Use the generated loader.lua in Delta.
+local Core = (function()
+-- Pure configuration and layout helpers; bundled into the runnable script.
+local Core = {}
+Core.VERSION = 1
+Core.REPO = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/"
+Core.POINTS = { "pnb", "blockBox", "seedBox", "farmBox", "farmDoor", "breakDoor", "plantBox" }
+Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest", "harvestRespawn" }
+Core.LIMITS = {
+    placeDelay = { 0.15, 2 }, punchDelay = { 0.22, 2 },
+    collectDelay = { 0, 5 }, actionTimeout = { 5, 30 },
+    moveTimeout = { 5, 90 }, seedThreshold = { 1, 200 },
+}
+
+function Core.defaults()
+    return {
+        version = Core.VERSION, blockId = 0, points = {},
+        options = { placeDelay = 0.2, punchDelay = 0.24, collectDelay = 0.1,
+            actionTimeout = 10, moveTimeout = 30, seedThreshold = 200, antiAFK = true, autoRejoin = true,
+            moveAfterHarvest = false, harvestRespawn = true },
+        webhook = { url = "", enabled = false, intervalMinutes = 5, includeBoxes = true },
+        planting = {seedId = 0, storageWorld = "", worlds = {}},
+    }
+end
+
+local function finite(n)
+    return type(n) == "number" and n == n and math.abs(n) < math.huge
+end
+
+local function integer(n, min, max)
+    return finite(n) and n == math.floor(n) and n >= min and n <= max
+end
+
+function Core.profileName(value)
+    assert(type(value) == "string", "Enter a profile name.")
+    local name = value:match("^%s*(.-)%s*$")
+    assert(#name > 0 and #name <= 48 and name:match("^[%w _%-]+$"),
+        "Use 1-48 letters, numbers, spaces, underscores, or hyphens.")
+    return name
+end
+
+function Core.webhookURL(value)
+    assert(type(value) == "string", "Enter a Discord webhook URL.")
+    local url = value:match("^%s*(.-)%s*$")
+    if url == "" then return url end
+    local host, path = url:match("^https://([^/]+)/api/(.+)$")
+    assert(host and (host == "discord.com" or host == "discordapp.com"
+        or host == "canary.discord.com" or host == "ptb.discord.com"), "Use an HTTPS Discord webhook URL.")
+    path = path:gsub("^v%d+/", ""):gsub("/$", "")
+    assert(#url <= 300 and path:match("^webhooks/%d+/[%w_%-]+$"), "Use a valid Discord webhook URL.")
+    return url:gsub("/$", "")
+end
+
+function Core.validateWebhook(input)
+    local out = Core.defaults().webhook
+    if input == nil then return out end
+    assert(type(input) == "table", "Invalid webhook settings.")
+    out.url = Core.webhookURL(input.url)
+    assert(type(input.enabled) == "boolean" and type(input.includeBoxes) == "boolean", "Invalid webhook toggles.")
+    assert(finite(input.intervalMinutes) and input.intervalMinutes >= 1 and input.intervalMinutes <= 1440,
+        "Webhook interval must be between 1 and 1440 minutes.")
+    assert(not input.enabled or out.url ~= "", "Set the Discord webhook URL before enabling reports.")
+    out.enabled, out.includeBoxes, out.intervalMinutes = input.enabled, input.includeBoxes, input.intervalMinutes
+    return out
+end
+
+function Core.worldName(value)
+    assert(type(value) == "string", "Enter a world name.")
+    local name = value:match("^%s*(.-)%s*$"):upper()
+    assert(#name > 0 and #name <= 48 and name:match("^[%w_%-]+$"), "Use a world name with 1-48 letters, digits, underscores, or hyphens.")
+    return name
+end
+
+function Core.parseWorlds(value)
+    assert(type(value) == "string", "Enter farm worlds separated by commas.")
+    local worlds, seen = {}, {}
+    for part in value:gmatch("[^,;\r\n]+") do
+        if part:match("%S") then
+            local name = Core.worldName(part)
+            if not seen[name] then table.insert(worlds, name); seen[name] = true end
+        end
+    end
+    assert(#worlds <= 50, "Use at most 50 farm worlds.")
+    return worlds
+end
+
+function Core.validatePlanting(input)
+    if input == nil then return Core.defaults().planting end
+    assert(type(input) == "table" and integer(input.seedId, 0, 65535)
+        and type(input.storageWorld) == "string" and type(input.worlds) == "table", "Invalid planting settings.")
+    local out = {seedId = input.seedId, storageWorld = input.storageWorld == "" and "" or Core.worldName(input.storageWorld), worlds = {}}
+    local seen = {}
+    for index, value in pairs(input.worlds) do
+        assert(integer(index, 1, #input.worlds), "Invalid farm world list.")
+        local name = Core.worldName(value)
+        assert(not seen[name], "Duplicate farm world: " .. name)
+        seen[name], out.worlds[index] = true, name
+    end
+    assert(#out.worlds <= 50, "Use at most 50 farm worlds.")
+    return out
+end
+
+function Core.validate(input)
+    assert(type(input) == "table" and input.version == Core.VERSION, "Unsupported or damaged profile.")
+    assert(integer(input.blockId, 0, 65535), "Invalid block ID in profile.")
+    assert(type(input.points) == "table" and type(input.options) == "table", "Incomplete profile.")
+    local out = Core.defaults()
+    out.webhook = Core.validateWebhook(input.webhook)
+    out.planting = Core.validatePlanting(input.planting)
+    out.blockId = input.blockId
+    for key, limits in pairs(Core.LIMITS) do
+        local value = input.options[key]
+        assert(finite(value) and value >= limits[1] and value <= limits[2], "Invalid setting: " .. key)
+        if key == "seedThreshold" then
+            assert(value == math.floor(value), "Seed threshold must be a whole number.")
+        end
+        out.options[key] = value
+    end
+    for _, key in ipairs(Core.BOOL_OPTIONS) do
+        local value = input.options[key]
+        if value ~= nil then
+            assert(type(value) == "boolean", "Invalid setting: " .. key)
+            out.options[key] = value
+        end
+    end
+    for _, key in ipairs(Core.POINTS) do
+        local point = input.points[key]
+        if point ~= nil then
+            assert(type(point) == "table" and type(point.world) == "string" and #point.world > 0,
+                "Invalid saved world: " .. key)
+            assert(integer(point.x, 0, 65535) and integer(point.y, 0, 65535), "Invalid tile: " .. key)
+            local copy = { world = point.world, x = point.x, y = point.y }
+            if key ~= "pnb" then
+                assert(integer(point.standX, 0, 65535) and integer(point.standY, 0, 65535),
+                    "Missing standing position: " .. key)
+                copy.standX, copy.standY = point.standX, point.standY
+            end
+            out.points[key] = copy
+        end
+    end
+    return out
+end
+
+function Core.grid(anchor)
+    local result = {}
+    -- One block directly above the player keeps new drops within pickup reach.
+    table.insert(result, { x = anchor.x, y = anchor.y - 1 })
+    return result
+end
+
+function Core.seedId(items, blockId)
+    local item = items[blockId]
+    assert(item, "Selected block is missing from the current game data.")
+    local id = item.seedId or blockId + 1
+    assert(items[id] and items[id].kind == "seed", "This block has no supported seed type.")
+    return id
+end
+
+function Core.farmable(item)
+    return type(item) == "table" and (item.kind == nil or item.kind == "block") and not item.background
+        and not item.lock and not item.area and not item.display and not item.displayOne
+        and not item.entrance and not item.door and not item.idOnly and not item.vip
+        and type(item.hits) == "number" and item.hits > 0
+end
+
+function Core.storageCount(rows, itemId)
+    local count = 0
+    for _, row in pairs(rows or {}) do
+        assert(type(row) == "table" and row[1] == itemId,
+            "This storage box contains a different item. Use a box dedicated to the selected item.")
+        assert(integer(row[2], 0, 4294967295), "Invalid storage count.")
+        count = count + row[2]
+    end
+    return count
+end
+
+-- Reporting can count the selected item in mixed boxes without changing them.
+function Core.itemCount(rows, itemId)
+    assert(type(rows) == "table", "Display contents are unavailable.")
+    local total = 0
+    for _, row in pairs(rows) do
+        assert(type(row) == "table" and integer(row[1], 0, 65535)
+            and integer(row[2], 0, 4294967295), "Invalid display contents.")
+        if row[1] == itemId then total = total + row[2] end
+    end
+    return total
+end
+
+function Core.plantingTile(world, items, x, y)
+    if x < 0 or x >= world.w or y < 0 or y >= world.h - 1 then return false end
+    if not world.fg[y] or world.fg[y][x] ~= 0 then return false end
+    local below = items[world.fg[y + 1] and world.fg[y + 1][x] or 0]
+    return below ~= nil and (below.solid == true or below.platform == true)
+end
+
+function Core.plantingTiles(world, items)
+    local tiles, rows = {}, 0
+    for y = 0, world.h - 2 do
+        local row = {}
+        for x = 0, world.w - 1 do
+            if Core.plantingTile(world, items, x, y) then table.insert(row, {x = x, y = y}) end
+        end
+        if #row > 0 then
+            rows = rows + 1
+            for n = 1, #row do table.insert(tiles, row[rows % 2 == 1 and n or #row - n + 1]) end
+        end
+    end
+    return tiles
+end
+
+function Core.checkSetup(config, mode, items)
+    assert(mode == "pnb" or mode == "transfer" or mode == "harvest" or mode == "plant", "Unknown farming task.")
+    if mode == "plant" then
+        local p = Core.validatePlanting(config.planting)
+        assert(items[p.seedId] and items[p.seedId].kind == "seed", "Choose a seed on the Planting tab.")
+        assert(p.storageWorld ~= "" and config.points.plantBox, "Save the planting seed Display Box and storage world first.")
+        assert(config.points.plantBox.world:upper() == p.storageWorld, "The saved seed Display Box must be in the entered storage world.")
+        assert(#p.worlds > 0, "Enter at least one dirt farm world.")
+        for _, name in ipairs(p.worlds) do assert(name ~= p.storageWorld, "Seed storage and dirt farm worlds must be different.") end
+        return true
+    end
+    assert(Core.farmable(items[config.blockId]), "Choose a farmable block from your inventory.")
+    local keys = mode == "pnb" and { "pnb", "blockBox", "seedBox" }
+        or mode == "harvest" and { "farmBox" }
+        or { "farmBox", "farmDoor", "blockBox", "breakDoor" }
+    for _, key in ipairs(keys) do
+        assert(config.points[key], "Save this location first: " .. key)
+    end
+    local p = config.points
+    if mode == "pnb" then
+        Core.seedId(items, config.blockId)
+        assert(p.pnb.world == p.blockBox.world and p.pnb.world == p.seedBox.world,
+            "PNB spot and both storage boxes must be in the same world.")
+        assert(p.seedBox.x == p.pnb.x - 2 and p.seedBox.y == p.pnb.y
+            and p.blockBox.x == p.pnb.x + 2 and p.blockBox.y == p.pnb.y,
+            "Layout must be: seed box, empty tile, player, empty tile, block box.")
+        assert(p.pnb.x >= 2 and p.pnb.y >= 1, "PNB tile or storage layout is outside the world.")
+    elseif mode == "transfer" then
+        assert(p.farmBox.world == p.farmDoor.world, "Farm storage and farm door must be in the same world.")
+        assert(p.blockBox.world == p.breakDoor.world, "Block storage and return door must be in the same world.")
+        assert(p.farmBox.world ~= p.blockBox.world, "Farm and breaking worlds must be different.")
+    end
+    return true
+end
+
+return Core
+
+end)()
+local Navigation = (function()
+-- Pure 2D walking/jumping planner. Coordinates use the game's downward Y axis.
+local Navigation = {}
+
+function Navigation.steer(dx, vx, braking)
+    if math.abs(dx) < 0.06 then return 0 end
+    if vx * dx > 0 and math.abs(dx) <= vx * vx / (2 * (braking or 17)) + 0.04 then return 0 end
+    return dx > 0 and 1 or -1
+end
+
+function Navigation.straightRuns(route)
+    local runs = {}
+    for _, step in ipairs(route) do
+        local last = runs[#runs]
+        local direction = step.x - step.fromX
+        if last and not last.jump and not step.jump and step.y == step.fromY
+            and last.y == last.fromY and last.y == step.y and last.x == step.fromX
+            and last.x - last.fromX == direction * #last.edges
+            and math.abs(direction) == 1 then
+            last.x, last.duration = step.x, last.duration + step.duration
+            table.insert(last.edges, step)
+        else
+            table.insert(runs, {x = step.x, y = step.y, fromX = step.fromX, fromY = step.fromY,
+                jump = step.jump, duration = step.duration, edges = {step}})
+        end
+    end
+    return runs
+end
+
+function Navigation.rowEnd(map, start, direction)
+    local x = start.x
+    while true do
+        local nextX = x + direction
+        if nextX < 0 or nextX >= map.w or map.solid(nextX, start.y)
+            or map.danger and (map.danger(nextX, start.y) or map.danger(nextX, start.y + 1))
+            or not (map.solid(nextX, start.y + 1) or map.platform and map.platform(nextX, start.y + 1)) then break end
+        x = nextX
+    end
+    return x
+end
+
+function Navigation.plan(map, start, goal, options)
+    options = options or {}
+    local speed, gravity = map.speed or 7.2, map.gravity or 55
+    local jumpSpeed = map.jumpSpeed or 19.8997487421324
+    local minX = math.max(0, math.min(start.x, goal.x) - 12)
+    local maxX = math.min(map.w - 1, math.max(start.x, goal.x) + 12)
+    local minY = math.max(0, math.min(start.y, goal.y) - 5)
+    local maxY = math.min(map.h - 2, math.max(start.y, goal.y) + 12)
+    if options.fullWorld then minX, maxX, minY, maxY = 0, map.w - 1, 0, map.h - 2 end
+    local solids, supports, stands = {}, {}, {}
+    local function key(x, y) return y * map.w + x end
+    local function solid(x, y)
+        if x < 0 or x >= map.w or y >= map.h then return true end
+        if y < 0 then return false end
+        local k = key(x, y)
+        if solids[k] == nil then solids[k] = map.solid(x, y) and true or false end
+        return solids[k]
+    end
+    local function danger(x, y) return map.danger and map.danger(x, y) end
+    local function support(x, y)
+        if x < 0 or x >= map.w or y < 0 or y >= map.h then return false end
+        local k = key(x, y)
+        if supports[k] == nil then
+            supports[k] = not danger(x, y) and (solid(x, y) or (map.platform and map.platform(x, y))) and true or false
+        end
+        return supports[k]
+    end
+    local function fits(x, feet)
+        for tx = math.floor(x - 0.299), math.floor(x + 0.299) do
+            for ty = math.floor(feet - 0.949), math.floor(feet - 0.002) do
+                if solid(tx, ty) or danger(tx, ty) then return false end
+            end
+        end
+        return true
+    end
+    local function standable(x, y)
+        if x < minX or x > maxX or y < minY or y > maxY then return false end
+        local k = key(x, y)
+        if stands[k] == nil then stands[k] = fits(x + 0.5, y + 1) and support(x, y + 1) end
+        return stands[k]
+    end
+    if not standable(goal.x, goal.y) then return nil, "The saved standing tile has no accessible support or headroom." end
+    if not standable(start.x, start.y) then return nil, "Wait until the avatar is standing on a floor or platform." end
+    local function travel(from, to, jumping)
+        local x, feet, vx, vy = from.x + 0.5, from.y + 1, 0, jumping and -jumpSpeed or 0
+        local targetX, dt = to.x + 0.5, 0.025
+        -- A farm's open columns can extend all the way to its bottom floor.
+        -- Keep the simulation long enough to reach that landing surface.
+        local steps = math.ceil((2.5 + math.max(0, to.y - from.y) / 24) / dt)
+        for step = 1, steps do
+            local direction = Navigation.steer(targetX - x, vx)
+            local desired = direction * speed
+            local acceleration = direction == 0 and 17 or 22
+            if vx < desired then vx = math.min(desired, vx + acceleration * dt)
+            else vx = math.max(desired, vx - acceleration * dt) end
+            local nx = x + vx * dt
+            if fits(nx, feet) then x = nx else vx = 0 end
+            vy = math.min(24, vy + gravity * dt)
+            local nextFeet = feet + vy * dt
+            local onLaunchFloor = false
+            if vy >= 0 then
+                for row = math.ceil(feet - 0.001), math.floor(nextFeet + 0.001) do
+                    if support(math.floor(x - 0.299), row) or support(math.floor(x + 0.299), row) then
+                        if math.abs(x - targetX) < 0.35 and row == to.y + 1 then return step * dt end
+                        if not jumping and row == from.y + 1 then
+                            feet, vy, onLaunchFloor = row, 0, true
+                            break
+                        end
+                        return nil -- Landed on an intermediate surface; plan it as a separate hop.
+                    end
+                end
+            end
+            if onLaunchFloor then -- Walk off the current ledge before simulating its fall.
+            elseif fits(x, nextFeet) then feet = nextFeet
+            elseif vy < 0 then vy = 0
+            else return nil end
+            if feet > maxY + 2 then return nil end
+        end
+    end
+    local function estimate(x, y) return (math.abs(x - goal.x) + math.abs(y - goal.y) * 0.6) / speed end
+    local initial = {x = start.x, y = start.y, cost = 0, score = estimate(start.x, start.y)}
+    local open, best, closed = {initial}, {[key(start.x, start.y)] = initial}, {}
+    local expansions = 0
+    while #open > 0 and expansions < (options.maxNodes or 1600) do
+        local selected = 1
+        for index = 2, #open do if open[index].score < open[selected].score then selected = index end end
+        local node = table.remove(open, selected)
+        local nodeKey = key(node.x, node.y)
+        if not closed[nodeKey] then
+            if node.x == goal.x and node.y == goal.y then
+                local route = {}
+                while node.parent do
+                    table.insert(route, 1, {x = node.x, y = node.y, jump = node.jump,
+                        fromX = node.parent.x, fromY = node.parent.y, duration = node.duration})
+                    node = node.parent
+                end
+                return route
+            end
+            closed[nodeKey], expansions = true, expansions + 1
+            if options.step and expansions % 64 == 0 then options.step() end
+            local function offer(x, y, jumping)
+                if not standable(x, y) then return end
+                local destinationKey = key(x, y)
+                local edgeKey = nodeKey .. ":" .. destinationKey .. ":" .. tostring(jumping)
+                if closed[destinationKey] or (options.banned and options.banned[edgeKey]) then return end
+                local duration
+                if not jumping and y == node.y then duration = 1 / speed
+                else duration = travel(node, {x = x, y = y}, jumping) end
+                if not duration then return end
+                local cost = node.cost + duration + (jumping and 0.12 or 0)
+                if not best[destinationKey] or cost < best[destinationKey].cost then
+                    local nextNode = {x = x, y = y, cost = cost, score = cost + estimate(x, y),
+                        parent = node, jump = jumping, duration = duration}
+                    best[destinationKey] = nextNode
+                    table.insert(open, nextNode)
+                end
+            end
+            for _, dx in ipairs({-1, 1}) do
+                for dy = 0, maxY - node.y do
+                    if standable(node.x + dx, node.y + dy) then offer(node.x + dx, node.y + dy, false); break end
+                    if solid(node.x + dx, node.y + dy) then break end
+                end
+            end
+            for dx = -4, 4 do
+                for dy = -3, 3 do
+                    if dx ~= 0 or dy ~= 0 then offer(node.x + dx, node.y + dy, true) end
+                end
+            end
+        end
+    end
+    return nil, "No walking/jumping route reaches the saved spot. Check door access and stepping platforms."
+end
+
+function Navigation.pickupGoal(map, state, drop, options)
+    options = options or {}
+    local search = {fullWorld = true, maxNodes = math.min(12000, map.w * map.h), step = options.step}
+    local start = {x = math.floor(state.x), y = math.floor(state.y - 0.01)}
+    local centerX, centerY = math.floor(drop.x), math.floor(drop.y)
+    local candidates = {}
+    for y = centerY - 1, centerY + 2 do
+        for x = centerX - 1, centerX + 1 do
+            if x >= 0 and x < map.w and y >= 0 and y < map.h - 1
+                and math.abs(drop.x - (x + 0.5)) <= 1.25
+                and drop.y >= y - 1.5 and drop.y <= y + 1.25
+                and not map.solid(x, y) and not (map.danger and map.danger(x, y))
+                and not (map.danger and map.danger(x, y + 1))
+                and (map.solid(x, y + 1) or (map.platform and map.platform(x, y + 1))) then
+                local distance = math.abs(drop.x - (x + 0.5)) + math.abs(drop.y - (y + 0.5))
+                table.insert(candidates, {x = x, y = y, score = distance})
+            end
+        end
+    end
+    table.sort(candidates, function(a, b) return a.score < b.score end)
+    local reason
+    for _, goal in ipairs(candidates) do
+        local route, message = Navigation.plan(map, start, goal, search)
+        if route then return {x = goal.x, y = goal.y} end
+        reason = message
+    end
+    return nil, "No reachable floor or platform is close to this harvested drop."
+        .. (#candidates == 0 and " No safe supported pickup tile is in range." or " " .. tostring(reason))
+end
+
+return Navigation
+
+end)()
+local VERSION = "0.1.14"
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local player = Players.LocalPlayer
+local env = getgenv and getgenv() or _G
+local ROOT = "ClarisGrowblox"
+local PROFILE_DIR = ROOT .. "/profiles"
+local RESUME_FILE = ROOT .. "/resume.json"
+local PNB_RESUME_FILE = ROOT .. "/pnb-resume.json"
+local SESSION_FILE = ROOT .. "/session.json"
+local PLANT_RESUME_FILE = ROOT .. "/plant-resume.json"
+local previousSession = env.ClarisGrowbloxApp
+
+if env.ClarisGrowbloxApp then
+    -- Reloading an idle script should preserve a paused transfer checkpoint.
+    local previous = env.ClarisGrowbloxApp
+    previous.alive = false
+    previous.token = previous.token + 1
+    if previous.idleConnection then pcall(function() previous.idleConnection:Disconnect() end) end
+    if previous.controls then
+        local hold = previous.controls
+        if hold.table.dir == hold.dirOverride then hold.table.dir = hold.dir end
+        if hold.table.jumping == hold.jumpOverride then hold.table.jumping = hold.jumping end
+        if hold.world.displayTake == hold.displayOverride then hold.world.displayTake = hold.displayTake end
+        if hold.world.takeDrop == hold.takeOverride then hold.world.takeDrop = hold.takeDrop end
+        previous.controls = nil
+    end
+    if previous.window then pcall(function() previous.window:Destroy() end) end
+end
+
+local function decode(text)
+    return HttpService:JSONDecode(text)
+end
+local function encode(value)
+    return HttpService:JSONEncode(value)
+end
+local function exists(path)
+    return type(isfile) == "function" and isfile(path)
+end
+local function filesystem()
+    assert(type(readfile) == "function" and type(writefile) == "function"
+        and type(isfolder) == "function" and type(makefolder) == "function",
+        "Delta file functions are unavailable. Profile saving needs readfile/writefile/makefolder.")
+    if not isfolder(ROOT) then makefolder(ROOT) end
+    if not isfolder(PROFILE_DIR) then makefolder(PROFILE_DIR) end
+end
+local function writeJSON(path, value)
+    filesystem()
+    local text = encode(value)
+    local staged = path .. ".pending"
+    writefile(staged, text)
+    assert(readfile(staged) == text, "Could not verify the saved file.")
+    if exists(path) then writefile(path .. ".bak", readfile(path)) end
+    writefile(path, text)
+    assert(readfile(path) == text, "Could not finish saving. The previous file is in .bak.")
+    if type(delfile) == "function" then pcall(delfile, staged) end
+end
+
+local App = {
+    alive = true, job = nil, token = 0, pending = 0, configuring = false,
+    config = Core.defaults(), profile = "Default", status = "Connecting to Growblox...",
+    logs = {}, controls = nil, runtime = nil, resume = nil,
+    connectionError = nil, discoveryReport = {},
+    stats = { broken = 0, trips = 0, moved = 0, gems = 0, harvested = 0, stashed = 0, planted = 0 }, runToggles = {},
+    webhookState = { pending = 0, generation = 0, status = "Automatic reports are Off." },
+    loadedAt = os.clock(),
+}
+env.ClarisGrowbloxApp = App
+local WindUI
+local ui = {}
+
+local function saveSession()
+    local config, profile = Core.validate(App.config), Core.profileName(App.profile)
+    local signature = encode({config = config, profile = profile})
+    if signature == App.sessionSignature then return end
+    writeJSON(SESSION_FILE, {version = 1, userId = player.UserId, config = config, profile = profile})
+    App.sessionSignature, App.sessionSaveError = signature, nil
+end
+local function restoreSession(previous)
+    local record
+    if previous and previous.config then
+        record = {version = 1, userId = player.UserId, config = previous.config, profile = previous.profile}
+    elseif exists(SESSION_FILE) then record = decode(readfile(SESSION_FILE)) end
+    if not record then return false end
+    assert(type(record) == "table" and record.version == 1 and record.userId == player.UserId,
+        "The saved session belongs to another account or script version.")
+    App.config, App.profile = Core.validate(record.config), Core.profileName(record.profile)
+    return true
+end
+local function pollSession()
+    if App.alive and not App.configuring then
+        local ok, problem = pcall(saveSession)
+        App.sessionSaveError = not ok and tostring(problem) or nil
+    end
+end
+
+local function syncRunToggles()
+    App.syncingRunToggles = true
+    for mode, control in pairs(App.runToggles) do
+        local enabled = App.alive and App.job == mode and App.jobToken == App.token
+        if control.Value ~= enabled then
+            pcall(function() control:Set(enabled, false, false) end)
+        end
+    end
+    App.syncingRunToggles = false
+end
+
+local function setStatus(text)
+    App.status = text
+    print("[Claris Growblox] " .. text)
+    table.insert(App.logs, 1, os.date("%H:%M:%S") .. "  " .. text)
+    if #App.logs > 30 then table.remove(App.logs) end
+end
+local function notify(text)
+    if WindUI then
+        pcall(function()
+            WindUI:Notify({ Title = "Claris Growblox", Content = text, Duration = 6 })
+        end)
+    end
+end
+local function idle()
+    assert(App.alive, "This script was unloaded.")
+    assert(not App.job and not App.configuring and App.pending == 0,
+        "Stop the current task and wait for pending requests before changing setup.")
+end
+local function checkpoint(token)
+    assert(App.alive and App.job and token == App.token, "Stopped.")
+end
+local function pause(seconds, token)
+    local deadline = os.clock() + seconds
+    repeat
+        if token then checkpoint(token) end
+        task.wait(math.min(0.05, math.max(0, deadline - os.clock())))
+    until os.clock() >= deadline
+end
+local function beginRequest(fn, ...)
+    local arguments = table.pack(...)
+    local request = { done = false }
+    App.pending = App.pending + 1
+    task.spawn(function()
+        request.result = table.pack(pcall(fn, table.unpack(arguments, 1, arguments.n)))
+        App.pending = App.pending - 1
+        request.done = true
+    end)
+    return request
+end
+local function awaitRequest(request, deadline, token)
+    while not request.done do
+        if token then checkpoint(token) end
+        assert(App.alive, "Script unloaded.")
+        assert(os.clock() < deadline, "Request timed out. Wait for it to finish before restarting.")
+        task.wait(0.05)
+    end
+    if token then checkpoint(token) end
+    if not request.result[1] then error(request.result[2], 0) end
+    return table.unpack(request.result, 2, request.result.n)
+end
+local function bounded(fn, seconds, token, ...)
+    local deadline = os.clock() + seconds
+    return awaitRequest(beginRequest(fn, ...), deadline, token)
+end
+
+local function newScan()
+    return {values = {}, names = {}, work = 0, yields = 0, reads = 0, lastYield = os.clock()}
+end
+local function scanStep(scan, stage)
+    assert(App.alive, "This script was unloaded during discovery.")
+    App.startupStage = stage
+    scan.work = scan.work + 1
+    if scan.work >= 2048 or os.clock() - scan.lastYield >= 0.006 then
+        task.wait()
+        assert(App.alive, "This script was unloaded during discovery.")
+        scan.work, scan.lastYield, scan.yields = 0, os.clock(), scan.yields + 1
+    end
+end
+local function upvalues(fn, scan)
+    if scan and scan.values[fn] then return scan.values[fn] end
+    local result
+    local getAll = getupvalues or (debug and debug.getupvalues)
+    if type(getAll) == "function" then
+        local ok, values = pcall(getAll, fn)
+        if ok and type(values) == "table" then result = values end
+    end
+    local getOne = getupvalue or (debug and debug.getupvalue)
+    if not result and type(getOne) == "function" then
+        result = {}
+        for index = 1, 100 do
+            local ok, first, second = pcall(getOne, fn, index)
+            if not ok or first == nil then break end
+            -- Executors return a value; standard Lua returns name, value.
+            if second ~= nil then result[index] = second else result[index] = first end
+        end
+    end
+    result = result or {}
+    if scan then scan.values[fn], scan.reads = result, scan.reads + 1 end
+    return result
+end
+local function functionName(fn, scan)
+    if scan and scan.names[fn] ~= nil then return scan.names[fn] or nil end
+    if debug and type(debug.info) == "function" then
+        local ok, name = pcall(debug.info, fn, "n")
+        if ok and name and name ~= "" then
+            if scan then scan.names[fn] = name end
+            return name
+        end
+    end
+    local getInfo = getinfo or (debug and debug.getinfo)
+    if type(getInfo) == "function" then
+        local ok, info = pcall(getInfo, fn)
+        if ok and type(info) == "table" then
+            if scan then scan.names[fn] = info.name or false end
+            return info.name
+        end
+    end
+    if scan then scan.names[fn] = false end
+    return nil
+end
+local function owns(fn, world, scan)
+    for _, value in pairs(upvalues(fn, scan)) do
+        if value == world then return true end
+    end
+    return false
+end
+local function readField(value, key)
+    local ok, field = pcall(function() return value[key] end)
+    if ok then return field end
+end
+local function findWorldPicker(world, objects, scan)
+    scan = scan or newScan()
+    if type(world.enter) ~= "function" then return nil end
+    local found
+    for _, fn in pairs(objects or {}) do
+        scanStep(scan, "Finding world picker")
+        if type(fn) == "function" and functionName(fn, scan) == "enter" then
+            local adapter, panel, hud, input
+            for _, value in pairs(upvalues(fn, scan)) do
+                if type(value) == "table" and rawget(value, "enter") == world.enter then adapter = value end
+                if type(value) == "function" and functionName(value, scan) == "hud" then hud = value end
+                local isInstance = type(typeof) == "function" and typeof(value) == "Instance"
+                if isInstance then
+                    if value:IsA("GuiObject") and value:FindFirstChild("recent", true)
+                        and value:FindFirstChild("WorldName", true) then panel = value end
+                    if value:IsA("TextBox") then input = value end
+                end
+            end
+            if adapter and panel and hud then
+                if found and found.panel ~= panel then return nil end
+                found = {panel = panel, complete = function()
+                    -- Match the normal picker entry's HUD and focus cleanup.
+                    panel.Visible = false
+                    hud()
+                    if input then input:ReleaseFocus() end
+                end}
+            end
+        end
+    end
+    return found
+end
+local function pickerOpen(r)
+    if not r or not r.picker then return false end
+    local ok, visible = pcall(function() return r.picker.panel.Visible end)
+    return ok and visible == true
+end
+
+local function registryMap(candidate, scan)
+    if type(candidate) ~= "table" then return nil end
+    local function matches(value)
+        return type(value) == "table" and rawget(value, "RnyflzPbj74") ~= nil
+    end
+    if matches(candidate) then return candidate end
+    -- The game publishes a proxy whose module references live in __index.
+    -- Inspect that table without invoking arbitrary GC-table metamethods.
+    local ok, meta = pcall(getmetatable, candidate)
+    if ok and type(meta) == "table" and matches(rawget(meta, "__index")) then
+        return rawget(meta, "__index")
+    end
+    if type(getrawmetatable) == "function" then
+        ok, meta = pcall(getrawmetatable, candidate)
+        if ok and type(meta) == "table" and matches(rawget(meta, "__index")) then
+            return rawget(meta, "__index")
+        end
+    end
+    -- Both published proxy methods close over the same map. Reading their
+    -- upvalues works even when Delta cannot expose the proxy's metatable.
+    if type(rawget(candidate, "WaitForChild")) == "function"
+        and type(rawget(candidate, "FindFirstChild")) == "function" then
+        for _, method in ipairs({ "WaitForChild", "FindFirstChild" }) do
+            for _, value in pairs(upvalues(rawget(candidate, method), scan)) do
+                if matches(value) then return value end
+            end
+        end
+    end
+end
+
+local function resolveRegistry(objects, scan)
+    scan = scan or newScan()
+    local key = ReplicatedStorage:GetAttribute("Qz")
+    local containers = { { label = "executor shared", value = shared },
+        { label = "executor globals", value = env.shared } }
+    if type(getrenv) == "function" then
+        local ok, gameEnvironment = pcall(getrenv)
+        if ok and type(gameEnvironment) == "table" then
+            table.insert(containers, { label = "game runtime shared", value = gameEnvironment.shared })
+        end
+    end
+    for _, container in ipairs(containers) do
+        if key ~= nil and type(container.value) == "table" then
+            local map = registryMap(rawget(container.value, key), scan)
+            if map then return map, container.label end
+        end
+    end
+    for _, object in pairs(objects or {}) do
+        scanStep(scan, "Finding module registry")
+        local map = registryMap(object, scan)
+        if map then return map, "GC module map" end
+        if key ~= nil and type(object) == "table" then
+            map = registryMap(rawget(object, key), scan)
+            if map then return map, "GC shared table" end
+        end
+    end
+    return nil, "unavailable; Qz attribute: " .. (key ~= nil and "present" or "missing")
+end
+
+local function itemDefinitions(candidate)
+    if type(candidate) ~= "table" then return nil end
+    -- Stable item IDs and independent categories distinguish definitions from
+    -- inventory rows, world grids, atlases, and unrelated GC tables. Inspect raw
+    -- fields only, and never require an arbitrary ModuleScript found in GC.
+    local function entry(id, name)
+        local value = rawget(candidate, id)
+        if type(value) == "table" and rawget(value, "name") == name then return value end
+    end
+    local blank, dirt, fist = entry(0, "Blank"), entry(2, "Dirt"), entry(18, "Fist")
+    local door, display = entry(12, "Door"), entry(1422, "Display Box")
+    if blank and rawget(blank, "solid") == false
+        and dirt and rawget(dirt, "solid") == true and type(rawget(dirt, "hits")) == "number"
+        and fist and rawget(fist, "kind") == "tool"
+        and door and rawget(door, "door") == true
+        and display and rawget(display, "display") == true then return candidate end
+end
+
+local function resolveItems(world, objects, registry, scan)
+    scan = scan or newScan()
+    local found, sources, seen = {}, {}, {}
+    local function consider(candidate, source)
+        local items = itemDefinitions(candidate)
+        if items and not seen[items] then
+            seen[items] = true
+            table.insert(found, items)
+            sources[items] = source
+        end
+    end
+    local function inspect(fn)
+        for _, value in pairs(upvalues(fn, scan)) do consider(value, "live world function upvalues") end
+    end
+    -- A definition table captured by this world's functions has stronger
+    -- ownership evidence than a copied or stale table elsewhere in GC.
+    for _, value in pairs(world) do
+        scanStep(scan, "Finding item definitions")
+        if type(value) == "function" then inspect(value) end
+    end
+    for _, object in pairs(scan.owned or objects) do
+        scanStep(scan, "Finding item definitions")
+        if type(object) == "function" and (scan.owned or owns(object, world, scan)) then inspect(object) end
+    end
+    if #found > 1 then
+        table.insert(App.discoveryReport, "Item definitions: ambiguous live world tables (" .. #found .. ")")
+        error("Growblox item definitions are ambiguous: multiple tables belong to the active world. Copy diagnostics from Settings.", 0)
+    end
+    if #found == 1 then return found[1], sources[found[1]] end
+
+    local registryIssue = "unavailable"
+    if registry then
+        local reference = rawget(registry, "RnyflzPbj74")
+        local items = itemDefinitions(reference)
+        if items then return items, "module registry table" end
+        if type(typeof) == "function" and typeof(reference) == "Instance" and reference:IsA("ModuleScript") then
+            local ok, value = pcall(require, reference)
+            if ok and itemDefinitions(value) then return value, "module registry" end
+            registryIssue = ok and "definition fingerprint mismatch" or "item module require failed"
+        else
+            registryIssue = "item reference is not a ModuleScript or definition table"
+        end
+    end
+    table.insert(App.discoveryReport, "Registry item lookup: " .. registryIssue)
+    for _, object in pairs(objects) do
+        scanStep(scan, "Finding item definitions")
+        consider(object, "GC item definitions")
+    end
+    if #found == 1 then return found[1], sources[found[1]] end
+    table.insert(App.discoveryReport, "Item definitions: " .. (#found > 1 and "ambiguous GC tables (" .. #found .. ")" or "not found"))
+    error(#found > 1
+        and "Growblox item definitions are ambiguous in GC. Copy diagnostics from Settings."
+        or "Growblox item definitions are inaccessible from Delta. Copy diagnostics from Settings. This is a script attachment failure, not a world-entry check.", 0)
+end
+
+local function inventoryObject(candidate)
+    return type(candidate) == "table" and type(rawget(candidate, "slots")) == "table"
+        and type(readField(candidate, "count")) == "function"
+        and type(readField(candidate, "room")) == "function"
+        and type(readField(candidate, "add")) == "function"
+        and type(readField(candidate, "remove")) == "function"
+end
+
+local function discover()
+    assert(type(getgc) == "function", "Delta must expose getgc(true) to read Growblox's 2D client.")
+    local scan = newScan()
+    App.startupStage = "Reading game objects"
+    task.wait() -- Let the window render before taking the executor's GC snapshot.
+    assert(App.alive, "This script was unloaded during discovery.")
+    local objects = getgc(true)
+    local registry, registrySource = resolveRegistry(objects, scan)
+    App.discoveryReport = { "Registry: " .. registrySource }
+    local worlds, physics, controls = {}, {}, {}
+    for _, object in pairs(objects) do
+        scanStep(scan, "Finding world and controls")
+        if type(object) == "table" then
+            if type(rawget(object, "backpackNow")) == "function"
+                and type(rawget(object, "displayPut")) == "function"
+                and type(rawget(object, "useDoor")) == "function"
+                and type(rawget(object, "fg")) == "table" then
+                table.insert(worlds, object)
+            end
+            if type(rawget(object, "state")) == "function"
+                and type(rawget(object, "solidAt")) == "function"
+                and rawget(object, "H") == 0.95 and rawget(object, "HW") == 0.3 then
+                table.insert(physics, object)
+            end
+            if type(rawget(object, "dir")) == "function"
+                and type(rawget(object, "jumping")) == "function"
+                and type(rawget(object, "punchPressed")) == "function"
+                and type(rawget(object, "setScale")) == "function"
+                and type(rawget(object, "place")) == "function"
+                and type(rawget(object, "edit")) == "function" then
+                table.insert(controls, object)
+            end
+        end
+    end
+    table.insert(App.discoveryReport, "World tables: " .. #worlds .. "; avatar controllers: "
+        .. #physics .. "; touch controls: " .. #controls)
+    assert(#worlds == 1, "Could not identify one active Growblox world table (found " .. #worlds .. ").")
+    local world = worlds[1]
+    local issues = {}
+    local gemHud
+    for _, candidate in pairs(objects) do
+        scanStep(scan, "Finding player HUD")
+        if type(candidate) == "table" and type(rawget(candidate, "setGems")) == "function"
+            and type(rawget(candidate, "addGems")) == "function"
+            and type(rawget(candidate, "setWorld")) == "function"
+            and type(rawget(candidate, "isTyping")) == "function" then
+            if not gemHud or (type(rawget(candidate, "onMessage")) == "function" and owns(candidate.onMessage, world, scan)) then
+                gemHud = candidate
+            end
+        end
+    end
+    local body
+    for _, candidate in ipairs(physics) do
+        if owns(candidate.state, world, scan) then
+            if body then
+                body = nil
+                table.insert(issues, "Multiple avatar controllers match the active world.")
+                break
+            end
+            body = candidate
+        end
+    end
+    if not body then table.insert(issues, "Local avatar state hook is unavailable.") end
+    if #controls ~= 1 then table.insert(issues, "Expected one touch controller; found " .. #controls .. ".") end
+    local inventory
+    for _, candidate in pairs(upvalues(world.backpackNow, scan)) do
+        if inventoryObject(candidate) then
+            inventory = candidate
+        end
+    end
+    if not inventory then
+        local ok, snapshot = pcall(world.backpackNow)
+        local matches = {}
+        if ok and type(snapshot) == "table" then
+            local counts = {}
+            for _, slot in pairs(snapshot) do counts[slot[1]] = (counts[slot[1]] or 0) + slot[2] end
+            for _, candidate in pairs(objects) do
+                scanStep(scan, "Finding backpack")
+                if inventoryObject(candidate) then
+                    local identical, seen = true, {}
+                    for _, slot in pairs(candidate.slots) do
+                        if counts[slot.id] ~= slot.n then identical = false; break end
+                        seen[slot.id] = true
+                    end
+                    for id in pairs(counts) do if not seen[id] then identical = false end end
+                    if identical then table.insert(matches, candidate) end
+                end
+            end
+        end
+        if #matches == 1 then inventory = matches[1] end
+    end
+    local readInventoryView
+    if not inventory then
+        -- Listing the backpack does not require private mutation hooks.
+        inventory = { slots = {} }
+        readInventoryView = function()
+            local snapshot = world.backpackNow()
+            local slots = {}
+            for _, slot in pairs(snapshot) do table.insert(slots, { id = slot[1], n = slot[2] }) end
+            inventory.slots = slots
+        end
+        function inventory:count(id)
+            local total = 0
+            for _, slot in pairs(self.slots) do if slot.id == id then total = total + slot.n end end
+            return total
+        end
+        readInventoryView()
+        table.insert(issues, "Backpack is readable; its live mutation hooks are unavailable.")
+    end
+    local handlers, ambiguousHandlers = {}, {}
+    scan.owned = {}
+    for _, object in pairs(objects) do
+        scanStep(scan, "Finding game handlers")
+        if type(object) == "function" and owns(object, world, scan) then
+            table.insert(scan.owned, object)
+            local name = functionName(object, scan)
+            if name == "setTile" or name == "hit" or name == "canPlace" or name == "plantSeed" then
+                if handlers[name] or ambiguousHandlers[name] then
+                    handlers[name], ambiguousHandlers[name] = nil, true
+                    if name ~= "plantSeed" then table.insert(issues, "Multiple " .. name .. " handlers match the world.") end
+                else
+                    handlers[name] = object
+                end
+            end
+        end
+    end
+    for _, name in ipairs({ "setTile", "hit", "canPlace" }) do
+        if not handlers[name] then table.insert(issues, "Missing farming handler: " .. name) end
+    end
+    local items, itemSource = resolveItems(world, objects, registry, scan)
+    table.insert(App.discoveryReport, "Item definitions: " .. itemSource)
+    local runtime = { world = world, body = body, controls = controls[1], inventory = inventory,
+        items = items, handlers = handlers, issues = issues,
+        readInventoryView = readInventoryView, ready = #issues == 0, gemHud = gemHud,
+        picker = findWorldPicker(world, objects, scan) }
+    table.insert(App.discoveryReport, "Inventory: " .. (readInventoryView and "readable snapshot" or "live backpack"))
+    table.insert(App.discoveryReport, "Farming hooks: " .. (#issues == 0 and "ready" or table.concat(issues, " ")))
+    table.insert(App.discoveryReport, "World picker: " .. (runtime.picker and "UI cleanup ready" or "UI hook unavailable"))
+    table.insert(App.discoveryReport, "Planting hook: " .. (ambiguousHandlers.plantSeed and "ambiguous"
+        or handlers.plantSeed and "ready" or "unavailable"))
+    App.startupStage = "Attached"
+    App.discoveryPerformance = {yields = scan.yields, upvalueReads = scan.reads}
+    table.insert(App.discoveryReport, "Discovery: " .. scan.yields .. " frame yields; " .. scan.reads .. " function upvalue reads")
+    -- The game already owns tileChanged handling. Own actions are optimistic and
+    -- need not receive an echo; do not add a listener or require an acknowledgment.
+    return runtime
+end
+
+local function connectGame()
+    App.discoveryReport = {}
+    local ok, result = pcall(discover)
+    if not ok then
+        App.connectionError = tostring(result)
+        error(App.connectionError, 0)
+    end
+    App.runtime = result
+    App.connectionError = nil
+    return result
+end
+
+local function runtime()
+    assert(App.runtime, App.connectionError or "The script has not attached to Growblox yet. Use Reconnect in Settings.")
+    return App.runtime
+end
+local function position()
+    local r = runtime()
+    assert(r.body, "The avatar state hook is unavailable. Copy the game connection diagnostics from Settings.")
+    local state = r.body.state()
+    assert(state.active and not state.dead, "Join a world and wait until your character is ready.")
+    return state
+end
+local function recoverable(message, worldName, reason)
+    return setmetatable({ message = message, world = worldName, reason = reason, recoverable = true },
+        { __tostring = function(value) return value.message end })
+end
+local function worldCheck(name, token)
+    checkpoint(token)
+    local r = runtime()
+    if r.world.name == "" or r.world.name == nil or pickerOpen(r) then
+        error(recoverable("Returned to the world picker.", name, "worldPicker"), 0)
+    end
+    assert(r.world.name == name, "The world changed. Stopping to protect the saved locations.")
+    assert(not player:GetAttribute("Frozen"), "Your character is frozen.")
+    if r.body then
+        local state = r.body.state()
+        if not state.active or state.dead then
+            error(recoverable("Waiting for the avatar to become ready.", name, "avatar"), 0)
+        end
+    end
+    position()
+    return r
+end
+local function tileAt(x, y)
+    local world = runtime().world
+    assert(x >= 0 and y >= 0 and x < world.w and y < world.h, "Saved tile is outside this world.")
+    return world.fg[y] and world.fg[y][x] or 0
+end
+local function count(id)
+    return runtime().inventory:count(id)
+end
+
+local function refreshInventory(token)
+    local r = runtime()
+    local hold = App.controls
+    if hold then
+        hold.syncing = true
+        local deadline = os.clock() + App.config.options.actionTimeout
+        while true do
+            if token then checkpoint(token) end
+            local taking = hold.autoTakes > 0
+            for _, drop in pairs(r.world.dropList()) do
+                if drop.taking then taking = true end
+            end
+            if not taking then break end
+            assert(os.clock() < deadline, "Waiting for an existing pickup timed out.")
+            pause(0.05, token)
+        end
+    end
+    local name = App.job == "pnb" and App.config.points.pnb.world or r.world.name
+    local snapshot
+    for attempt = 1, 3 do
+        if token then worldCheck(name, token) end
+        snapshot = bounded(r.world.call, App.config.options.actionTimeout, token, "GetInventory")
+        -- A response can arrive after leaving the world or beginning its exit
+        -- animation. Check that state before treating it as a damaged backpack.
+        if token then worldCheck(name, token) end
+        if type(snapshot) == "table" and type(snapshot.slots) == "table" then break end
+        if attempt < 3 then pause(0.25, token) end
+    end
+    assert(type(snapshot) == "table" and type(snapshot.slots) == "table", "Invalid backpack response.")
+    local desired = {}
+    for _, slot in pairs(snapshot.slots) do
+        local id, n = slot[1], slot[2]
+        assert(type(id) == "number" and type(n) == "number", "Invalid backpack slot response.")
+        desired[id] = (desired[id] or 0) + n
+    end
+    if type(snapshot.capacity) == "number" then r.inventory.capacity = snapshot.capacity end
+    -- Match the client's InventorySync handler, preserving tools absent from the snapshot.
+    local current = {}
+    for _, slot in ipairs(r.inventory.slots) do current[slot.id] = slot.n end
+    for id, n in pairs(current) do
+        if r.items[id] and r.items[id].kind ~= "tool" and n > (desired[id] or 0) then
+            r.inventory:remove(id, n - (desired[id] or 0))
+        end
+    end
+    for id, n in pairs(desired) do
+        local missing = n - r.inventory:count(id)
+        if missing > 0 then r.inventory:add(id, missing) end
+    end
+    if hold then hold.syncing = false end
+    return desired
+end
+
+local function releaseControls()
+    local hold = App.controls
+    if hold then
+        if hold.table.dir == hold.dirOverride then hold.table.dir = hold.dir end
+        if hold.table.jumping == hold.jumpOverride then hold.table.jumping = hold.jumping end
+        if hold.world.displayTake == hold.displayOverride then hold.world.displayTake = hold.displayTake end
+        if hold.world.takeDrop == hold.takeOverride then hold.world.takeDrop = hold.takeDrop end
+        App.controls = nil
+    end
+end
+local function takeControls()
+    if App.controls then return App.controls end
+    local controls = runtime().controls
+    local world = runtime().world
+    local hold = { table = controls, dir = controls.dir, jumping = controls.jumping, direction = 0, jump = false,
+        world = world, displayTake = world.displayTake, takeDrop = world.takeDrop, autoTakes = 0,
+        syncing = false, pausePickup = false }
+    hold.dirOverride = function() return hold.direction end
+    hold.jumpOverride = function() return hold.jump end
+    controls.dir, controls.jumping = hold.dirOverride, hold.jumpOverride
+    hold.displayOverride = function() end
+    hold.takeOverride = function(...)
+        if hold.syncing or hold.pausePickup then return 0 end
+        hold.autoTakes = hold.autoTakes + 1
+        local result = table.pack(pcall(hold.takeDrop, ...))
+        task.defer(function() hold.autoTakes = hold.autoTakes - 1 end)
+        if not result[1] then error(result[2]) end
+        return table.unpack(result, 2, result.n)
+    end
+    world.displayTake, world.takeDrop = hold.displayOverride, hold.takeOverride
+    App.controls = hold
+    return hold
+end
+
+local function navigationMap(r)
+    local world = r.world
+    local function itemAt(x, y) return r.items[world.fg[y] and world.fg[y][x] or 0] end
+    return {
+        w = world.w, h = world.h, speed = 7.2 * (world.speedScale or 1),
+        gravity = 55 * (world.gravityScale or 1),
+        solid = function(x, y) return r.body.solidAt(x, y) end,
+        platform = function(x, y) local item = itemAt(x, y); return item and item.platform end,
+        danger = function(x, y)
+            local item = itemAt(x, y)
+            return item and (item.deadly or item.hurts)
+        end,
+    }
+end
+local function moveTo(x, y, worldName, token, onStep)
+    local r = worldCheck(worldName, token)
+    tileAt(x, y)
+    local hold = takeControls()
+    local targetX, targetY = x + 0.5, y + 1
+    local farmNavigation = App.job == "plant" or App.job == "harvest"
+    local timeout = farmNavigation and math.max(90, App.config.options.moveTimeout) or App.config.options.moveTimeout
+    local deadline, banned, replans = os.clock() + timeout, {}, 0
+    -- Waypoints and the final destination must agree. A looser waypoint
+    -- tolerance can otherwise accept an empty route without ever moving.
+    local function reached(state, tx, ty)
+        return state.grounded and math.abs(state.x - tx) < 0.16
+            and math.abs(state.y - ty) < 0.22 and math.abs(state.vx or 0) < 0.8
+    end
+    while true do
+        worldCheck(worldName, token)
+        local state = position()
+        if onStep and onStep(state) == false then hold.direction, hold.jump = 0, false; return false end
+        if reached(state, targetX, targetY) then hold.direction, hold.jump = 0, false; return end
+        assert(os.clock() < deadline, "Could not reach the saved position. Check stepping platforms and door access.")
+        hold.direction, hold.jump = 0, false
+        local landingDeadline = math.min(deadline, os.clock() + 2.5 + r.world.h / 24)
+        while not state.grounded do
+            assert(os.clock() < landingDeadline, "The avatar did not land on a reachable floor or platform.")
+            pause(0.03, token)
+            worldCheck(worldName, token)
+            state = position()
+        end
+        local start = {x = math.floor(state.x), y = math.floor(state.y - 0.01)}
+        local route, message = Navigation.plan(navigationMap(r), start, {x = x, y = y}, {
+            banned = banned, fullWorld = farmNavigation,
+            maxNodes = farmNavigation and math.min(12000, r.world.w * r.world.h) or 1600,
+            step = function() pause(0, token); worldCheck(worldName, token) end,
+        })
+        assert(route, message)
+        if #route == 0 then route = {{x = x, y = y, fromX = start.x, fromY = start.y, jump = false, duration = 0.2}} end
+        route = Navigation.straightRuns(route)
+        App.navigationDebug = "Planned " .. #route .. " walking/jumping steps to " .. x .. ", " .. y
+        local failed
+        for _, waypoint in ipairs(route) do
+            local began, movedAt, movedX, movedY = os.clock(), os.clock(), state.x, state.y
+            local launchAt, airborne = nil, false
+            while true do
+                worldCheck(worldName, token)
+                state = position()
+                if onStep and onStep(state) == false then hold.direction, hold.jump = 0, false; return false end
+                if reached(state, waypoint.x + 0.5, waypoint.y + 1) then break end
+                assert(os.clock() < deadline, "Returning to the saved position timed out. Check the route.")
+                if UserInputService:GetFocusedTextBox() then
+                    hold.direction, hold.jump = 0, false
+                    movedAt = os.clock()
+                else
+                    hold.direction = Navigation.steer(waypoint.x + 0.5 - state.x, state.vx or 0,
+                        state.grounded and 48 or 17)
+                    if waypoint.jump and not launchAt and state.grounded then launchAt = os.clock() end
+                    if launchAt and not state.grounded then airborne = true end
+                    hold.jump = launchAt ~= nil and ((not airborne and os.clock() - launchAt < 0.2)
+                        or (airborne and not state.grounded and (state.vy or 0) < -0.1))
+                    if math.abs(state.x - movedX) + math.abs(state.y - movedY) > 0.08 then
+                        movedX, movedY, movedAt = state.x, state.y, os.clock()
+                    end
+                    if os.clock() - movedAt > 1 or os.clock() - began > math.max(2.5, waypoint.duration + 1.5) then
+                        failed = waypoint
+                        break
+                    end
+                end
+                pause(0.025, token)
+            end
+            hold.direction, hold.jump = 0, false
+            if failed then break end
+        end
+        if failed then
+            for _, edge in ipairs(failed.edges) do
+                local from = edge.fromY * r.world.w + edge.fromX
+                local destination = edge.y * r.world.w + edge.x
+                banned[from .. ":" .. destination .. ":" .. tostring(edge.jump)] = true
+            end
+            replans = replans + 1
+            assert(replans <= 4, "The planned jumps did not reach the platforms. Check the entrance and route layout.")
+            setStatus("Trying another route around the obstacle...")
+        end
+    end
+end
+local function moveToPoint(point, token)
+    moveTo(point.standX or point.x, point.standY or point.y, point.world, token)
+end
+local function assertPNBPosition()
+    if App.job ~= "pnb" then return end
+    local point, state = App.config.points.pnb, position()
+    if not state.grounded or math.abs(state.x - (point.x + 0.5)) > 0.3
+        or math.abs(state.y - (point.y + 1)) > 0.25 then
+        error(recoverable("The avatar left the breaking spot.", point.world, "position"), 0)
+    end
+end
+
+local function boxRows(point)
+    local r = runtime()
+    assert(r.world.name == point.world, "Storage box is in another world.")
+    local item = r.items[tileAt(point.x, point.y)]
+    assert(item and item.display and not item.displayOne, "The saved tile is not a Display Box.")
+    return r.world.displays.get(point.x, point.y) or {}
+end
+local function storageCount(point, id)
+    return Core.storageCount(boxRows(point), id)
+end
+local function withdraw(point, id, token)
+    worldCheck(point.world, token)
+    moveToPoint(point, token)
+    if storageCount(point, id) == 0 then return 0 end
+    refreshInventory(token)
+    assert(runtime().inventory:room(id) > 0, "Your backpack has no room for this block.")
+    local before = count(id)
+    local ok, result = bounded(runtime().world.call, App.config.options.actionTimeout, token,
+        "DisplayItem", point.x, point.y, nil)
+    assert(ok and type(result) == "table", type(result) == "string" and result or "Storage withdrawal failed.")
+    local taken = 0
+    for _, row in pairs(result.taken or {}) do
+        assert(row[1] == id, "The storage box changed and another item was withdrawn. Check your backpack.")
+        taken = taken + row[2]
+    end
+    refreshInventory(token)
+    assert(taken > 0 and count(id) >= before + taken, "The server did not confirm blocks in your backpack.")
+    return taken
+end
+local function deposit(point, id, amount, token)
+    worldCheck(point.world, token)
+    moveToPoint(point, token)
+    storageCount(point, id)
+    refreshInventory(token)
+    amount = math.min(math.floor(amount), count(id))
+    assert(amount > 0, "No items are available to deposit.")
+    local before = count(id)
+    local ok, result = bounded(runtime().world.call, App.config.options.actionTimeout, token,
+        "DisplayItem", point.x, point.y, id, nil, nil, amount, point.x + 0.5)
+    assert(ok, type(result) == "string" and result or "The storage deposit was rejected.")
+    refreshInventory(token)
+    assert(count(id) <= before - amount, "The server did not confirm the storage deposit.")
+    return amount
+end
+
+local function clearResume()
+    App.resume = nil
+    if exists(RESUME_FILE) and type(delfile) == "function" then
+        pcall(delfile, RESUME_FILE)
+    elseif type(writefile) == "function" then
+        pcall(writeJSON, RESUME_FILE, { version = 1, active = false })
+    end
+end
+local function clearPNBResume()
+    if exists(PNB_RESUME_FILE) and type(delfile) == "function" then
+        pcall(delfile, PNB_RESUME_FILE)
+    elseif exists(PNB_RESUME_FILE) and type(writefile) == "function" then
+        pcall(writeJSON, PNB_RESUME_FILE, {version = 1, active = false})
+    end
+end
+local function savePNBResume()
+    saveSession()
+    writeJSON(PNB_RESUME_FILE, {version = 1, active = true, userId = player.UserId, updatedAt = os.time(),
+        config = Core.validate(App.config), profile = App.profile})
+    App.lastPNBSave = os.clock()
+end
+local function refreshPNBCheckpoint()
+    if App.alive and App.job == "pnb" and App.jobToken == App.token and App.config.options.autoRejoin
+        and App.pending == 0 and not App.recovering and os.clock() - (App.lastPNBSave or -math.huge) >= 120 then
+        local ok, message = pcall(savePNBResume)
+        App.lastPNBSave = os.clock()
+        App.recoverySaveError = not ok and tostring(message) or nil
+    end
+end
+local function readPNBResume()
+    if not exists(PNB_RESUME_FILE) then return nil end
+    local record = decode(readfile(PNB_RESUME_FILE))
+    if not record.active then return nil end
+    assert(record.version == 1 and record.userId == player.UserId, "The saved farm belongs to another account or script version.")
+    assert(type(record.updatedAt) == "number" and os.time() - record.updatedAt < 21600,
+        "The saved farm is over six hours old. Load your profile and start it again.")
+    record.config, record.profile = Core.validate(record.config), Core.profileName(record.profile)
+    return record
+end
+local function saveResume(phase, cargo)
+    saveSession()
+    local record = { version = 1, active = true, userId = player.UserId, updatedAt = os.time(),
+        config = Core.validate(App.config), profile = App.profile, phase = phase, cargo = cargo or 0 }
+    writeJSON(RESUME_FILE, record)
+    App.resume = record
+end
+local function queueResume()
+    local queue = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
+    local loader = env.ClarisGrowbloxLoaderURL
+    if type(queue) ~= "function" or type(loader) ~= "string" or not loader:match("^https://") then
+        return false
+    end
+    if not App.queued then
+        local code = "task.wait(3); getgenv().ClarisGrowbloxAutoResume = true; "
+            .. "loadstring(game:HttpGet(" .. string.format("%q", loader) .. "))()"
+        queue(code)
+        App.queued = true
+    end
+    return true
+end
+local function enterDoor(door, destination, nextPhase, cargo, token)
+    moveToPoint(door, token)
+    local r = worldCheck(door.world, token)
+    local metadata = r.items[tileAt(door.x, door.y)]
+    assert(metadata and (metadata.door or metadata.entrance or metadata.vip), "Saved door no longer exists.")
+    saveResume(nextPhase, cargo)
+    saveSession()
+    local canResume = queueResume()
+    local ok, response = bounded(r.world.call, App.config.options.actionTimeout, token,
+        "UseDoor", door.x, door.y)
+    assert(ok and type(response) == "table", type(response) == "string" and response
+        or "The door was rejected. Check its link, access, and password.")
+    if response.go then
+        r.world.goTo(response.go[1], response.go[2])
+    else
+        assert(type(response.enter) == "string", "Door returned no destination world.")
+        local entered, message, teleport = bounded(r.world.enter, App.config.options.actionTimeout + 15,
+            token, response.enter)
+        if teleport then
+            releaseControls()
+            App.teleporting = true
+            setStatus(canResume and "Changing servers; Moving Drops will resume after loading."
+                or "Changing servers. Run the GitHub loader again, then press Resume saved transfer.")
+            local deadline = os.clock() + 45
+            while os.clock() < deadline do pause(0.2, token) end
+            App.teleporting = false
+            error("Server teleport did not finish. Check the door and press Resume saved transfer.")
+        end
+        assert(entered, tostring(message or "Could not enter the destination world."))
+    end
+    pause(0.5, token)
+    worldCheck(destination.world, token)
+end
+
+local function settleTile(x, y, id, seconds, worldName, token)
+    local deadline = os.clock() + seconds
+    repeat
+        worldCheck(worldName, token)
+        assert(tileAt(x, y) == id, "Tile " .. x .. ", " .. y .. " changed while the action settled. Stopping.")
+        pause(0.03, token)
+    until os.clock() >= deadline
+end
+local function withoutPickups(fn)
+    local hold = App.controls
+    local previous = hold and hold.pausePickup
+    if hold then hold.pausePickup = true end
+    local result = table.pack(pcall(fn))
+    if hold then hold.pausePickup = previous end
+    if not result[1] then error(result[2], 0) end
+    return table.unpack(result, 2, result.n)
+end
+local function placeTile(point, id, token)
+    return withoutPickups(function()
+        local name = App.config.points.pnb.world
+        local r = worldCheck(name, token)
+        assertPNBPosition()
+        -- Quiesce automatic pickups so a server inventory delta identifies this
+        -- placement rather than a concurrently collected copy of the same block.
+        local before = refreshInventory(token)[id] or 0
+        worldCheck(name, token)
+        assertPNBPosition()
+        assert(tileAt(point.x, point.y) == 0, "The PNB grid contains another block.")
+        assert(r.handlers.canPlace(r.items[id], point.x, point.y),
+            "Cannot place at " .. point.x .. ", " .. point.y .. ". Check reach, access, and empty tiles.")
+        assert(before > 0, "No blocks are left in your backpack.")
+        r.handlers.setTile("fg", point.x, point.y, id, false, (position().facing or 1) < 0)
+        App.lastPlacement = {x = point.x, y = point.y, world = name, grid = r.world.fg, at = os.clock()}
+        r.inventory:remove(id, 1)
+        pause(App.config.options.placeDelay, token)
+        local deadline = os.clock() + App.config.options.actionTimeout
+        while true do
+            worldCheck(name, token)
+            local after = refreshInventory(token)[id] or 0
+            if after == before - 1 then break end
+            assert(after == before, "Backpack changed unexpectedly while placing. Stopping.")
+            assert(os.clock() < deadline, "The server did not consume a block for tile "
+                .. point.x .. ", " .. point.y .. ". Check placement access and range.")
+            pause(0.15, token)
+        end
+        settleTile(point.x, point.y, id, 0.12, name, token)
+    end)
+end
+local function breakTile(point, id, token)
+    local name = App.config.points.pnb.world
+    local r = worldCheck(name, token)
+    assert(tileAt(point.x, point.y) == id, "The target tile changed. Stopping before punching another block.")
+    local deadline = os.clock() + App.config.options.actionTimeout + (r.items[id].hits or 1) * App.config.options.punchDelay
+    local placed = App.lastPlacement
+    if placed and placed.world == name and placed.grid == r.world.fg
+        and placed.x == point.x and placed.y == point.y then
+        local remaining = 0.32 - (os.clock() - placed.at)
+        if remaining > 0 then pause(remaining, token) end
+    end
+    while tileAt(point.x, point.y) == id do
+        worldCheck(name, token)
+        assertPNBPosition()
+        assert(os.clock() < deadline, "Block did not break. Check permissions and your punching range.")
+        local state = position()
+        assert(math.abs(point.x + 0.5 - state.x) <= 2.75
+            and math.abs(point.y + 0.5 - (state.y - 0.475)) <= 2.75,
+            "Player moved outside the PNB grid's punching range.")
+        r.handlers.hit(point.x, point.y)
+        pause(App.config.options.punchDelay, token)
+    end
+    assert(tileAt(point.x, point.y) == 0, "The block changed while breaking.")
+    -- Match the normal client's hit completion. Allow its optimistic deletion to
+    -- settle and observe corrections; the following cycle reconciles inventory.
+    -- A tileChanged echo is not a required response to an own-player break.
+    settleTile(point.x, point.y, 0, math.max(0.18, App.config.options.punchDelay), name, token)
+    App.stats.broken = App.stats.broken + 1
+end
+
+local function takeDropBatch(anchor, targets, attempts, retryAt, eligible, token, onTaken)
+    local r = worldCheck(anchor.world, token)
+    local take = App.controls and App.controls.takeDrop or r.world.takeDrop
+    assert(type(take) == "function" and type(r.world.dropTaken) == "function",
+        "The loose-drop pickup hooks are unavailable. Copy diagnostics from Settings.")
+    local jobs, reserved = {}, {}
+    local deadline = os.clock() + App.config.options.actionTimeout
+    for _, drop in ipairs(targets) do
+        if #jobs >= 8 then break end
+        worldCheck(anchor.world, token)
+        assertPNBPosition()
+        local present = false
+        for _, current in pairs(r.world.dropList()) do if current == drop then present = true; break end end
+        local room = drop.id == 112 and 65535 or math.max(0, r.inventory:room(drop.id) - (reserved[drop.id] or 0))
+        local want = math.floor(math.min(drop.n, room, 65535))
+        if want > 0 and present and eligible(drop) then
+            local before, grid, uid, id = drop.n, r.world.fg, drop.uid, drop.id
+            if id ~= 112 then reserved[id] = (reserved[id] or 0) + want end
+            attempts[uid] = (attempts[uid] or 0) + 1
+            drop.taking = true
+            -- Settlement owns the drop even after Stop; native pickup cannot
+            -- race it and a packet's remaining count is never subtracted twice.
+            local request = beginRequest(function()
+                local ok, result = pcall(function()
+                    local amount = take(uid, want)
+                    if amount == nil then amount = 0 end
+                    assert(type(amount) == "number" and amount >= 0 and amount <= want
+                        and amount == math.floor(amount), "Invalid pickup response from the server.")
+                    if amount > 0 and r.world.name == anchor.world and r.world.fg == grid then
+                        r.world.dropTaken(uid, math.min(drop.n, math.max(0, before - amount)))
+                        if id == 112 then App.stats.gems = App.stats.gems + amount end
+                        if onTaken then onTaken(uid, id, amount) end
+                    elseif amount == 0 then
+                        retryAt[uid], drop.refused = os.clock() + 1, os.clock()
+                    end
+                    return amount
+                end)
+                drop.taking = false
+                assert(ok, tostring(result))
+                return result
+            end)
+            table.insert(jobs, {request = request, uid = uid, id = id})
+        end
+    end
+    local results = {}
+    for _, job in ipairs(jobs) do
+        local amount = awaitRequest(job.request, deadline, token)
+        if amount > 0 then attempts[job.uid] = 0 end
+        table.insert(results, {uid = job.uid, id = job.id, amount = amount})
+    end
+    return results
+end
+
+local function collectDrops(anchor, blockId, seedId, token)
+    pause(App.config.options.collectDelay, token)
+    return withoutPickups(function()
+        local r = worldCheck(anchor.world, token)
+        refreshInventory(token) -- Finish preexisting normal pickup callbacks first.
+        local take = App.controls and App.controls.takeDrop or r.world.takeDrop
+        assert(type(take) == "function" and type(r.world.dropTaken) == "function",
+            "The loose-drop pickup hooks are unavailable. Copy diagnostics from Settings.")
+        local attempts, retryAt, deadline = {}, {}, os.clock() + App.config.options.actionTimeout
+        local gemsTaken = 0
+        local function nearby(drop)
+            return not drop.display and not drop.pending and type(drop.uid) == "number"
+                and type(drop.n) == "number" and drop.n > 0 and not drop.taking
+                and (drop.id == 112 or drop.id == blockId or drop.id == seedId)
+                and type(drop.x) == "number" and type(drop.y) == "number"
+                and math.abs(drop.x - (anchor.x + 0.5)) <= 1.25
+                and drop.y >= anchor.y - 1.5 and drop.y <= anchor.y + 1.25
+        end
+        local function updateGems()
+            if gemsTaken > 0 and r.gemHud then
+                local gems = bounded(r.world.call, App.config.options.actionTimeout, token, "GetGems")
+                assert(type(gems) == "number" and gems >= 0, "Invalid gem balance from the server.")
+                r.gemHud.setGems(gems)
+                gemsTaken = 0
+            end
+        end
+        while true do
+            worldCheck(anchor.world, token)
+            assertPNBPosition()
+            if count(seedId) >= App.config.options.seedThreshold then
+                setStatus("Putting collected seeds into the left storage box...")
+                deposit(App.config.points.seedBox, seedId, count(seedId), token)
+                moveToPoint(anchor, token)
+                deadline = os.clock() + App.config.options.actionTimeout
+            end
+            local targets, waiting, refused = {}, false, false
+            for _, drop in pairs(r.world.dropList()) do
+                if nearby(drop) then
+                    local room = drop.id == 112 and 65535 or r.inventory:room(drop.id)
+                    if room > 0 then
+                        -- Normal pickup uses a one-second refusal cooldown. Read
+                        -- its initial timestamp once: suppressed native attempts
+                        -- must not keep postponing our own requests.
+                        retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
+                        if (attempts[drop.uid] or 0) >= 3 then
+                            refused = true
+                        elseif math.max(drop.readyAt or 0, retryAt[drop.uid]) > os.clock() then
+                            waiting = true
+                        else
+                            table.insert(targets, drop)
+                        end
+                    end
+                end
+            end
+            if #targets == 0 then
+                updateGems()
+                if refused then
+                    local details = {}
+                    for _, drop in pairs(r.world.dropList()) do
+                        if nearby(drop) and (attempts[drop.uid] or 0) >= 3 then
+                            table.insert(details, string.format("uid %d, item %d, count %d at %.2f, %.2f",
+                                drop.uid, drop.id, drop.n, drop.x, drop.y))
+                        end
+                    end
+                    error("The server refused nearby drop pickups: " .. table.concat(details, "; ")
+                        .. ". Check reach and access; copy diagnostics.")
+                end
+                if not waiting then return end
+                assert(os.clock() < deadline, "Nearby drops did not become ready for pickup.")
+                pause(0.05, token)
+            else
+                setStatus("Collecting nearby drops together...")
+                local results = takeDropBatch(anchor, targets, attempts, retryAt, nearby, token)
+                local accepted = false
+                for _, result in ipairs(results) do
+                    local got = result.amount
+                    if got > 0 then
+                        accepted = true
+                        if result.id == 112 then gemsTaken = gemsTaken + got end
+                    end
+                end
+                if accepted then
+                    -- Reconcile once after the whole batch settles, so pickups
+                    -- do not wait for a second RPC between each drop.
+                    refreshInventory(token)
+                    deadline = os.clock() + App.config.options.actionTimeout
+                end
+            end
+        end
+    end)
+end
+
+local function runHarvest(token)
+    Core.checkSetup(App.config, "harvest", runtime().items)
+    local box, id = App.config.points.farmBox, App.config.blockId
+    local r = worldCheck(box.world, token)
+    storageCount(box, id) -- Reject unsuitable storage before claiming anything.
+    return withoutPickups(function()
+        moveToPoint(box, token)
+        refreshInventory(token)
+        local storedBefore = App.stats.stashed
+        local attempts, retryAt, needsApproach, approached = {}, {}, {}, {}
+        local sweepRow, sweepX, sweepDirection, movingBatch
+        local rangeLimited, emptySince = false, nil
+        local deadline = os.clock() + App.config.options.actionTimeout
+        local function selected(drop)
+            return type(drop) == "table" and not drop.display and drop.id == id
+                and type(drop.uid) == "number" and type(drop.n) == "number" and drop.n > 0
+                and type(drop.x) == "number" and type(drop.y) == "number"
+        end
+        local function near(state, drop)
+            return math.abs(drop.x - state.x) <= 1.25
+                and drop.y >= state.y - 2.5 and drop.y <= state.y + 0.25
+        end
+        local function applyResults(results)
+            local accepted = false
+            for _, result in ipairs(results) do
+                if result.amount > 0 then
+                    accepted, needsApproach[result.uid] = true, nil
+                else
+                    rangeLimited, needsApproach[result.uid] = true, true
+                end
+                approached[result.uid] = nil
+            end
+            if accepted then
+                refreshInventory(token)
+                deadline = os.clock() + App.config.options.actionTimeout
+            end
+            return accepted
+        end
+        local function finishMovingBatch(wait)
+            if movingBatch and (wait or movingBatch.done) then
+                local request = movingBatch
+                movingBatch = nil
+                applyResults(awaitRequest(request, os.clock() + App.config.options.actionTimeout, token))
+            end
+        end
+        local function collectWhileMoving(state)
+            finishMovingBatch(false)
+            if state.grounded then
+                sweepRow, sweepX = math.floor(state.y - 0.01), state.x
+                if r.inventory:room(id) <= 0 then return false end
+            end
+            if movingBatch then return end
+            local targets = {}
+            for _, drop in pairs(r.world.dropList()) do
+                if selected(drop) then
+                    retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
+                    if not drop.pending and not drop.taking and near(state, drop) and math.abs(drop.x - state.x) <= 0.55
+                        and os.clock() >= math.max(drop.readyAt or 0, retryAt[drop.uid])
+                        and (attempts[drop.uid] or 0) < 3 then table.insert(targets, drop) end
+                end
+            end
+            if #targets > 0 then
+                movingBatch = beginRequest(function()
+                    return takeDropBatch(box, targets, attempts, retryAt, function(drop)
+                        return selected(drop) and not drop.pending and not drop.taking and near(position(), drop)
+                    end, token, function(_, _, amount) App.stats.harvested = App.stats.harvested + amount end)
+                end)
+            end
+        end
+        local function returnToStorage()
+            local state, point = position(), box
+            local dx = math.abs(state.x - ((point.standX or point.x) + 0.5))
+            local dy = math.abs(state.y - ((point.standY or point.y) + 1))
+            if not App.config.options.harvestRespawn or type(r.world.respawn) ~= "function" or dx + dy <= 4 then return end
+            local hold = takeControls()
+            hold.direction, hold.jump = 0, false
+            assert(App.pending == 0, "Wait for pending pickups before respawning to storage.")
+            refreshInventory(token)
+            local beforeX, beforeY, beforeCount = state.x, state.y, count(id)
+            setStatus("Respawning near Farm storage...")
+            bounded(r.world.respawn, App.config.options.actionTimeout, token)
+            local readyDeadline, changed, stable = os.clock() + math.max(15, App.config.options.actionTimeout), false, nil
+            while true do
+                checkpoint(token)
+                assert(r.world.name == box.world and not pickerOpen(r), "The world changed while respawning to Farm storage.")
+                local avatar = r.body.state()
+                if not avatar.active or avatar.dead or math.abs(avatar.x - beforeX) + math.abs(avatar.y - beforeY) > 0.5 then changed = true end
+                if changed and avatar.active and not avatar.dead and avatar.grounded then
+                    stable = stable or os.clock()
+                    if os.clock() - stable >= 0.25 then break end
+                else stable = nil end
+                assert(os.clock() < readyDeadline, "Respawn did not finish. Blocks remain in the backpack; check diagnostics.")
+                pause(0.05, token)
+            end
+            worldCheck(box.world, token)
+            refreshInventory(token)
+            assert(count(id) == beforeCount, "Backpack blocks changed during respawn. Check inventory before restarting harvest.")
+        end
+        local function stash()
+            finishMovingBatch(true)
+            if count(id) == 0 then return end
+            returnToStorage()
+            setStatus("Storing harvested " .. r.items[id].name .. " in Farm storage...")
+            local amount = deposit(box, id, count(id), token)
+            App.stats.stashed = App.stats.stashed + amount
+            deadline = os.clock() + App.config.options.actionTimeout
+        end
+        stash() -- Includes the selected blocks already filling the backpack.
+        while true do
+            worldCheck(box.world, token)
+            local state = position()
+            local remaining = {}
+            for _, drop in pairs(r.world.dropList()) do
+                if selected(drop) then
+                    -- Suppressed native pickup attempts can keep updating refused.
+                    -- Freeze its initial cooldown; our own refusals update retryAt.
+                    retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
+                    table.insert(remaining, drop)
+                end
+            end
+            if #remaining == 0 then
+                stash()
+                emptySince = emptySince or os.clock()
+                if os.clock() - emptySince >= math.max(0.3, App.config.options.collectDelay) then
+                    setStatus("Finished collecting harvest: " .. (App.stats.stashed - storedBefore)
+                        .. " blocks stored in the farm Display Box.")
+                    return
+                end
+                pause(0.05, token)
+            else
+                emptySince = nil
+                if r.inventory:room(id) <= 0 then
+                    assert(count(id) > 0, "Your backpack has no room for the harvested block. Free a slot before collecting.")
+                    stash()
+                    state = position()
+                end
+                table.sort(remaining, function(a, b)
+                    if sweepRow and sweepDirection then
+                        local function inSweep(drop)
+                            return math.floor(drop.y) == sweepRow and (drop.x - sweepX) * sweepDirection >= -0.2
+                        end
+                        local aSweep, bSweep = inSweep(a), inSweep(b)
+                        if aSweep ~= bSweep then return aSweep end
+                        if aSweep and a.x ~= b.x then return a.x * sweepDirection < b.x * sweepDirection end
+                    end
+                    local da = math.abs(a.x - state.x) + math.abs(a.y - state.y) * 2
+                    local db = math.abs(b.x - state.x) + math.abs(b.y - state.y) * 2
+                    return da == db and a.uid < b.uid or da < db
+                end)
+                local function ready(drop)
+                    return not drop.pending and not drop.taking
+                        and os.clock() >= math.max(drop.readyAt or 0, retryAt[drop.uid])
+                end
+                local function eligible(drop)
+                    return selected(drop) and ready(drop) and not needsApproach[drop.uid]
+                        and (not rangeLimited or near(state, drop) or approached[drop.uid])
+                end
+                local targets, nextDrop = {}, nil
+                for _, drop in ipairs(remaining) do
+                    assert((attempts[drop.uid] or 0) < 3,
+                        "The server refused harvested drop uid " .. drop.uid .. " at " .. drop.x .. ", " .. drop.y
+                            .. ". Check pickup reach and access; copy diagnostics.")
+                    if ready(drop) then
+                        nextDrop = nextDrop or drop
+                        if eligible(drop) then table.insert(targets, drop) end
+                    end
+                end
+                if #targets > 0 then
+                    setStatus("Collecting harvested " .. r.items[id].name .. "... " .. #remaining .. " loose drops remain.")
+                    local results = takeDropBatch(box, targets, attempts, retryAt, eligible, token,
+                        function(_, _, amount) App.stats.harvested = App.stats.harvested + amount end)
+                    local accepted = false
+                    for _, result in ipairs(results) do
+                        if result.amount > 0 then
+                            accepted = true
+                            needsApproach[result.uid] = nil
+                        else
+                            rangeLimited = true
+                            for _, drop in ipairs(remaining) do
+                                if drop.uid == result.uid then
+                                    needsApproach[result.uid] = near(state, drop) or approached[result.uid] or nil
+                                    break
+                                end
+                            end
+                        end
+                        approached[result.uid] = nil
+                    end
+                    if accepted then
+                        refreshInventory(token) -- One reconciliation for the entire pickup batch.
+                        deadline = os.clock() + App.config.options.actionTimeout
+                    else pause(0.05, token) end
+                elseif rangeLimited and nextDrop and (not near(state, nextDrop) or needsApproach[nextDrop.uid]) then
+                    setStatus("Walking to harvested drop uid " .. nextDrop.uid .. "...")
+                    local goal, message = Navigation.pickupGoal(navigationMap(r), state, nextDrop, {
+                        step = function() pause(0, token); worldCheck(box.world, token) end,
+                    })
+                    assert(goal, tostring(message) .. " Drop uid " .. nextDrop.uid .. " at " .. nextDrop.x .. ", " .. nextDrop.y)
+                    if sweepRow ~= goal.y then
+                        sweepRow, sweepX = goal.y, goal.x + 0.5
+                        sweepDirection = nextDrop.x >= state.x and 1 or -1
+                    elseif (nextDrop.x - sweepX) * sweepDirection < -0.2 then
+                        sweepDirection = -sweepDirection
+                    end
+                    local edge = Navigation.rowEnd(navigationMap(r), goal, sweepDirection)
+                    for _, drop in ipairs(remaining) do
+                        local tileX = math.floor(drop.x)
+                        if math.floor(drop.y) == goal.y and (tileX - goal.x) * sweepDirection > 0
+                            and (edge - tileX) * sweepDirection >= 0 then goal.x = tileX end
+                    end
+                    moveTo(goal.x, goal.y, box.world, token, collectWhileMoving)
+                    finishMovingBatch(true)
+                    needsApproach[nextDrop.uid], approached[nextDrop.uid] = nil, true
+                    deadline = os.clock() + App.config.options.actionTimeout
+                    pause(0.03, token)
+                else
+                    assert(os.clock() < deadline, "Harvested drops did not become ready. Check pending pickups and copy diagnostics.")
+                    pause(0.05, token)
+                end
+            end
+        end
+    end)
+end
+
+local function runPNB(token)
+    Core.checkSetup(App.config, "pnb", runtime().items)
+    local p = App.config.points
+    local blockId = App.config.blockId
+    local seedId = Core.seedId(runtime().items, blockId)
+    worldCheck(p.pnb.world, token)
+    moveToPoint(p.pnb, token)
+    local grid = Core.grid(p.pnb)
+    for _, point in ipairs(grid) do
+        local id = tileAt(point.x, point.y)
+        assert(id == 0 or id == blockId, "Clear the tile directly above the PNB spot before starting.")
+    end
+    storageCount(p.blockBox, blockId)
+    storageCount(p.seedBox, seedId)
+    while true do
+        worldCheck(p.pnb.world, token)
+        moveToPoint(p.pnb, token)
+        refreshInventory(token)
+        if count(seedId) >= App.config.options.seedThreshold then
+            setStatus("Putting seeds into the left storage box...")
+            deposit(p.seedBox, seedId, count(seedId), token)
+            moveToPoint(p.pnb, token)
+        end
+        local existing = false
+        for _, point in ipairs(grid) do
+            if tileAt(point.x, point.y) == blockId then existing = true end
+        end
+        if count(blockId) == 0 and not existing then
+            setStatus("Refilling blocks from the right storage box...")
+            local taken = withdraw(p.blockBox, blockId, token)
+            if taken == 0 then
+                setStatus("Finished: no blocks remain in your backpack or block storage.")
+                return
+            end
+            moveToPoint(p.pnb, token)
+        end
+        setStatus("Placing one " .. runtime().items[blockId].name .. " directly above the player...")
+        for _, point in ipairs(grid) do
+            local id = tileAt(point.x, point.y)
+            assert(id == 0 or id == blockId, "A different block appeared in the PNB grid.")
+            if id == 0 and count(blockId) > 0 then placeTile(point, blockId, token) end
+        end
+        setStatus("Breaking the selected blocks...")
+        for _, point in ipairs(grid) do
+            if tileAt(point.x, point.y) == blockId then breakTile(point, blockId, token) end
+        end
+        setStatus("Collecting gems, seeds, and returned blocks...")
+        collectDrops(p.pnb, blockId, seedId, token)
+    end
+end
+
+local function recentPNBWorld(name, token)
+    setStatus("Checking Recently Visited Worlds for " .. name .. "...")
+    local ok, lists = pcall(bounded, runtime().world.call, App.config.options.actionTimeout, token, "ListWorlds")
+    checkpoint(token)
+    assert(App.pending == 0, "The recent-world request did not settle. Wait for it before rejoining.")
+    if ok and type(lists) == "table" and type(lists.recent) == "table" then
+        for index, world in ipairs(lists.recent) do
+            if type(world) == "string" and world:upper() == name:upper() then
+                App.recentWorldDebug = "Saved PNB world found at Recent position " .. index .. ": " .. world
+                return world, true
+            end
+        end
+    end
+    App.recentWorldDebug = "Saved PNB world absent from Recent or list unavailable; using " .. name
+    return name, false
+end
+local function recoverPNB(problem, token)
+    assert(App.config.options.autoRejoin, tostring(problem))
+    local name = App.config.points.pnb.world
+    assert(problem.world == name, "Recovery target differs from the saved PNB world.")
+    local r = runtime()
+    releaseControls()
+    App.recovering = true
+    local pendingDeadline = os.clock() + App.config.options.actionTimeout + 5
+    while App.pending > 0 do
+        checkpoint(token)
+        assert(os.clock() < pendingDeadline, "A previous request did not settle; cannot rejoin yet.")
+        pause(0.05, token)
+    end
+    setStatus("Waiting for the saved world and avatar to load...")
+    local readyDeadline = os.clock() + App.config.options.actionTimeout + 15
+    local stableSince, entryWaitUntil, attempts = nil, 0, 0
+    local recentChecked, target, fromRecent = false, name, false
+    while true do
+        checkpoint(token)
+        assert(r.world.name == name or r.world.name == "" or r.world.name == nil,
+            "Arrived in another world. Check the saved PNB world.")
+        -- The exit animation can become inactive before the world name clears.
+        -- Reconsider re-entry throughout loading, including a second picker return.
+        if (r.world.name == nil or r.world.name == "" or pickerOpen(r)) and os.clock() >= entryWaitUntil then
+            assert(type(r.world.enter) == "function", "The world re-entry hook is unavailable.")
+            attempts = attempts + 1
+            assert(attempts <= 3, "The saved world repeatedly returned to the picker during recovery.")
+            savePNBResume()
+            local canResume = queueResume()
+            setStatus("Rejoining " .. name .. " (attempt " .. attempts .. "/3)...")
+            pause(attempts == 1 and 1 or 2, token)
+            assert(r.world.name == name or r.world.name == "" or r.world.name == nil,
+                "Arrived in another world. Check the saved PNB world.")
+            if r.world.name ~= name or pickerOpen(r) then
+                if not recentChecked then
+                    target, fromRecent = recentPNBWorld(name, token)
+                    recentChecked = true
+                    assert(r.world.name == name or r.world.name == "" or r.world.name == nil,
+                        "Arrived in another world. Check the saved PNB world.")
+                    setStatus("Rejoining " .. target .. (fromRecent and " from Recently Visited Worlds" or "")
+                        .. " (attempt " .. attempts .. "/3)...")
+                end
+                local entered, message, teleport = bounded(r.world.enter,
+                    App.config.options.actionTimeout + 15, token, target)
+                if teleport then
+                    App.teleporting = true
+                    setStatus(canResume and "Changing servers; the saved farm will resume after loading."
+                        or "Changing servers. Run the loader after arrival, then use Resume saved farm.")
+                    local deadline = os.clock() + 45
+                    while os.clock() < deadline do pause(0.2, token) end
+                    error("Server teleport did not finish. Use Resume saved farm after checking the world.")
+                end
+                if not entered then
+                    assert(App.pending == 0, "A world entry request is still pending.")
+                    assert(attempts < 3, tostring(message or "Could not rejoin the saved world."))
+                elseif r.picker then
+                    assert(r.world.name == name, "Arrived in another world. Check the saved PNB world.")
+                    r.picker.complete()
+                end
+                entryWaitUntil = os.clock() + (entered and 2 or 0)
+            end
+            stableSince = nil
+            readyDeadline = os.clock() + App.config.options.actionTimeout + 15
+            setStatus("Waiting for the saved world and avatar to load...")
+        end
+        local state = r.body and r.body.state()
+        if r.world.name == name and not pickerOpen(r) and state and state.active and not state.dead
+            and not player:GetAttribute("Frozen") then
+            stableSince = stableSince or os.clock()
+            if os.clock() - stableSince >= 1 then break end
+        else stableSince = nil end
+        assert(os.clock() < readyDeadline, "The saved world or avatar did not become ready.")
+        pause(0.1, token)
+    end
+    takeControls()
+    refreshInventory(token)
+    App.lastPlacement = nil
+    setStatus("Finding a route back to the breaking spot...")
+    moveToPoint(App.config.points.pnb, token)
+    App.recovering = false
+    setStatus("Back at the breaking spot. Resuming Place & Break...")
+end
+
+local function classifyPNBFault(problem, token)
+    if type(problem) == "table" and problem.recoverable then return problem end
+    releaseControls()
+    local name, deadline = App.config.points.pnb.world, os.clock() + 1.5
+    -- An interrupted RPC can fail before the local exit state changes. Allow
+    -- that short transition to reveal itself without retrying mutating actions.
+    repeat
+        checkpoint(token)
+        local r = runtime()
+        if r.world.name == "" or r.world.name == nil or pickerOpen(r) then
+            return recoverable("Returned to the world picker during an action: " .. tostring(problem), name, "worldPicker")
+        end
+        if r.world.name ~= name then return problem end
+        local state = r.body and r.body.state()
+        if state and (not state.active or state.dead) then
+            return recoverable("The avatar became unavailable during an action: " .. tostring(problem), name, "avatar")
+        end
+        if os.clock() >= deadline then return problem end
+        pause(0.1, token)
+    until false
+end
+
+local function runTransfer(token, saved)
+    Core.checkSetup(App.config, "transfer", runtime().items)
+    local p, id = App.config.points, App.config.blockId
+    local phase = saved and saved.phase or "pickup"
+    local cargo = saved and saved.cargo or 0
+    assert(phase == "pickup" or phase == "deliver" or phase == "return", "Invalid transfer resume phase.")
+    if not saved then worldCheck(p.farmBox.world, token) end
+    while true do
+        checkpoint(token)
+        if phase == "pickup" then
+            worldCheck(p.farmBox.world, token)
+            moveToPoint(p.farmBox, token)
+            refreshInventory(token)
+            if storageCount(p.farmBox, id) == 0 then
+                clearResume()
+                setStatus("Finished: the farm storage box is empty.")
+                return
+            end
+            setStatus("Taking blocks from the farm storage box...")
+            saveResume("pickupPending", 0)
+            local taken = withdraw(p.farmBox, id, token)
+            assert(taken > 0, "No blocks were withdrawn.")
+            -- Track only this trip's cargo; existing inventory blocks stay with the player.
+            cargo = taken
+            saveResume("deliver", cargo)
+            phase = "deliver"
+        elseif phase == "deliver" then
+            if runtime().world.name == p.farmBox.world then
+                setStatus("Going through the door to the breaking world...")
+                enterDoor(p.farmDoor, p.blockBox, "deliver", cargo, token)
+            end
+            worldCheck(p.blockBox.world, token)
+            setStatus("Putting the transported blocks into PNB storage...")
+            refreshInventory(token)
+            assert(count(id) >= cargo, "Some saved cargo is missing. Check your backpack before resuming.")
+            -- Save the count before issuing a mutating request. An interrupted deposit is
+            -- ambiguous; resume refuses to repeat it until the player checks the inventory.
+            saveResume("depositPending", cargo)
+            local moved = deposit(p.blockBox, id, cargo, token)
+            App.stats.trips = App.stats.trips + 1
+            App.stats.moved = App.stats.moved + moved
+            cargo = 0
+            phase = "return"
+            saveResume(phase, cargo)
+        elseif phase == "return" then
+            if runtime().world.name == p.blockBox.world then
+                setStatus("Returning through the door to the farm world...")
+                enterDoor(p.breakDoor, p.farmBox, "return", 0, token)
+            end
+            worldCheck(p.farmBox.world, token)
+            phase = "pickup"
+            saveResume(phase, 0)
+        end
+    end
+end
+
+local function clearPlantResume()
+    App.plantState = nil
+    if exists(PLANT_RESUME_FILE) then
+        if type(delfile) == "function" then delfile(PLANT_RESUME_FILE)
+        else writeJSON(PLANT_RESUME_FILE, {version = 1, active = false}) end
+    end
+end
+local function savePlantResume(state)
+    saveSession()
+    local copy = {worldIndex = state.worldIndex, phase = state.phase, skipped = {}, pending = state.pending}
+    for key, reason in pairs(state.skipped or {}) do copy.skipped[key] = reason end
+    writeJSON(PLANT_RESUME_FILE, {version = 1, active = true, userId = player.UserId, updatedAt = os.time(),
+        config = Core.validate(App.config), profile = App.profile, state = copy})
+    App.plantState = state
+end
+local function readPlantResume()
+    if not exists(PLANT_RESUME_FILE) then return nil end
+    local record = decode(readfile(PLANT_RESUME_FILE))
+    if not record.active then return nil end
+    assert(record.version == 1 and record.userId == player.UserId, "The saved planting task belongs to another account or script version.")
+    assert(type(record.updatedAt) == "number" and os.time() - record.updatedAt < 21600, "Saved planting is over six hours old. Start it again.")
+    record.config, record.profile = Core.validate(record.config), Core.profileName(record.profile)
+    local state = record.state
+    assert(type(state) == "table" and type(state.worldIndex) == "number" and state.worldIndex == math.floor(state.worldIndex)
+        and state.worldIndex >= 1 and state.worldIndex <= #record.config.planting.worlds + 1
+        and (state.phase == "farm" or state.phase == "stock" or state.phase == "pickupPending")
+        and type(state.skipped) == "table", "Invalid saved planting progress.")
+    for key, reason in pairs(state.skipped) do
+        assert(type(key) == "string" and key:match("^%d+:%d+$") and type(reason) == "string", "Invalid skipped planting tile.")
+    end
+    if state.pending then
+        local point = state.pending
+        assert(state.phase == "farm" and point.world == record.config.planting.worlds[state.worldIndex], "Invalid pending seed world.")
+        for _, key in ipairs({"x", "y", "before"}) do
+            assert(type(point[key]) == "number" and point[key] == math.floor(point[key])
+                and point[key] >= 0 and point[key] <= 65535, "Invalid pending seed placement.")
+        end
+        assert(point.before >= 1 and point.before <= 200, "Invalid pending seed count.")
+    end
+    return record
+end
+local function enterPlantWorld(name, state, token)
+    local r = runtime()
+    local attempts, nextEntry, stableSince = 0, 0, nil
+    local deadline = os.clock() + App.config.options.actionTimeout + 15
+    releaseControls()
+    while true do
+        checkpoint(token)
+        if (r.world.name ~= name or pickerOpen(r)) and os.clock() >= nextEntry then
+            attempts = attempts + 1
+            assert(attempts <= 3, "Planting world repeatedly returned to the picker: " .. name)
+            assert(type(r.world.enter) == "function", "The world entry hook is unavailable.")
+            savePlantResume(state)
+            local queued = queueResume()
+            setStatus("Entering planting world " .. name .. "...")
+            local entered, message, teleport = bounded(r.world.enter, App.config.options.actionTimeout + 15, token, name)
+            if teleport then
+                App.teleporting = true
+                setStatus(queued and "Changing servers; planting will resume after loading."
+                    or "Changing servers. Run the loader after arrival, then use Resume planting.")
+                local teleportDeadline = os.clock() + 45
+                while os.clock() < teleportDeadline do pause(0.2, token) end
+                error("Server teleport did not finish. Use Resume planting after arrival.")
+            end
+            if not entered then assert(attempts < 3, tostring(message or "Could not enter " .. name))
+            elseif r.picker and r.world.name == name then r.picker.complete() end
+            nextEntry, stableSince = os.clock() + 2, nil
+            deadline = os.clock() + App.config.options.actionTimeout + 15
+        end
+        local avatar = r.body and r.body.state()
+        if r.world.name == name and not pickerOpen(r) and avatar and avatar.active and not avatar.dead
+            and not player:GetAttribute("Frozen") then
+            stableSince = stableSince or os.clock()
+            if os.clock() - stableSince >= 1 then break end
+        else stableSince = nil end
+        assert(os.clock() < deadline, "Planting world or avatar did not finish loading: " .. name)
+        pause(0.1, token)
+    end
+    App.teleporting = false
+    takeControls()
+    refreshInventory(token)
+end
+local function reconcilePlant(state, token)
+    local point = state.pending
+    if not point then return end
+    worldCheck(point.world, token)
+    local id = App.config.planting.seedId
+    local actual, tile = refreshInventory(token)[id] or 0, tileAt(point.x, point.y)
+    if actual == point.before - 1 and tile == id then
+        App.stats.planted = App.stats.planted + 1
+    else
+        assert(actual == point.before and tile == 0,
+            "Cannot reconcile the interrupted seed placement. Check the backpack and tile, then clear saved planting.")
+    end
+    state.pending = nil
+    savePlantResume(state)
+end
+local function plantTile(point, state, token)
+    return withoutPickups(function()
+        local name, id = App.config.planting.worlds[state.worldIndex], App.config.planting.seedId
+        local r = worldCheck(name, token)
+        local before = refreshInventory(token)[id] or 0
+        if not Core.plantingTile(r.world, r.items, point.x, point.y) then return false end
+        if not r.handlers.canPlace(r.items[id], point.x, point.y) then return false end
+        assert(before > 0, "No planting seeds are left in the backpack.")
+        state.pending = {world = name, x = point.x, y = point.y, before = before}
+        savePlantResume(state)
+        r.handlers.plantSeed(id, point.x, point.y)
+        pause(math.max(0.2, App.config.options.placeDelay), token)
+        local deadline = os.clock() + App.config.options.actionTimeout
+        while true do
+            worldCheck(name, token)
+            local after = refreshInventory(token)[id] or 0
+            assert(after == before or after == before - 1, "Seed count changed unexpectedly while planting. Check diagnostics before resuming.")
+            if after == before - 1 and tileAt(point.x, point.y) == id then break end
+            assert(os.clock() < deadline, "The server did not confirm a planted seed at " .. point.x .. ", " .. point.y .. ".")
+            pause(0.15, token)
+        end
+        settleTile(point.x, point.y, id, 0.12, name, token)
+        App.stats.planted = App.stats.planted + 1
+        state.pending = nil
+        savePlantResume(state)
+        return true
+    end)
+end
+local function runPlant(token, saved)
+    Core.checkSetup(App.config, "plant", runtime().items)
+    local settings, id = App.config.planting, App.config.planting.seedId
+    local state = saved and saved.state or {worldIndex = 1, phase = "farm", skipped = {}}
+    assert(state.phase ~= "pickupPending", "A seed storage withdrawal was interrupted. Check the backpack and box, then clear saved planting.")
+    savePlantResume(state)
+    while state.worldIndex <= #settings.worlds do
+        checkpoint(token)
+        if state.phase == "stock" then
+            enterPlantWorld(settings.storageWorld, state, token)
+            local box = App.config.points.plantBox
+            if storageCount(box, id) == 0 then
+                clearPlantResume()
+                setStatus("Planting stopped: the seed storage box is empty. Unfinished farm: " .. settings.worlds[state.worldIndex])
+                return
+            end
+            state.phase = "pickupPending"
+            savePlantResume(state)
+            withdraw(box, id, token)
+            state.phase = "farm"
+            savePlantResume(state)
+        end
+        local name = settings.worlds[state.worldIndex]
+        enterPlantWorld(name, state, token)
+        reconcilePlant(state, token)
+        local r, refill = runtime(), false
+        setStatus("Planting " .. r.items[id].name .. " in " .. name .. " (" .. state.worldIndex .. "/" .. #settings.worlds .. ")...")
+        for _, point in ipairs(Core.plantingTiles(r.world, r.items)) do
+            checkpoint(token)
+            worldCheck(name, token)
+            local key = point.x .. ":" .. point.y
+            if not state.skipped[key] and Core.plantingTile(r.world, r.items, point.x, point.y) then
+                if count(id) == 0 then refill = true; break end
+                local permitted = not r.world.areas or type(r.world.areas.canEdit) ~= "function" or r.world.areas.canEdit(point.x, point.y)
+                local arrived, issue = true, nil
+                if permitted then arrived, issue = pcall(moveTo, point.x, point.y, name, token) end
+                checkpoint(token)
+                worldCheck(name, token)
+                if not arrived then
+                    if type(issue) == "table" and issue.recoverable then error(issue, 0) end
+                    local text = tostring(issue)
+                    assert(text:find("route", 1, true) or text:find("position", 1, true) or text:find("support", 1, true)
+                        or text:find("platform", 1, true) or text:find("timed out", 1, true), text)
+                    state.skipped[key] = "unreachable"
+                elseif not permitted or not plantTile(point, state, token) then state.skipped[key] = "not permitted" end
+                if state.skipped[key] then savePlantResume(state) end
+            end
+        end
+        if refill then
+            state.phase = "stock"
+        else
+            local skipped = 0
+            for _ in pairs(state.skipped) do skipped = skipped + 1 end
+            setStatus("Processed " .. name .. ": " .. skipped .. " tiles skipped due to access or route. Moving to the next farm.")
+            state.worldIndex, state.skipped = state.worldIndex + 1, {}
+        end
+        savePlantResume(state)
+    end
+    clearPlantResume()
+    setStatus("Finished planting all configured farms. Seeds planted this session: " .. App.stats.planted)
+end
+
+function App:stop()
+    self.token = self.token + 1
+    self.teleporting = false
+    self.recovering = false
+    syncRunToggles()
+    releaseControls()
+    clearResume()
+    clearPNBResume()
+    clearPlantResume()
+    pcall(saveSession)
+    setStatus(self.pending > 0 and "Stopped; waiting for a pending server request." or "Stopped.")
+end
+function App:destroy()
+    if not self.alive then return end
+    self:stop()
+    self.alive = false
+    if self.idleConnection then self.idleConnection:Disconnect(); self.idleConnection = nil end
+    if self.window then pcall(function() self.window:Destroy() end) end
+    if env.ClarisGrowbloxApp == self then env.ClarisGrowbloxApp = nil end
+end
+local function start(mode, saved)
+    idle()
+    local r = runtime()
+    if mode == "harvest" or mode == "plant" then
+        assert(r.body and r.controls and type(r.inventory.room) == "function" and type(r.inventory.add) == "function"
+            and type(r.inventory.remove) == "function", "Collection and planting need the live backpack and movement hooks.")
+        if mode == "plant" then assert(r.handlers and type(r.handlers.canPlace) == "function" and type(r.handlers.plantSeed) == "function",
+            "The seed planting hooks are unavailable. Copy diagnostics from Settings.") end
+    else
+        assert(r.ready ~= false, "Inventory loaded, but farming hooks are unavailable: " .. table.concat(r.issues or {}, " "))
+    end
+    Core.checkSetup(App.config, mode, runtime().items)
+    if mode == "plant" then clearResume() else clearPlantResume() end
+    if mode == "harvest" and App.config.options.moveAfterHarvest then Core.checkSetup(App.config, "transfer", r.items) end
+    if mode == "pnb" and App.config.options.autoRejoin then savePNBResume(); queueResume()
+    else clearPNBResume() end
+    saveSession()
+    App.token = App.token + 1
+    local token = App.token
+    App.job = mode
+    App.jobToken = token
+    App.lastError = nil
+    App.teleporting, App.recovering = false, false
+    local transferRan = mode == "transfer"
+    syncRunToggles()
+    task.spawn(function()
+        local ok, message = xpcall(function()
+            checkpoint(token)
+            takeControls()
+            if mode == "pnb" then
+                while true do
+                    local completed, problem = pcall(runPNB, token)
+                    if completed then break end
+                    checkpoint(token)
+                    problem = classifyPNBFault(problem, token)
+                    if type(problem) == "table" and problem.recoverable and App.config.options.autoRejoin then
+                        local interruptions = 0
+                        while true do
+                            local recovered, nextProblem = pcall(recoverPNB, problem, token)
+                            if recovered then break end
+                            checkpoint(token)
+                            -- Entry denials and route failures remain terminal. A
+                            -- new picker/respawn fault during recovery can retry.
+                            if type(nextProblem) ~= "table" or not nextProblem.recoverable then error(nextProblem, 0) end
+                            interruptions = interruptions + 1
+                            assert(interruptions < 3, "Recovery was interrupted three times. Check the saved world and connection.")
+                            problem = nextProblem
+                        end
+                    else error(problem, 0) end
+                end
+            elseif mode == "plant" then
+                local progress = saved
+                while true do
+                    local completed, problem = pcall(runPlant, token, progress)
+                    if completed then break end
+                    checkpoint(token)
+                    if type(problem) == "table" and problem.recoverable and App.config.options.autoRejoin then
+                        progress = {state = App.plantState}
+                        assert(progress.state and progress.state.phase ~= "pickupPending", "Seed withdrawal was interrupted. Check the backpack before resuming.")
+                        setStatus("Planting interrupted; returning to its saved world...")
+                    else error(problem, 0) end
+                end
+            elseif mode == "harvest" then
+                runHarvest(token)
+                if App.config.options.moveAfterHarvest then
+                    checkpoint(token)
+                    App.job = "transfer"
+                    transferRan = true
+                    syncRunToggles()
+                    setStatus("Harvest collection finished. Starting Moving Drops...")
+                    runTransfer(token)
+                end
+            else runTransfer(token, saved) end
+        end, function(err) return tostring(err) end)
+        releaseControls()
+        App.job = nil
+        App.jobToken = nil
+        App.recovering = false
+        syncRunToggles()
+        if not ok and token == App.token and App.alive then
+            App.lastError = message
+            setStatus("Paused: " .. message)
+            notify(message)
+        end
+        if transferRan and ok then clearResume() end
+        if mode == "pnb" and (ok or not App.teleporting) then clearPNBResume() end
+    end)
+end
+
+local function setRunningEnabled(mode, enabled)
+    if App.syncingRunToggles then return true end
+    local ok, message = pcall(function()
+        if enabled then
+            if App.job == mode and App.jobToken == App.token then return end
+            start(mode)
+        elseif App.job == mode and App.jobToken == App.token then
+            App:stop()
+        end
+    end)
+    syncRunToggles()
+    if not ok then notify(tostring(message)) end
+    return ok, message
+end
+
+local function installAntiAFK()
+    if App.idleConnection then return true end
+    local ok, service = pcall(function() return game:GetService("VirtualUser") end)
+    if not ok then App.antiAFKError = tostring(service); return false end
+    local connected, connection = pcall(function()
+        return player.Idled:Connect(function()
+            if not App.alive or not App.config.options.antiAFK then return end
+            if App.lastIdleInput and os.clock() - App.lastIdleInput < 60 then return end
+            local sent, message = pcall(function()
+                service:CaptureController()
+                service:ClickButton2(Vector2.new(0, 0))
+            end)
+            if sent then App.lastIdleInput, App.antiAFKError = os.clock(), nil
+            else App.antiAFKError = tostring(message) end
+        end)
+    end)
+    if not connected then App.antiAFKError = tostring(connection); return false end
+    App.idleConnection, App.antiAFKError = connection, nil
+    return true
+end
+
+local function resetWebhookSchedule()
+    local state = App.webhookState
+    state.generation = state.generation + 1
+    state.nextAt = os.clock() + App.config.webhook.intervalMinutes * 60
+    state.status = App.config.webhook.enabled and "Automatic reports are On." or "Automatic reports are Off."
+end
+local function setWebhookSetting(key, value)
+    assert(App.alive, "Script unloaded.")
+    assert(key == "url" or key == "enabled" or key == "intervalMinutes" or key == "includeBoxes", "Unknown webhook setting.")
+    local nextSettings = {}
+    for name, current in pairs(App.config.webhook) do nextSettings[name] = current end
+    nextSettings[key] = value
+    App.config.webhook = Core.validateWebhook(nextSettings)
+    resetWebhookSchedule()
+    if key == "enabled" and value then App.webhookState.nextAt = os.clock() end
+end
+local function reportText(value, limit)
+    return tostring(value):sub(1, limit or 250)
+end
+local function reportBox(point, itemId)
+    if not point then return "Not saved" end
+    if not itemId then return "Unavailable (choose a block)" end
+    local r = App.runtime
+    if not r or r.world.name ~= point.world then
+        return "Unavailable (box is in " .. reportText(point.world, 100) .. ")"
+    end
+    local ok, total = pcall(function() return Core.itemCount(boxRows(point), itemId) end)
+    if not ok then return "Unavailable (check the saved Display Box)" end
+    return tostring(total) .. " in " .. reportText(point.world, 100) .. " at " .. point.x .. ", " .. point.y
+end
+local function webhookPayload(config, profile, metrics)
+    metrics = metrics or {}
+    local r, fields = App.runtime, {}
+    local function field(name, value, inline)
+        table.insert(fields, {name = name, value = reportText(value, 700), inline = inline == true})
+    end
+    local blockId = config.blockId ~= 0 and config.blockId or nil
+    local seedId
+    if r and blockId then
+        local ok, id = pcall(Core.seedId, r.items, blockId)
+        if ok then seedId = id end
+    end
+    local function backpack(id)
+        if not r or not id then return "Unavailable" end
+        local ok, total = pcall(function()
+            if r.readInventoryView then return Core.itemCount(r.world.backpackNow(), id) end
+            return r.inventory:count(id)
+        end)
+        return ok and tostring(total) or "Unavailable"
+    end
+    local name = player.Name or tostring(player.UserId)
+    field("Player", reportText(player.DisplayName or name, 100) .. " (@" .. reportText(name, 100) .. ")", true)
+    field("World", r and r.world.name ~= "" and r.world.name or "World picker / unconnected", true)
+    field("Profile", reportText(profile, 48), true)
+    field("Level", metrics.level or "Unavailable", true)
+    field("Gems", metrics.gems or "Unavailable", true)
+    local mode = App.job == "pnb" and "Place & Break" or App.job == "transfer" and "Moving Drops"
+        or App.job == "harvest" and "Collect harvest" or App.job == "plant" and "Planting" or "Off"
+    field("Farm status", mode .. (App.recovering and " (recovering)" or "") .. "\n" .. reportText(App.status, 600))
+    local item = r and blockId and r.items[blockId]
+    field("Selected block", item and (reportText(item.name or blockId, 100) .. " [" .. blockId .. "]") or "Not selected", true)
+    field("Backpack", "Blocks: " .. backpack(blockId) .. "\nSeeds: " .. backpack(seedId), true)
+    local minutes = math.floor((os.clock() - App.loadedAt) / 60)
+    field("This script session", "Time loaded: " .. minutes .. " min\nBlocks broken: " .. App.stats.broken
+        .. "\nGems collected: " .. App.stats.gems .. "\nBlocks moved: " .. App.stats.moved .. "\nTrips: " .. App.stats.trips
+        .. "\nHarvest blocks collected: " .. App.stats.harvested .. "\nBlocks stashed in Farm storage: " .. App.stats.stashed
+        .. "\nSeeds planted: " .. App.stats.planted)
+    if App.job == "plant" then
+        field("Planting seed", r and r.items[config.planting.seedId] and r.items[config.planting.seedId].name or "Not selected", true)
+        field("Planting seeds in backpack", backpack(config.planting.seedId), true)
+        if config.webhook.includeBoxes then field("Planting seed Display Box", reportBox(config.points.plantBox, config.planting.seedId), true) end
+    end
+    if config.webhook.includeBoxes then
+        field("Block Display Box", reportBox(config.points.blockBox, blockId), true)
+        field("Seed Display Box", reportBox(config.points.seedBox, seedId), true)
+        field("Farm Display Box", reportBox(config.points.farmBox, blockId), true)
+    end
+    return { username = "Claris Growblox", allowed_mentions = {parse = {}}, embeds = {{
+        title = "Growblox player stats", color = 0x65C18C, fields = fields,
+        footer = {text = "Claris Growblox v" .. VERSION .. " | " .. os.date("!%Y-%m-%d %H:%M:%S UTC")},
+    }} }
+end
+local function webhookTransport()
+    local candidates = {request, http_request, env.request, env.http_request,
+        type(syn) == "table" and syn.request or false,
+        type(http) == "table" and http.request or false}
+    for _, fn in pairs(candidates) do if type(fn) == "function" then return fn end end
+end
+-- Reporting owns its own requests: a slow Discord connection cannot stop the farm.
+-- Keep unsettled requests reserved even after a timeout to prevent overlapping reports.
+local function beginWebhookRequest(fn, ...)
+    local arguments, state = table.pack(...), App.webhookState
+    local result = {done = false}
+    state.pending = state.pending + 1
+    task.spawn(function()
+        result.values = table.pack(pcall(fn, table.unpack(arguments, 1, arguments.n)))
+        result.done = true
+        state.pending = state.pending - 1
+    end)
+    return result
+end
+local function webhookMetrics()
+    local r, metrics = App.runtime, {}
+    if not r or not r.world.name or r.world.name == "" then return metrics end
+    local gems = beginWebhookRequest(r.world.call, "GetGems")
+    local level = beginWebhookRequest(r.world.call, "GetLevel")
+    local deadline = os.clock() + 8
+    while App.alive and not (gems.done and level.done) and os.clock() < deadline do task.wait(0.05) end
+    local function number(result)
+        local values = result.done and result.values
+        local value = values and values[1] and values[2]
+        if type(value) == "number" and value == value and value >= 0 and value < math.huge then return value end
+    end
+    metrics.gems, metrics.level = number(gems), number(level)
+    return metrics
+end
+local function discordRetry(response)
+    local retry
+    for key, value in pairs(type(response.Headers) == "table" and response.Headers or {}) do
+        if tostring(key):lower() == "retry-after" then retry = tonumber(value) end
+    end
+    if type(response.Body) == "string" then
+        local ok, body = pcall(decode, response.Body)
+        if ok and type(body) == "table" then retry = tonumber(body.retry_after) or retry end
+    end
+    if not retry or retry ~= retry or retry == math.huge then retry = 60 end
+    return math.max(1, math.min(retry, 86400))
+end
+local function sendWebhook(manual)
+    local state, now = App.webhookState, os.clock()
+    if not App.alive then return false, "Script unloaded." end
+    if state.inFlight or state.pending > 0 then return false, "Waiting for the previous report request to finish." end
+    if now < (state.retryAt or 0) then return false, "Discord requested a cooldown. Try again later." end
+    if state.lastAttempt and now - state.lastAttempt < 5 then return false, "Wait five seconds between reports." end
+    local valid, settings = pcall(Core.validateWebhook, App.config.webhook)
+    if not valid then return false, tostring(settings) end
+    if settings.url == "" then return false, "Set the Discord webhook URL first." end
+    if not manual and not settings.enabled then return false, "Automatic reports are Off." end
+    local transport = webhookTransport()
+    if not transport then
+        state.status = "Delta HTTP request function is unavailable."
+        state.nextAt = now + settings.intervalMinutes * 60
+        return false, state.status
+    end
+    local generation, config, profile = state.generation, App.config, App.profile
+    state.inFlight, state.lastAttempt = true, now
+    state.nextAt, state.status = now + settings.intervalMinutes * 60, "Sending player stats..."
+    task.spawn(function()
+        local ok, message = pcall(function()
+            local metrics = webhookMetrics()
+            if not App.alive or state.generation ~= generation then return end
+            local payload = webhookPayload(config, profile, metrics)
+            local response = beginWebhookRequest(transport, {
+                Url = settings.url .. "?wait=true", Method = "POST",
+                Headers = {["Content-Type"] = "application/json"}, Body = encode(payload),
+            })
+            local deadline = os.clock() + 15
+            while App.alive and not response.done and os.clock() < deadline do task.wait(0.05) end
+            if not App.alive or state.generation ~= generation then return end
+            assert(response.done, "Discord request timed out; waiting for it to settle before sending again.")
+            -- Executor exceptions/response bodies can contain the URL's secret token.
+            assert(response.values[1], "Discord request failed. Check your connection and webhook URL.")
+            local result = response.values[2]
+            assert(type(result) == "table", "Invalid response from the executor HTTP function.")
+            local status = tonumber(result.StatusCode or result.Status)
+            if status == 429 then
+                local seconds = discordRetry(result)
+                state.retryAt = os.clock() + seconds
+                error("Discord rate limit: retry after " .. math.ceil(seconds) .. " seconds.", 0)
+            end
+            assert(status and status >= 200 and status < 300 and result.Success ~= false,
+                "Discord rejected the report (HTTP " .. tostring(status or "unknown") .. "). Check your webhook URL.")
+            state.lastSent, state.status = os.date("%H:%M:%S"), "Report sent."
+        end)
+        state.inFlight = false
+        if not ok and App.alive and state.generation == generation then state.status = tostring(message) end
+    end)
+    return true
+end
+local function pollWebhook()
+    local state = App.webhookState
+    if App.alive and App.config.webhook.enabled and not App.configuring and App.runtime
+        and os.clock() >= (state.nextAt or 0) then
+        sendWebhook(false)
+    end
+end
+
+local function seedChoices(query)
+    local r = runtime()
+    local scan, candidates, seen, relevant = newScan(), {}, {}, {}
+    query = (query or ""):match("^%s*(.-)%s*$"):lower()
+    local selectedId, selected = App.config.planting.seedId, nil
+    for _, slot in pairs(r.inventory.slots) do relevant[slot.id] = true end
+    local box = App.config.points.plantBox
+    if box and box.world == r.world.name then
+        local ok, rows = pcall(boxRows, box)
+        if ok then for _, row in pairs(rows) do relevant[row[1]] = true end end
+    end
+    if App.config.blockId > 0 then
+        local ok, id = pcall(Core.seedId, r.items, App.config.blockId)
+        if ok then relevant[id] = true end
+    end
+    local function consider(id)
+        if seen[id] or type(id) ~= "number" then return end
+        seen[id] = true
+        local item = r.items[id]
+        if type(item) ~= "table" or item.kind ~= "seed" then return end
+        local name = item.name or ("Seed " .. id)
+        if id == selectedId or query == "" or name:lower():find(query, 1, true) or tostring(id) == query then
+            local label = name .. " [" .. id .. "]"
+            table.insert(candidates, {id = id, label = label, rank = id == selectedId and 0 or relevant[id] and 1 or 2})
+            if id == selectedId then selected = label end
+        end
+    end
+    consider(selectedId)
+    for id in pairs(relevant) do consider(id) end
+    if query ~= "" then
+        for id in pairs(r.items) do
+            scanStep(scan, "Finding seed choices")
+            consider(id)
+        end
+    end
+    table.sort(candidates, function(a, b) return a.rank < b.rank or a.rank == b.rank and a.label < b.label end)
+    local labels, lookup = {}, {}
+    for index = 1, math.min(40, #candidates) do
+        local choice = candidates[index]
+        labels[index], lookup[choice.label] = choice.label, choice.id
+    end
+    table.sort(labels)
+    App.seedChoiceCount, App.seedChoiceMatches = #labels, #candidates
+    App.startupStage = "Ready"
+    return labels, lookup, selected, #candidates > #labels
+end
+
+local sessionOK, sessionProblem = pcall(restoreSession, previousSession)
+App.sessionRestoreError = not sessionOK and tostring(sessionProblem) or nil
+previousSession = nil
+
+if env.ClarisGrowbloxTest then
+    return { App = App, Core = Core, start = start, checkpoint = checkpoint,
+        runTransfer = runTransfer, runPNB = runPNB, refreshInventory = refreshInventory,
+        withdraw = withdraw, deposit = deposit, releaseControls = releaseControls,
+        takeControls = takeControls, collectDrops = collectDrops, enterDoor = enterDoor,
+        settleTile = settleTile, placeTile = placeTile, breakTile = breakTile, resolveRegistry = resolveRegistry,
+        discover = discover, connectGame = connectGame, runtime = runtime, resolveItems = resolveItems,
+        syncRunToggles = syncRunToggles, setRunningEnabled = setRunningEnabled,
+        Navigation = Navigation, navigationMap = navigationMap, moveTo = moveTo, worldCheck = worldCheck,
+        recoverPNB = recoverPNB, recoverable = recoverable, installAntiAFK = installAntiAFK,
+        savePNBResume = savePNBResume, readPNBResume = readPNBResume, refreshPNBCheckpoint = refreshPNBCheckpoint,
+        webhookPayload = webhookPayload, setWebhookSetting = setWebhookSetting,
+        resetWebhookSchedule = resetWebhookSchedule, sendWebhook = sendWebhook, pollWebhook = pollWebhook,
+        findWorldPicker = findWorldPicker, pickerOpen = pickerOpen, runHarvest = runHarvest,
+        saveSession = saveSession, restoreSession = restoreSession, pollSession = pollSession,
+        runPlant = runPlant, plantTile = plantTile, enterPlantWorld = enterPlantWorld,
+        readPlantResume = readPlantResume, savePlantResume = savePlantResume, clearPlantResume = clearPlantResume,
+        reconcilePlant = reconcilePlant, seedChoices = seedChoices }
+end
+
+local function loadWindUI()
+    if type(env.ClarisGrowbloxWindUI) == "table" then return env.ClarisGrowbloxWindUI end
+    local url = env.ClarisGrowbloxWindUIURL or (Core.REPO .. "vendor/WindUI.lua")
+    local source = game:HttpGet(url)
+    local chunk, message = loadstring(source, "Claris WindUI")
+    assert(chunk, message)
+    return chunk()
+end
+WindUI = loadWindUI()
+local window = WindUI:CreateWindow({
+    Title = "Claris Growblox Autofarm", Author = "Claris | v" .. VERSION,
+    Folder = ROOT, Icon = "sprout", Size = UDim2.fromOffset(640, 560),
+    OpenButton = { Title = "Claris Growblox", Enabled = true, Draggable = true, OnlyMobile = false },
+})
+App.window = window
+window:OnDestroy(function() App:destroy() end)
+local pnbTab = window:Tab({ Title = "Place & Break", Icon = "hammer" })
+local harvestTab = window:Tab({ Title = "Harvest Drops", Icon = "package" })
+local plantTab = window:Tab({ Title = "Planting", Icon = "sprout" })
+local transferTab = window:Tab({ Title = "Moving Drops", Icon = "truck" })
+local profileTab = window:Tab({ Title = "Configurations", Icon = "save" })
+local webhookTab = window:Tab({ Title = "Discord Webhook", Icon = "bell" })
+local settingsTab = window:Tab({ Title = "Settings", Icon = "settings" })
+
+local function paragraphSet(paragraph, title, desc)
+    if paragraph and paragraph.ParagraphFrame then
+        paragraph.ParagraphFrame:SetTitle(title)
+        paragraph.ParagraphFrame:SetDesc(desc)
+    end
+end
+local function pointText(key)
+    local point = App.config.points[key]
+    if not point then return "Not saved" end
+    local text = point.world .. "  |  tile " .. point.x .. ", " .. point.y
+    if point.standX then text = text .. "  |  stand " .. point.standX .. ", " .. point.standY end
+    return text
+end
+local function updatePoints()
+    for key, paragraph in pairs(ui.points or {}) do
+        paragraphSet(paragraph, ui.pointTitles[key], pointText(key))
+    end
+    paragraphSet(ui.harvestPoint, "Farm storage", pointText("farmBox"))
+    paragraphSet(ui.plantPoint, "Planting seed storage", pointText("plantBox"))
+end
+local function uiAction(fn)
+    return function()
+        task.spawn(function()
+            local ok, message = pcall(idle)
+            if not ok then notify(tostring(message)); return end
+            App.configuring = true
+            ok, message = xpcall(fn, function(err) return tostring(err) end)
+            App.configuring = false
+            if ok then ok, message = pcall(saveSession) end
+            if not ok then setStatus(message); notify(message) end
+        end)
+    end
+end
+local function captureNearby(key, kind)
+    local r, state = runtime(), position()
+    local standX, standY = math.floor(state.x), math.floor(state.y - 0.01)
+    local candidates = {}
+    for y = math.max(0, standY - 2), math.min(r.world.h - 1, standY + 1) do
+        for x = math.max(0, standX - 3), math.min(r.world.w - 1, standX + 3) do
+            local item = r.items[tileAt(x, y)]
+            local matches = item and (kind == "box" and item.display and not item.displayOne
+                or kind == "door" and (item.door or item.vip))
+            if matches then
+                local distance = (x + 0.5 - state.x) ^ 2 + (y + 1 - state.y) ^ 2
+                table.insert(candidates, { x = x, y = y, distance = distance })
+            end
+        end
+    end
+    table.sort(candidates, function(a, b) return a.distance < b.distance end)
+    assert(candidates[1], "Stand beside the " .. kind .. " and try saving again.")
+    assert(not candidates[2] or math.abs(candidates[1].distance - candidates[2].distance) > 0.1,
+        "Two targets are equally close. Stand closer to the one you want to save.")
+    local chosen = candidates[1]
+    App.config.points[key] = { world = r.world.name, x = chosen.x, y = chosen.y,
+        standX = standX, standY = standY }
+    updatePoints()
+    setStatus("Saved " .. ui.pointTitles[key] .. ": " .. pointText(key))
+end
+local function capturePNB()
+    local r, state = runtime(), position()
+    local point = { world = r.world.name, x = math.floor(state.x), y = math.floor(state.y - 0.01) }
+    assert(state.grounded, "Stand still on the PNB platform before saving.")
+    for _, cell in ipairs(Core.grid(point)) do tileAt(cell.x, cell.y) end
+    App.config.points.pnb = point
+    -- Save the screenshot's two boxes automatically when this exact layout exists.
+    for key, offset in pairs({ seedBox = -2, blockBox = 2 }) do
+        local x, y = point.x + offset, point.y
+        local item = r.items[tileAt(x, y)]
+        if item and item.display and not item.displayOne then
+            App.config.points[key] = { world = point.world, x = x, y = y,
+                standX = point.x + (offset < 0 and -1 or 1), standY = point.y }
+        end
+    end
+    updatePoints()
+    setStatus("Saved PNB spot. Matching left/right Display Boxes were saved too.")
+end
+
+local blockLabels, blockDropdown = {}, nil
+local function refreshBlocks()
+    local r = App.runtime or connectGame()
+    if r.readInventoryView then r.readInventoryView() end
+    local ids, seen = {}, {}
+    for _, slot in ipairs(r.inventory.slots) do
+        if Core.farmable(r.items[slot.id]) and not seen[slot.id] then
+            table.insert(ids, slot.id); seen[slot.id] = true
+        end
+    end
+    local selected = App.config.blockId
+    if selected > 0 and Core.farmable(r.items[selected]) and not seen[selected] then
+        table.insert(ids, selected)
+    end
+    table.sort(ids, function(a, b) return r.items[a].name < r.items[b].name end)
+    local labels, selectedLabel = {}, nil
+    blockLabels = {}
+    for _, id in ipairs(ids) do
+        local label = r.items[id].name .. " [" .. id .. "]  |  " .. count(id) .. " in backpack"
+        blockLabels[label] = id
+        table.insert(labels, label)
+        if id == selected then selectedLabel = label end
+    end
+    blockDropdown.Value = selectedLabel
+    blockDropdown:Refresh(labels)
+end
+ui.points, ui.pointTitles = {}, {
+    pnb = "PNB spot", blockBox = "Block storage (breaking world)", seedBox = "Seed storage (left box)",
+    farmBox = "Farm storage", farmDoor = "Farm door to breaking world", breakDoor = "Breaking door to farm world",
+    plantBox = "Planting seed storage",
+}
+ui.status = pnbTab:Paragraph({ Title = "Status", Desc = App.status })
+blockDropdown = pnbTab:Dropdown({
+    Title = "Block to farm", Desc = "Select a block from your backpack; this also selects the Moving Drops block.",
+    Values = {}, SearchBarEnabled = true,
+    Callback = function(label)
+        if App.syncingUI then return end
+        local id = blockLabels[label]
+        if id then
+            if App.job or App.configuring or App.pending > 0 then
+                notify("Stop the task before selecting another block.")
+                return
+            end
+            App.config.blockId = id
+        end
+    end,
+})
+pnbTab:Button({ Title = "Refresh inventory choices", Callback = uiAction(refreshBlocks) })
+pnbTab:Paragraph({ Title = "PNB layout", Desc = "Seed box - Empty - Player - Empty - Block box\nPlace one block directly above the player, break it, collect nearby drops, and repeat." })
+for _, key in ipairs({ "pnb", "blockBox", "seedBox" }) do
+    ui.points[key] = pnbTab:Paragraph({ Title = ui.pointTitles[key], Desc = "Not saved" })
+end
+pnbTab:Button({ Title = "Save PNB spot and matching boxes", Desc = "Stand on the middle platform, then press this button.", Callback = uiAction(capturePNB) })
+pnbTab:Button({ Title = "Save block storage", Desc = "Stand beside the right Display Box.", Callback = uiAction(function() captureNearby("blockBox", "box") end) })
+pnbTab:Button({ Title = "Save seed storage", Desc = "Stand beside the left Display Box.", Callback = uiAction(function() captureNearby("seedBox", "box") end) })
+App.runToggles.pnb = pnbTab:Toggle({ Title = "Place & Break", Value = false,
+    Desc = "On runs the farm. Off stops it. Turns off automatically when the task ends.",
+    Callback = function(enabled) setRunningEnabled("pnb", enabled) end })
+
+ui.transferStatus = transferTab:Paragraph({ Title = "Status", Desc = App.status })
+transferTab:Paragraph({ Title = "Moving Drops setup", Desc = "Harvest manually, then use Harvest Drops to collect and store the selected blocks in Farm storage. Save both boxes and both linked doors. Start in the farm world." })
+for _, key in ipairs({ "farmBox", "farmDoor", "breakDoor" }) do
+    ui.points[key] = transferTab:Paragraph({ Title = ui.pointTitles[key], Desc = "Not saved" })
+    local pointKey = key
+    transferTab:Button({ Title = "Save " .. ui.pointTitles[key], Desc = "Stand beside the target and press Save.",
+        Callback = uiAction(function() captureNearby(pointKey, pointKey == "farmBox" and "box" or "door") end) })
+end
+transferTab:Paragraph({ Title = "Destination storage", Desc = "Use Save block storage on the Place & Break tab for the breaking world's destination box." })
+App.runToggles.transfer = transferTab:Toggle({ Title = "Moving Drops", Value = false,
+    Desc = "On moves the blocks. Off stops it. Turns off automatically when the task ends.",
+    Callback = function(enabled) setRunningEnabled("transfer", enabled) end })
+
+local selectedProfile, profileNameInput, profileDropdown = nil, nil, nil
+local settingsControls = {}
+ui.harvestStatus = harvestTab:Paragraph({ Title = "Status", Desc = App.status })
+harvestTab:Paragraph({ Title = "Collect harvested blocks", Desc = "Use the block selected on Place & Break. Collect its floating drops throughout the farm world and empty the backpack into Farm storage automatically. Harvest the trees first, then turn this On." })
+ui.harvestPoint = harvestTab:Paragraph({ Title = "Farm storage", Desc = pointText("farmBox") })
+harvestTab:Button({ Title = "Save Farm storage", Desc = "Stand beside the farm world's Display Box.",
+    Callback = uiAction(function() captureNearby("farmBox", "box") end) })
+settingsControls.moveAfterHarvest = harvestTab:Toggle({ Title = "Start Moving Drops after collection", Value = App.config.options.moveAfterHarvest,
+    Desc = "Finish collecting every selected block, then begin the configured door transfer. Save both doors and destination storage first.",
+    Callback = function(value)
+        if App.syncingUI then return end
+        if App.job or App.configuring or App.pending > 0 then
+            notify("Stop the task before changing automatic transfer.")
+            App.syncingUI = true
+            settingsControls.moveAfterHarvest:Set(App.config.options.moveAfterHarvest, false, false)
+            App.syncingUI = false
+            return
+        end
+        App.config.options.moveAfterHarvest = value
+    end })
+settingsControls.harvestRespawn = harvestTab:Toggle({ Title = "Respawn to Farm storage", Value = App.config.options.harvestRespawn,
+    Desc = "Respawn before storing a backpack of blocks. Use when your respawn door is near Farm storage.",
+    Callback = function(value)
+        if App.syncingUI then return end
+        if App.job or App.configuring or App.pending > 0 then
+            notify("Stop the task before changing the storage return route.")
+            App.syncingUI = true
+            settingsControls.harvestRespawn:Set(App.config.options.harvestRespawn, false, false)
+            App.syncingUI = false
+            return
+        end
+        App.config.options.harvestRespawn = value
+    end })
+App.runToggles.harvest = harvestTab:Toggle({ Title = "Collect harvest", Value = false,
+    Desc = "On collects and stores harvested blocks. Off stops. Turns Off when collection finishes or encounters a problem.",
+    Callback = function(enabled) setRunningEnabled("harvest", enabled) end })
+local plantControls, seedLabels = {}, {}
+local seedSearch, seedSearchGeneration = "", 0
+local function refreshSeeds(syncInputs)
+    if not App.runtime then return end
+    local labels, lookup, selected, more = seedChoices(seedSearch)
+    App.syncingPlantUI = true
+    seedLabels = lookup
+    plantControls.seed.Value = selected
+    plantControls.seed:Refresh(labels)
+    if syncInputs ~= false then
+        plantControls.storageWorld:Set(App.config.planting.storageWorld)
+        plantControls.worlds:Set(table.concat(App.config.planting.worlds, ", "))
+    end
+    paragraphSet(ui.seedChoices, "Seed choices", more and "Showing up to 40 choices. Narrow the search to find another seed."
+        or "Showing backpack seeds, the selected seed, and seeds in your saved box. Search by name or exact ID for other seeds.")
+    App.syncingPlantUI = false
+end
+local function changePlantSetting(key, value)
+    if App.syncingPlantUI or App.syncingUI then return end
+    local ok, message = pcall(function()
+        idle()
+        if key == "seedId" then value = assert(seedLabels[value], "Choose a seed.")
+        elseif key == "worlds" then value = Core.parseWorlds(value)
+        elseif value ~= "" then value = Core.worldName(value) end
+        local candidate = Core.validate(App.config)
+        candidate.planting[key] = value
+        App.config.planting = Core.validatePlanting(candidate.planting)
+        saveSession()
+    end)
+    if not ok then notify(tostring(message)) end
+end
+ui.plantStatus = plantTab:Paragraph({ Title = "Status", Desc = App.status })
+plantTab:Paragraph({ Title = "Fill dirt farms with seeds", Desc = "Plant the selected seed on empty tiles with solid ground or a platform below. Doors, vents, existing trees, and floating tiles are skipped. Refill from the saved seed Display Box, then continue through your farm world list." })
+App.syncingPlantUI = true
+plantControls.search = plantTab:Input({ Title = "Find seed by name or ID", Value = "", Placeholder = "e.g. Sugar Cane or 955",
+    Callback = function(value)
+        if App.syncingPlantUI or App.syncingUI then return end
+        seedSearch, seedSearchGeneration = tostring(value or ""), seedSearchGeneration + 1
+        local generation = seedSearchGeneration
+        task.spawn(function()
+            task.wait(0.25)
+            if not App.alive or generation ~= seedSearchGeneration then return end
+            local ok, issue = pcall(refreshSeeds, false)
+            if not ok and App.alive then notify(tostring(issue)) end
+        end)
+    end })
+ui.seedChoices = plantTab:Paragraph({ Title = "Seed choices", Desc = "Backpack and saved seed choices load after connecting. Search to find other seeds." })
+plantControls.seed = plantTab:Dropdown({ Title = "Seed to plant", Values = {}, SearchBarEnabled = true,
+    Callback = function(value) changePlantSetting("seedId", value) end })
+plantControls.storageWorld = plantTab:Input({ Title = "Seed storage world", Value = App.config.planting.storageWorld,
+    Placeholder = "e.g. ZZ4", Callback = function(value) changePlantSetting("storageWorld", value) end })
+plantControls.worlds = plantTab:Input({ Title = "Dirt farm worlds (in order)", Value = table.concat(App.config.planting.worlds, ", "),
+    Placeholder = "FARM1, FARM2, FARM3", Callback = function(value) changePlantSetting("worlds", value) end })
+ui.plantPoint = plantTab:Paragraph({ Title = "Planting seed storage", Desc = pointText("plantBox") })
+plantTab:Button({ Title = "Save seed Display Box", Desc = "Stand beside the seed box in the storage world. A dedicated box also selects its seed type.",
+    Callback = uiAction(function()
+        captureNearby("plantBox", "box")
+        App.config.planting.storageWorld = Core.worldName(runtime().world.name)
+        local rows, seed = boxRows(App.config.points.plantBox), nil
+        for _, row in pairs(rows) do
+            assert(runtime().items[row[1]] and runtime().items[row[1]].kind == "seed", "Use a Display Box containing seeds only.")
+            assert(not seed or seed == row[1], "Use a Display Box dedicated to one seed type.")
+            seed = row[1]
+        end
+        if seed then App.config.planting.seedId = seed end
+        refreshSeeds()
+    end) })
+plantTab:Button({ Title = "Refresh seed choices", Callback = uiAction(refreshSeeds) })
+App.runToggles.plant = plantTab:Toggle({ Title = "Plant seeds", Value = false,
+    Desc = "On plants and refills automatically. Off stops. Unreachable or denied tiles are reported and skipped.",
+    Callback = function(enabled) setRunningEnabled("plant", enabled) end })
+App.syncingPlantUI = false
+local webhookControls = {}
+local function syncWebhookControls()
+    App.syncingWebhookUI = true
+    for key, control in pairs(webhookControls) do
+        local value = App.config.webhook[key]
+        control:Set(key == "intervalMinutes" and tostring(value) or value)
+    end
+    App.syncingWebhookUI = false
+end
+local function syncUI()
+    App.syncingUI = true
+    for key, control in pairs(settingsControls) do control:Set(App.config.options[key]) end
+    profileNameInput:Set(App.profile)
+    if App.runtime then refreshBlocks() end
+    refreshSeeds()
+    updatePoints()
+    resetWebhookSchedule()
+    syncWebhookControls()
+    App.syncingUI = false
+end
+local function profilePath(name)
+    return PROFILE_DIR .. "/" .. Core.profileName(name) .. ".json"
+end
+local function listProfiles()
+    filesystem()
+    assert(type(listfiles) == "function", "Delta listfiles is required to list saved profiles.")
+    local names = {}
+    for _, path in ipairs(listfiles(PROFILE_DIR)) do
+        local basename = path:gsub("\\", "/"):match("([^/]+)%.json$")
+        if basename then table.insert(names, basename) end
+    end
+    table.sort(names)
+    profileDropdown.Value = selectedProfile
+    profileDropdown:Refresh(names)
+    return names
+end
+profileTab:Paragraph({ Title = "Named configurations", Desc = "Each profile saves the chosen block, saved locations, timing settings, and Discord webhook settings. Give each farm setup its own name. Files stay in Delta's ClarisGrowblox/profiles folder." })
+profileNameInput = profileTab:Input({ Title = "Profile name", Value = App.profile, Placeholder = "e.g. Sugar Cane - Farm 1", Callback = function() end })
+profileDropdown = profileTab:Dropdown({ Title = "Saved profiles", Values = {}, SearchBarEnabled = true,
+    Callback = function(name) selectedProfile = name end })
+profileTab:Button({ Title = "Save profile / Save as", Callback = uiAction(function()
+    local name = Core.profileName(profileNameInput.Value)
+    writeJSON(profilePath(name), Core.validate(App.config))
+    App.profile, selectedProfile = name, name
+    listProfiles()
+    setStatus("Saved profile: " .. name)
+end) })
+profileTab:Button({ Title = "Load selected profile", Callback = uiAction(function()
+    assert(selectedProfile, "Choose a saved profile first.")
+    local nextConfig = Core.validate(decode(readfile(profilePath(selectedProfile))))
+    App.config, App.profile = nextConfig, selectedProfile
+    syncUI()
+    setStatus("Loaded profile: " .. App.profile)
+end) })
+profileTab:Button({ Title = "New empty configuration", Callback = uiAction(function()
+    App.config, App.profile = Core.defaults(), "New Farm"
+    syncUI()
+    setStatus("New configuration. Save the locations, then save it under a new name.")
+end) })
+profileTab:Button({ Title = "Refresh saved profiles", Callback = uiAction(listProfiles) })
+profileTab:Button({ Title = "Delete selected profile", Callback = uiAction(function()
+    assert(selectedProfile, "Choose a saved profile first.")
+    local name = Core.profileName(selectedProfile)
+    assert(type(delfile) == "function", "Delta delfile is required to delete profiles.")
+    local path = profilePath(name)
+    if exists(path) then delfile(path) end
+    if exists(path .. ".bak") then delfile(path .. ".bak") end
+    selectedProfile = nil
+    profileDropdown:Select(nil)
+    listProfiles()
+    setStatus("Deleted profile: " .. name)
+end) })
+
+local function readResume()
+    if not exists(RESUME_FILE) then return nil end
+    local record = decode(readfile(RESUME_FILE))
+    if not record.active then return nil end
+    assert(record.version == 1 and record.userId == player.UserId, "The saved transfer belongs to another account or script version.")
+    assert(type(record.updatedAt) == "number" and os.time() - record.updatedAt < 21600,
+        "Saved transfer is over six hours old. Check your backpack and clear it before restarting.")
+    record.config = Core.validate(record.config)
+    record.profile = Core.profileName(record.profile)
+    assert(type(record.cargo) == "number" and record.cargo >= 0 and record.cargo <= 200,
+        "Invalid cargo in the saved transfer.")
+    return record
+end
+local function resumeTransfer()
+    idle()
+    local saved = readResume()
+    assert(saved, "No saved transfer is available.")
+    assert(saved.phase ~= "depositPending" and saved.phase ~= "pickupPending",
+        "A storage request was interrupted. Check the backpack and boxes, clear the saved transfer, then start again.")
+    App.config, App.profile, App.resume = saved.config, saved.profile, saved
+    syncUI()
+    start("transfer", saved)
+end
+local function resumeFarm()
+    idle()
+    local saved = readPNBResume()
+    assert(saved, "No saved farm is available. Load your profile and start Place & Break.")
+    App.config, App.profile = saved.config, saved.profile
+    syncUI()
+    start("pnb")
+end
+profileTab:Button({ Title = "Resume saved farm", Desc = "Return to the saved PNB world and breaking spot after a server change.",
+    Callback = function()
+        local ok, message = pcall(resumeFarm)
+        if not ok then notify(tostring(message)) end
+    end })
+profileTab:Button({ Title = "Resume saved transfer", Callback = function()
+    local ok, message = pcall(resumeTransfer)
+    if not ok then notify(tostring(message)) end
+end })
+local function resumePlant()
+    idle()
+    local saved = readPlantResume()
+    assert(saved, "No saved planting task is available.")
+    assert(saved.state.phase ~= "pickupPending", "A seed withdrawal was interrupted. Check the backpack and storage, then clear saved planting.")
+    App.config, App.profile = saved.config, saved.profile
+    syncUI()
+    start("plant", saved)
+end
+plantTab:Button({ Title = "Resume planting", Desc = "Restore the seed, world list, and progress after a server change or interruption.",
+    Callback = function() local ok, message = pcall(resumePlant); if not ok then notify(tostring(message)) end end })
+plantTab:Button({ Title = "Clear saved planting", Desc = "Use after checking an interrupted storage withdrawal or seed placement.",
+    Callback = uiAction(function() clearPlantResume(); setStatus("Cleared saved planting.") end) })
+profileTab:Button({ Title = "Clear saved transfer", Desc = "Use after checking an interrupted storage request. Items stay where they are.", Callback = uiAction(function()
+    clearResume()
+    setStatus("Cleared saved transfer.")
+end) })
+
+webhookTab:Paragraph({ Title = "Discord player reports", Desc = "Send player level and gems, farm status, session totals, backpack blocks/seeds, and saved Display Box counts. Save the profile to keep these settings. Keep your webhook URL private." })
+local function webhookChanged(key)
+    return function(value)
+        if App.syncingWebhookUI or App.syncingUI then return end
+        if key == "intervalMinutes" then value = tonumber(value) end
+        local ok, message = pcall(setWebhookSetting, key, value)
+        if not ok then notify(tostring(message)) end
+        syncWebhookControls()
+    end
+end
+App.syncingWebhookUI = true
+webhookControls.url = webhookTab:Input({ Title = "Discord webhook URL", Value = App.config.webhook.url,
+    Placeholder = "https://discord.com/api/webhooks/...", Callback = webhookChanged("url") })
+webhookControls.intervalMinutes = webhookTab:Input({ Title = "Send every (minutes)", Value = tostring(App.config.webhook.intervalMinutes),
+    Desc = "Enter 1-1440 minutes, for example 1, 5, or 30.", Placeholder = "5", Callback = webhookChanged("intervalMinutes") })
+webhookControls.includeBoxes = webhookTab:Toggle({ Title = "Include Display Box counts", Value = App.config.webhook.includeBoxes,
+    Desc = "Count selected blocks/seeds in saved boxes. Boxes in another world show as unavailable.", Callback = webhookChanged("includeBoxes") })
+webhookControls.enabled = webhookTab:Toggle({ Title = "Automatic webhook reports", Value = App.config.webhook.enabled,
+    Desc = "On sends a report, then repeats at your interval while the script is loaded. Off stops future reports.", Callback = webhookChanged("enabled") })
+App.syncingWebhookUI = false
+webhookTab:Button({ Title = "Send stats now", Callback = function()
+    local ok, message = sendWebhook(true)
+    if not ok then notify(message) end
+end })
+ui.webhookStatus = webhookTab:Paragraph({ Title = "Webhook status", Desc = App.webhookState.status })
+
+settingsTab:Paragraph({ Title = "Settings", Desc = "These settings are saved separately in each named configuration." })
+for _, info in ipairs({
+    {"antiAFK", "Anti-AFK", "Keep the session active when Roblox detects idle time."},
+    {"autoRejoin", "Rejoin world and return to PNB", "Re-enter the saved world from the world picker, then walk and jump back to the breaking spot."},
+}) do
+    local key = info[1]
+    settingsControls[key] = settingsTab:Toggle({Title = info[2], Desc = info[3], Value = App.config.options[key],
+        Callback = function(value)
+            if App.syncingUI then return end
+            if App.job or App.configuring or App.pending > 0 then
+                notify("Stop the task before changing settings.")
+                settingsControls[key]:Set(App.config.options[key], false, false)
+                return
+            end
+            App.config.options[key] = value
+            if key == "antiAFK" and value then installAntiAFK() end
+        end})
+end
+local sliderInfo = {
+    { "placeDelay", "Delay after placement", 0.05 }, { "punchDelay", "Delay between punches", 0.02 },
+    { "collectDelay", "Time to wait for drops", 0.05 }, { "actionTimeout", "Server request timeout", 1 },
+    { "moveTimeout", "Movement timeout", 1 }, { "seedThreshold", "Store seeds at this count", 1 },
+}
+for _, info in ipairs(sliderInfo) do
+    local key, title, step = info[1], info[2], info[3]
+    local limits = Core.LIMITS[key]
+    settingsControls[key] = settingsTab:Slider({ Title = title, Step = step,
+        Value = { Min = limits[1], Max = limits[2], Default = App.config.options[key] },
+        Callback = function(value)
+            if App.syncingUI then return end
+            if App.job or App.configuring or App.pending > 0 then
+                notify("Stop the task before changing settings.")
+                return
+            end
+            App.config.options[key] = value
+        end,
+    })
+end
+ui.diagnostics = settingsTab:Paragraph({ Title = "Game connection", Desc = "Connecting..." })
+local function reconnect()
+    releaseControls()
+    App.runtime = connectGame()
+    App.syncingUI = true
+    refreshBlocks()
+    refreshSeeds()
+    App.syncingUI = false
+    paragraphSet(ui.diagnostics, "Game connection", "Attached to " .. App.runtime.world.name
+        .. "\n" .. table.concat(App.discoveryReport, "\n"))
+    setStatus(App.runtime.ready and "Connected. Select a block and save your locations."
+        or "Inventory loaded. Some farming hooks are unavailable; see Settings for details.")
+end
+settingsTab:Button({ Title = "Reconnect to game", Callback = uiAction(reconnect) })
+settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
+    local text = "Claris Growblox " .. VERSION .. "\n"
+        .. "World: " .. (App.runtime and App.runtime.world.name or "unconnected")
+        .. "\nProfile: " .. App.profile .. "\nStatus: " .. App.status
+        .. "\nPending requests: " .. App.pending .. "\n" .. table.concat(App.logs, "\n")
+        .. "\nConnection error: " .. (App.connectionError or "none")
+        .. "\nAnti-AFK: " .. (App.antiAFKError or "ready")
+        .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
+        .. "\nRecovery save: " .. (App.recoverySaveError or "ready")
+        .. "\nSession save: " .. (App.sessionSaveError or App.sessionRestoreError or "ready")
+        .. "\nPlanting hook: " .. (App.runtime and App.runtime.handlers.plantSeed and "ready" or "unavailable")
+        .. "\nStartup stage: " .. (App.startupStage or "Building interface")
+        .. "\nSeed choices rendered: " .. (App.seedChoiceCount or 0)
+        .. "\nWebhook: " .. App.webhookState.status .. "\nWebhook pending requests: " .. App.webhookState.pending
+        .. "\nWorld picker: " .. (App.runtime and App.runtime.picker and (pickerOpen(App.runtime) and "visible" or "hidden") or "UI hook unavailable")
+        .. "\nRecent world selection: " .. (App.recentWorldDebug or "not requested")
+        .. "\n" .. table.concat(App.discoveryReport, "\n")
+    local clipboard = setclipboard or toclipboard
+    if clipboard then clipboard(text); notify("Diagnostics copied.") else print(text); notify("Diagnostics printed to the console.") end
+end })
+settingsTab:Button({ Title = "Unload script", Callback = function() App:destroy() end })
+ui.log = settingsTab:Paragraph({ Title = "Recent activity", Desc = "Ready." })
+installAntiAFK()
+
+task.spawn(function()
+    local deadline = os.clock() + 30
+    while App.alive and not ReplicatedStorage:GetAttribute("Qz") and os.clock() < deadline do task.wait(0.25) end
+    if not App.alive then return end
+    App.configuring = true
+    local ok, message = pcall(function()
+        reconnect()
+        listProfiles()
+        if App.sessionRestoreError then notify(App.sessionRestoreError) end
+        local plantingOK, planting = pcall(readPlantResume)
+        if plantingOK and planting then setStatus("Saved planting found. Use Resume planting on Planting.")
+        elseif not plantingOK then notify(tostring(planting)) end
+        local farmOK, farm = pcall(readPNBResume)
+        if farmOK and farm then setStatus("Saved farm found. Use Resume saved farm from Configurations.")
+        elseif not farmOK then notify(tostring(farm)) end
+        if exists(RESUME_FILE) then
+            local resumeOK, saved = pcall(readResume)
+            if resumeOK and saved then
+                App.resume = saved
+                setStatus("Saved transfer found. Resume it from Configurations.")
+            elseif not resumeOK then
+                notify(tostring(saved))
+            end
+        end
+    end)
+    App.configuring = false
+    if not ok then
+        paragraphSet(ui.diagnostics, "Game connection", tostring(message))
+        setStatus(tostring(message))
+        notify(tostring(message))
+    elseif env.ClarisGrowbloxAutoResume then
+        env.ClarisGrowbloxAutoResume = nil
+        local resumed, problem = pcall(function()
+            if readPlantResume() then resumePlant()
+            elseif readPNBResume() then resumeFarm()
+            elseif App.resume then resumeTransfer() end
+        end)
+        if not resumed then setStatus(tostring(problem)); notify(tostring(problem)) end
+    end
+end)
+task.spawn(function()
+    while App.alive do
+        syncRunToggles()
+        refreshPNBCheckpoint()
+        pollSession()
+        pollWebhook()
+        local suffix = "\nProfile: " .. App.profile .. "  |  Blocks broken: " .. App.stats.broken
+            .. "  |  Trips: " .. App.stats.trips .. "  |  Blocks moved: " .. App.stats.moved
+            .. "  |  Gems collected: " .. App.stats.gems
+            .. "\nHarvest blocks collected: " .. App.stats.harvested .. "  |  Blocks stashed: " .. App.stats.stashed
+            .. "  |  Seeds planted: " .. App.stats.planted
+        pcall(function()
+            paragraphSet(ui.status, "Status", App.status .. suffix)
+            paragraphSet(ui.transferStatus, "Status", App.status .. suffix)
+            paragraphSet(ui.harvestStatus, "Status", App.status .. suffix)
+            paragraphSet(ui.plantStatus, "Status", App.status .. suffix)
+            paragraphSet(ui.log, "Recent activity", table.concat(App.logs, "\n"))
+            local state = App.webhookState
+            local details = state.status .. "\nInterval: " .. App.config.webhook.intervalMinutes .. " min"
+                .. "\nLast sent: " .. (state.lastSent or "Never")
+            if App.config.webhook.enabled then
+                local nextAt = math.max(state.nextAt or os.clock(), state.retryAt or 0)
+                details = details .. "\nNext report in: " .. math.ceil(math.max(0, nextAt - os.clock()) / 60) .. " min"
+            end
+            paragraphSet(ui.webhookStatus, "Webhook status", details)
+        end)
+        task.wait(1)
+    end
+end)
+return App
