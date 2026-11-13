@@ -131,7 +131,7 @@ end
 return Core
 
 end)()
-local VERSION = "0.1.0"
+local VERSION = "0.1.1"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -190,6 +190,7 @@ local App = {
     alive = true, job = nil, token = 0, pending = 0, configuring = false,
     config = Core.defaults(), profile = "Default", status = "Connecting to Growblox...",
     logs = {}, controls = nil, runtime = nil, resume = nil, tileEvents = {},
+    connectionError = nil, discoveryReport = {},
     stats = { broken = 0, trips = 0, moved = 0 },
 }
 env.ClarisGrowbloxApp = App
@@ -286,12 +287,68 @@ local function readField(value, key)
     if ok then return field end
 end
 
+local function registryMap(candidate)
+    if type(candidate) ~= "table" then return nil end
+    local function matches(value)
+        return type(value) == "table" and rawget(value, "RnyflzPbj74") ~= nil
+            and rawget(value, "j1PKXTgzz") ~= nil and rawget(value, "hAYmgnN0A36") ~= nil
+    end
+    if matches(candidate) then return candidate end
+    -- The game publishes a proxy whose module references live in __index.
+    -- Inspect that table without invoking arbitrary GC-table metamethods.
+    local ok, meta = pcall(getmetatable, candidate)
+    if ok and type(meta) == "table" and matches(rawget(meta, "__index")) then
+        return rawget(meta, "__index")
+    end
+    if type(getrawmetatable) == "function" then
+        ok, meta = pcall(getrawmetatable, candidate)
+        if ok and type(meta) == "table" and matches(rawget(meta, "__index")) then
+            return rawget(meta, "__index")
+        end
+    end
+end
+
+local function resolveRegistry(objects)
+    local key = ReplicatedStorage:GetAttribute("Qz")
+    local containers = { { label = "executor shared", value = shared },
+        { label = "executor globals", value = env.shared } }
+    if type(getrenv) == "function" then
+        local ok, gameEnvironment = pcall(getrenv)
+        if ok and type(gameEnvironment) == "table" then
+            table.insert(containers, { label = "game runtime shared", value = gameEnvironment.shared })
+        end
+    end
+    for _, container in ipairs(containers) do
+        if key ~= nil and type(container.value) == "table" then
+            local map = registryMap(rawget(container.value, key))
+            if map then return map, container.label end
+        end
+    end
+    for _, object in pairs(objects or {}) do
+        local map = registryMap(object)
+        if map then return map, "GC module map" end
+        if key ~= nil and type(object) == "table" then
+            map = registryMap(rawget(object, key))
+            if map then return map, "GC shared table" end
+        end
+    end
+    error("Growblox module registry is inaccessible from Delta. Qz attribute: "
+        .. (key ~= nil and "present" or "missing") .. ". This is a script attachment failure, not a world-entry check.", 0)
+end
+
+local function inventoryObject(candidate)
+    return type(candidate) == "table" and type(rawget(candidate, "slots")) == "table"
+        and type(readField(candidate, "count")) == "function"
+        and type(readField(candidate, "room")) == "function"
+        and type(readField(candidate, "add")) == "function"
+        and type(readField(candidate, "remove")) == "function"
+end
+
 local function discover()
     assert(type(getgc) == "function", "Delta must expose getgc(true) to read Growblox's 2D client.")
-    local registryKey = ReplicatedStorage:GetAttribute("Qz")
-    local registry = registryKey and shared[registryKey]
-    assert(type(registry) == "table", "Join a Growblox world and wait for it to finish loading.")
     local objects = getgc(true)
+    local registry, registrySource = resolveRegistry(objects)
+    App.discoveryReport = { "Registry: " .. registrySource }
     local worlds, physics, controls = {}, {}, {}
     for _, object in pairs(objects) do
         if type(object) == "table" then
@@ -316,42 +373,91 @@ local function discover()
             end
         end
     end
-    assert(#worlds == 1, "Could not identify one active Growblox world. Rejoin and reconnect.")
+    table.insert(App.discoveryReport, "World tables: " .. #worlds .. "; avatar controllers: "
+        .. #physics .. "; touch controls: " .. #controls)
+    assert(#worlds == 1, "Could not identify one active Growblox world table (found " .. #worlds .. ").")
     local world = worlds[1]
+    local issues = {}
     local body
     for _, candidate in ipairs(physics) do
         if owns(candidate.state, world) then
-            assert(not body, "Multiple avatar controllers found. Rejoin before starting.")
+            if body then
+                body = nil
+                table.insert(issues, "Multiple avatar controllers match the active world.")
+                break
+            end
             body = candidate
         end
     end
-    assert(body, "Could not read the local 2D avatar. Delta debug upvalue support is required.")
-    assert(#controls == 1, "Could not identify the active touch controls. Rejoin and reconnect.")
+    if not body then table.insert(issues, "Local avatar state hook is unavailable.") end
+    if #controls ~= 1 then table.insert(issues, "Expected one touch controller; found " .. #controls .. ".") end
     local inventory
     for _, candidate in pairs(upvalues(world.backpackNow)) do
-        if type(candidate) == "table" and type(readField(candidate, "slots")) == "table"
-            and type(readField(candidate, "count")) == "function"
-            and type(readField(candidate, "room")) == "function" then
+        if inventoryObject(candidate) then
             inventory = candidate
         end
     end
-    assert(inventory, "Could not access your backpack. Delta debug upvalue support is required.")
+    if not inventory then
+        local ok, snapshot = pcall(world.backpackNow)
+        local matches = {}
+        if ok and type(snapshot) == "table" then
+            local counts = {}
+            for _, slot in pairs(snapshot) do counts[slot[1]] = (counts[slot[1]] or 0) + slot[2] end
+            for _, candidate in pairs(objects) do
+                if inventoryObject(candidate) then
+                    local identical, seen = true, {}
+                    for _, slot in pairs(candidate.slots) do
+                        if counts[slot.id] ~= slot.n then identical = false; break end
+                        seen[slot.id] = true
+                    end
+                    for id in pairs(counts) do if not seen[id] then identical = false end end
+                    if identical then table.insert(matches, candidate) end
+                end
+            end
+        end
+        if #matches == 1 then inventory = matches[1] end
+    end
+    local readInventoryView
+    if not inventory then
+        -- Listing the backpack does not require private mutation hooks.
+        inventory = { slots = {} }
+        readInventoryView = function()
+            local snapshot = world.backpackNow()
+            local slots = {}
+            for _, slot in pairs(snapshot) do table.insert(slots, { id = slot[1], n = slot[2] }) end
+            inventory.slots = slots
+        end
+        function inventory:count(id)
+            local total = 0
+            for _, slot in pairs(self.slots) do if slot.id == id then total = total + slot.n end end
+            return total
+        end
+        readInventoryView()
+        table.insert(issues, "Backpack is readable; its live mutation hooks are unavailable.")
+    end
     local handlers = {}
     for _, object in pairs(objects) do
         if type(object) == "function" then
             local name = functionName(object)
             if (name == "setTile" or name == "hit" or name == "canPlace") and owns(object, world) then
-                assert(not handlers[name], "Multiple " .. name .. " handlers found. Rejoin before starting.")
-                handlers[name] = object
+                if handlers[name] then
+                    table.insert(issues, "Multiple " .. name .. " handlers match the world.")
+                else
+                    handlers[name] = object
+                end
             end
         end
     end
-    assert(handlers.setTile and handlers.hit and handlers.canPlace,
-        "Could not identify placement/break handlers. Delta must retain function names and upvalues.")
+    for _, name in ipairs({ "setTile", "hit", "canPlace" }) do
+        if not handlers[name] then table.insert(issues, "Missing farming handler: " .. name) end
+    end
     local items = require(registry.RnyflzPbj74)
     local packets = require(registry.j1PKXTgzz)
     local runtime = { world = world, body = body, controls = controls[1], inventory = inventory,
-        items = items, packets = packets, handlers = handlers }
+        items = items, packets = packets, handlers = handlers, issues = issues,
+        readInventoryView = readInventoryView, ready = #issues == 0 }
+    table.insert(App.discoveryReport, "Inventory: " .. (readInventoryView and "readable snapshot" or "live backpack"))
+    table.insert(App.discoveryReport, "Farming hooks: " .. (#issues == 0 and "ready" or table.concat(issues, " ")))
     -- ByteNet's listener teardown contract is unknown; invalidate callbacks on reconnect/unload.
     packets.tileChanged.listen(function(message)
         if App.alive and App.runtime == runtime and message.layer == 1
@@ -365,12 +471,26 @@ local function discover()
     return runtime
 end
 
+local function connectGame()
+    App.discoveryReport = {}
+    local ok, result = pcall(discover)
+    if not ok then
+        App.connectionError = tostring(result)
+        error(App.connectionError, 0)
+    end
+    App.runtime = result
+    App.connectionError = nil
+    return result
+end
+
 local function runtime()
-    assert(App.runtime, "Connect to the game first using Reconnect in Settings.")
+    assert(App.runtime, App.connectionError or "The script has not attached to Growblox yet. Use Reconnect in Settings.")
     return App.runtime
 end
 local function position()
-    local state = runtime().body.state()
+    local r = runtime()
+    assert(r.body, "The avatar state hook is unavailable. Copy the game connection diagnostics from Settings.")
+    local state = r.body.state()
     assert(state.active and not state.dead, "Join a world and wait until your character is ready.")
     return state
 end
@@ -813,6 +933,8 @@ function App:destroy()
 end
 local function start(mode, saved)
     idle()
+    local r = runtime()
+    assert(r.ready ~= false, "Inventory loaded, but farming hooks are unavailable: " .. table.concat(r.issues or {}, " "))
     Core.checkSetup(App.config, mode, runtime().items)
     App.token = App.token + 1
     local token = App.token
@@ -839,7 +961,8 @@ if env.ClarisGrowbloxTest then
         runTransfer = runTransfer, runPNB = runPNB, refreshInventory = refreshInventory,
         withdraw = withdraw, deposit = deposit, releaseControls = releaseControls,
         takeControls = takeControls, collectDrops = collectDrops, enterDoor = enterDoor,
-        waitTile = waitTile, placeTile = placeTile }
+        waitTile = waitTile, placeTile = placeTile, resolveRegistry = resolveRegistry,
+        discover = discover, connectGame = connectGame, runtime = runtime }
 end
 
 local function loadWindUI()
@@ -945,7 +1068,8 @@ end
 
 local blockLabels, blockDropdown = {}, nil
 local function refreshBlocks()
-    local r = runtime()
+    local r = App.runtime or connectGame()
+    if r.readInventoryView then r.readInventoryView() end
     local ids, seen = {}, {}
     for _, slot in ipairs(r.inventory.slots) do
         if Core.farmable(r.items[slot.id]) and not seen[slot.id] then
@@ -1131,13 +1255,14 @@ ui.diagnostics = settingsTab:Paragraph({ Title = "Game connection", Desc = "Conn
 local function reconnect()
     releaseControls()
     App.tileEvents = {}
-    App.runtime = discover()
+    App.runtime = connectGame()
     App.syncingUI = true
     refreshBlocks()
     App.syncingUI = false
-    paragraphSet(ui.diagnostics, "Game connection", "Connected to " .. App.runtime.world.name
-        .. "\n2D avatar, backpack, placement, breaking, storage, and network handlers found.")
-    setStatus("Connected. Select a block and save your locations.")
+    paragraphSet(ui.diagnostics, "Game connection", "Attached to " .. App.runtime.world.name
+        .. "\n" .. table.concat(App.discoveryReport, "\n"))
+    setStatus(App.runtime.ready and "Connected. Select a block and save your locations."
+        or "Inventory loaded. Some farming hooks are unavailable; see Settings for details.")
 end
 settingsTab:Button({ Title = "Reconnect to game", Callback = uiAction(reconnect) })
 settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
@@ -1145,6 +1270,8 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "World: " .. (App.runtime and App.runtime.world.name or "unconnected")
         .. "\nProfile: " .. App.profile .. "\nStatus: " .. App.status
         .. "\nPending requests: " .. App.pending .. "\n" .. table.concat(App.logs, "\n")
+        .. "\nConnection error: " .. (App.connectionError or "none")
+        .. "\n" .. table.concat(App.discoveryReport, "\n")
     local clipboard = setclipboard or toclipboard
     if clipboard then clipboard(text); notify("Diagnostics copied.") else print(text); notify("Diagnostics printed to the console.") end
 end })
@@ -1153,7 +1280,7 @@ ui.log = settingsTab:Paragraph({ Title = "Recent activity", Desc = "Ready." })
 
 task.spawn(function()
     local deadline = os.clock() + 30
-    while App.alive and not player:GetAttribute("GameReady") and os.clock() < deadline do task.wait(0.25) end
+    while App.alive and not ReplicatedStorage:GetAttribute("Qz") and os.clock() < deadline do task.wait(0.25) end
     if not App.alive then return end
     App.configuring = true
     local ok, message = pcall(function()

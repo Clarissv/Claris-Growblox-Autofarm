@@ -36,7 +36,8 @@ local function fixture()
     }
     local localPlayer = { UserId = 1234, GetAttribute = function() return nil end }
     local services = {
-        HttpService = http, Players = { LocalPlayer = localPlayer }, ReplicatedStorage = {},
+        HttpService = http, Players = { LocalPlayer = localPlayer },
+        ReplicatedStorage = { GetAttribute = function() return "session-registry" end },
         UserInputService = { GetFocusedTextBox = function() return nil end },
     }
     game = { GetService = function(_, name) assert(services[name], name); return services[name] end }
@@ -261,6 +262,82 @@ test("Acknowledgments from an old world grid are ignored", function()
     f.world.fg[7][10] = 954
     f.app.tileEvents[7 * f.world.w + 10] = {serial = 3, id = 954, world = "BREAK", fg = {}}
     rejects(function() f.hooks.waitTile(10, 7, 954, 0, "BREAK", 1) end, "No server confirmation")
+end)
+
+local function moduleMap(f)
+    return {
+        RnyflzPbj74 = f.app.runtime.items,
+        hAYmgnN0A36 = {},
+        j1PKXTgzz = { tileChanged = { listen = function() end }, worldTag = function() return 1 end },
+    }
+end
+
+test("Game runtime shared is used when Delta's shared table is isolated", function()
+    local f = fixture()
+    local modules = moduleMap(f)
+    shared = {}
+    getrenv = function() return { shared = { ["session-registry"] = setmetatable({}, {__index = modules}) } } end
+    local resolved, source = f.hooks.resolveRegistry({})
+    assert(resolved == modules and source == "game runtime shared")
+end)
+
+test("GC can recover the module map without access to game shared", function()
+    local f = fixture()
+    local modules = moduleMap(f)
+    shared, getrenv = {}, nil
+    local resolved, source = f.hooks.resolveRegistry({{}, modules})
+    assert(resolved == modules and source == "GC module map")
+    resolved, source = f.hooks.resolveRegistry({setmetatable({}, {__index = modules})})
+    assert(resolved == modules and source == "GC module map")
+end)
+
+test("Registry failure stays visible instead of being blamed on world entry", function()
+    local f = fixture()
+    shared, getrenv = {}, nil
+    getgc = function() return {} end
+    f.app.runtime = nil
+    rejects(function() f.hooks.connectGame() end, "module registry is inaccessible")
+    assert(f.app.connectionError and not f.app.connectionError:find("Join a Growblox world", 1, true))
+    rejects(function() f.hooks.runtime() end, "module registry is inaccessible")
+end)
+
+local function prepareDiscovery(f, liveInventory)
+    local modules = moduleMap(f)
+    shared, getrenv = {}, nil
+    f.world.displayPut, f.world.useDoor = function() end, function() end
+    function f.world.backpackNow()
+        local rows = {}
+        for _, slot in pairs(f.inventory.slots) do table.insert(rows, {slot.id, slot.n}) end
+        return rows
+    end
+    local objects = {f.world, modules}
+    if liveInventory then table.insert(objects, f.inventory) end
+    getgc = function() return objects end
+    require = function(reference) return reference end
+    return modules
+end
+
+test("Missing motion and punch hooks do not prevent loading the live backpack", function()
+    local f = fixture()
+    f.inventory:add(954, 61)
+    prepareDiscovery(f, true)
+    local r = f.hooks.connectGame()
+    assert(r.inventory == f.inventory and r.inventory:count(954) == 61)
+    assert(r.ready == false and #r.issues > 0)
+    f.app.job = nil
+    rejects(function() f.hooks.start("pnb") end, "Inventory loaded, but farming hooks are unavailable")
+    assert(f.app.job == nil and f.app.controls == nil)
+end)
+
+test("Backpack snapshots can populate the selector without private inventory upvalues", function()
+    local f = fixture()
+    f.inventory:add(954, 61)
+    prepareDiscovery(f, false)
+    local r = f.hooks.connectGame()
+    assert(r.readInventoryView and r.inventory:count(954) == 61 and r.ready == false)
+    f.inventory:add(954, 10)
+    r.readInventoryView()
+    assert(r.inventory:count(954) == 71)
 end)
 
 return string.format("%d actual-script runtime tests passed (mock services/server)", passed)

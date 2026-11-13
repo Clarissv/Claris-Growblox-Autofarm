@@ -5,6 +5,7 @@ Source boundary: 126 Lua dump files in `../[112863874972771] Growblox`, supplied
 | Finding | Dump source and line | Implementation consequence |
 | --- | --- | --- |
 | Registry is `shared[ReplicatedStorage:GetAttribute("Qz")]` | `[nil] rpiyox2ca0N (1_666082).lua:1740` | Resolve ModuleScript references from the game registry. |
+| Bootstrap publishes a proxy with the actual module map in its `__index` table | `[nil] TFM2nCP4e (1_666125).lua:192` | Resolve through `getrenv().shared`, the executor's shared table, or a matching GC module map. Executor and game environments may differ. |
 | Main returns `true`; the active world is private | `rpiyox2ca0N:14935` | Discover the world table through `getgc(true)` and verify its function signatures. |
 | Avatar state callback exposes 2D center/feet coordinates and velocities | `rpiyox2ca0N:10163` | Use the matching controller's `state()` for capture and movement feedback. |
 | Main dynamically reads mounted touch controls | `rpiyox2ca0N:160`; `[nil] ZT0JhdkFNJaq (1_666093).lua:383` | Temporarily supply movement/jump input and restore the original functions on stop. |

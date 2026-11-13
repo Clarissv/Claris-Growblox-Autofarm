@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.0.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.1.
+
+Version 0.1.1 fixes startup when Delta's `shared` table differs from the game's `shared` table. It resolves the module map through the game's runtime environment or GC tables, loads the inventory independently of missing farming hooks, and retains the original connection error in diagnostics.
 
 ## Features
 
