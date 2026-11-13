@@ -214,4 +214,22 @@ test("Reporting counts matching stacks in mixed boxes and rejects damaged conten
     rejects(function() Core.itemCount({{954, -1}}, 954) end, "Invalid")
 end)
 
+test("Harvest collection requires only the chosen block and farm Display Box", function()
+    local config = setup()
+    config.points = {farmBox = config.points.farmBox}
+    assert(Core.checkSetup(config, "harvest", items))
+    config.points.farmBox = nil
+    rejects(function() Core.checkSetup(config, "harvest", items) end, "farmBox")
+end)
+
+test("Older profiles keep automatic harvest transfer Off and validate explicit choices", function()
+    local config = setup()
+    config.options.moveAfterHarvest = nil
+    assert(not Core.validate(config).options.moveAfterHarvest)
+    config.options.moveAfterHarvest = true
+    assert(Core.validate(config).options.moveAfterHarvest)
+    config.options.moveAfterHarvest = "yes"
+    rejects(function() Core.validate(config) end, "moveAfterHarvest")
+end)
+
 return string.format("%d configuration/layout/storage tests passed", passed)

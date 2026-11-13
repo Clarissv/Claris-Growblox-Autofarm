@@ -1,6 +1,10 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.8.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.10.
+
+Version 0.1.10 fixes startup's dependence on three exact module keys. It can recover the registry from protected proxy method upvalues, use item definitions captured by the active world's functions, or find one validated definition table in GC. It only loads the known item module when needed. Diagnostics show registry availability, discovered world/controller counts, and the item-definition source or failure.
+
+Harvest Drops collects the selected block's floating harvest drops throughout the current farm world and repeatedly empties the backpack into the saved Farm storage box. It tries batched pickup from the box first, then walks to supported pickup positions if the server requires proximity. An optional setting starts Moving Drops only after collection and storage finish. Existing held blocks of the selected type are stored too. Tree harvesting remains manual.
 
 Version 0.1.8 fixes recovery when the picker appears during an exit animation, inventory read, or an earlier recovery attempt. It also detects the visible picker even if the game still reports the old world and avatar, and performs the normal picker HUD/focus cleanup after successful entry. Rejoining looks for the saved breaking world in Recently Visited Worlds, falls back to its saved name, waits for one second of stable loading, then returns to PNB. Interrupted inventory replies are checked against current world/avatar state before being applied.
 
@@ -22,6 +26,7 @@ Version 0.1.1 fixes startup when Delta's `shared` table differs from the game's 
 
 - **Place & Break:** choose a block from your inventory, place one directly above your saved PNB position, break it, collect nearby loose gems, seeds, and returned blocks, and repeat. Refill from the right Display Box when the backpack runs out. Put seeds in the left Display Box at the configured count, which defaults to 200. Stop when both backpack and block storage are empty.
 - **Moving Drops:** take the selected blocks from a dedicated farm Display Box, use the linked door to the breaking world, deposit the trip's blocks in the PNB storage box, and return through the other linked door. Continue until stopped or the farm box is empty. Harvesting remains manual.
+- **Harvest Drops:** collect the selected block's loose drops after manual tree harvesting. Store backpack blocks in the saved Farm storage box, collect up to eight drop requests at a time with stack-room reservations, deposit when full, and finish with the remaining blocks stored. Optionally start Moving Drops afterward. Seeds, gems, and other loose item types are outside this collection task.
 - **Named configurations:** Save, Load, New, and Delete multiple profiles containing the chosen block, every saved world and tile, the position from which to access each box/door, and timing settings.
 - **Discord reports:** send stats manually or automatically every 1-1440 minutes, defaulting to five. Include selected block/seed counts from the saved storage boxes in the current world. Reporting runs independently of farming and respects Discord cooldowns.
 - **Anti-AFK:** responds to Roblox's idle event while the script is loaded. Disable it in Settings or unload the script to stop it. The setting is saved per profile.
@@ -62,7 +67,7 @@ For an existing checkout with the GitHub remote configured, upload this rebuilt 
 ```powershell
 Set-Location -LiteralPath 'F:\VSCode\Luau\Claris Growblox Autofarm\logic'
 git add .
-git commit -m "Fix world picker recovery and recent world re-entry"
+git commit -m "Add harvested drop collection into Farm storage"
 git push
 ```
 
@@ -85,10 +90,22 @@ Recovery checks the picker throughout loading, including when it appears after a
 
 Existing profiles and saved locations still work. Collect any drops remaining in the old outer columns manually once; the new loop does not place blocks there. **Settings → Time to wait for drops** now defaults to 0.1 seconds and allows zero. Loaded profiles retain their saved delay, so set this to 0.1 or zero and save again if your old profile uses 0.75 seconds. The game still controls drop readiness; lowering this extra delay does not bypass that wait.
 
+## Collect harvested drops into Farm storage
+
+1. On **Place & Break**, select the harvested block, such as Sugar Cane. The same selected block applies to Harvest Drops and Moving Drops.
+2. In the farm world, stand beside a dedicated Display Box and use **Harvest Drops → Save Farm storage**. The location is shared with **Moving Drops → Farm storage**, so an existing saved box works. Save your profile after setup.
+3. Harvest the trees manually, then turn **Harvest Drops → Collect harvest** On. The script walks to the saved box, deposits selected blocks already in the backpack, collects loose blocks in batches, and deposits again whenever the stack fills. It finishes with the last batch stored in the box.
+4. Enable **Start Moving Drops after collection** before starting if you want automatic transport. Both linked doors and the destination block box must already be saved. This option is saved per profile and defaults to Off for older profiles. When collection finishes, Collect harvest turns Off and Moving Drops turns On for the transfer. With the option Off, you can start Moving Drops manually afterward.
+5. Turn the active task toggle Off to stop. The status shows collection, movement, and storage progress; collected/stashed session totals also appear in Discord reports.
+
+Collection reads the current world's loose-drop list and targets only the selected block. It respects drop readiness, retry cooldowns, and backpack capacity. There is no identified server action to move loose drops directly into a Display Box, so collection and verified deposit are separate actions. If distant UID pickups are accepted, the script can stay at the box. If refused, it uses the collision-aware walking/jumping planner to get near the drops and returns to storage as needed. Live pickup reach determines which path is used.
+
+Keep the saved box and farm platforms reachable. A failed deposit retains the backpack blocks; an unreachable or repeatedly refused drop stops with its UID and coordinates. Automatic transport begins only after successful collection, including a short empty-list settling check. A world change or respawn interrupts harvest collection; PNB's automatic rejoin remains specific to Place & Break. Pending accepted pickups still settle after Stop, so wait for requests before restarting collection. Tree cutting, seed collection, and gem collection remain manual for this task.
+
 ## Set up Moving Drops
 
 1. Select the block on **Place & Break**. This choice also applies to Moving Drops.
-2. In the farm world, harvest manually and place the harvested blocks in the farm Display Box.
+2. In the farm world, harvest manually, then use Harvest Drops to collect the selected blocks into the farm Display Box. You can also fill the box manually.
 3. Stand beside that box and press **Save Farm storage** on **Moving Drops**. Stand beside the linked door and save **Farm door to breaking world**.
 4. In the breaking world, save the destination Display Box using **Save block storage** on **Place & Break**. Stand beside the return door and save **Breaking door to farm world**.
 5. Verify the doors link to the intended worlds and arrival doors. Save the named profile after recording both worlds.
@@ -109,7 +126,7 @@ An interrupted storage request leaves a `pickupPending` or `depositPending` chec
 5. Press **Send stats now** to check delivery, then turn **Automatic webhook reports** On. Enabling sends a report and starts the interval. Editing the interval schedules the next report from that change; manual sends also restart the interval. Discord's retry delay can postpone a report.
 6. Use **Configurations → Save profile / Save as** to keep the URL, interval, and toggles. Webhook controls can be changed while farming; saving a profile retains the existing requirement to stop the farm first.
 
-Reports include Roblox player name, Growblox level and gem balance, current world/profile, farm status, selected block, backpack blocks/seeds, and blocks broken, gems collected, trips, and blocks moved during this script session. Session totals reset when reloading the script. Level and gem balance use the game's read-only APIs; failed or slow queries show **Unavailable**. Backpack and box counts come from the client's current data without moving the avatar or taking anything from storage. Boxes in another world, missing saved locations, or invalid saved tiles are marked explicitly; the reporter does not enter another world to read them.
+Reports include Roblox player name, Growblox level and gem balance, current world/profile, farm status, selected block, backpack blocks/seeds, and blocks broken, gems collected, trips, blocks moved, harvest blocks collected, and blocks stashed during this script session. Session totals reset when reloading the script. Level and gem balance use the game's read-only APIs; failed or slow queries show **Unavailable**. Backpack and box counts come from the client's current data without moving the avatar or taking anything from storage. Boxes in another world, missing saved locations, or invalid saved tiles are marked explicitly; the reporter does not enter another world to read them.
 
 Automatic reporting continues while the script is loaded, including when the farm is Off or recovering. Turn its reporting toggle Off or unload the script to end future reports. A request already sent can still finish. **Webhook status** shows delivery results, last successful send, and the next interval. HTTP errors and Discord rate limits do not stop farming. Reports wait for unsettled requests before sending again. Delta must expose `request`, `http_request`, or a supported equivalent for Discord delivery.
 
@@ -135,12 +152,12 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.8 passes 111 offline checks: 19 configuration/layout/storage tests, 90 tests executing the generated runtime against mock services and a mock server, and two release checks. Added recovery fixtures cover delayed picker transitions, brief false readiness, invalid/interrupted inventory responses, a second picker return during recovery, bounded retries, Recent selection/fallback, correct picker discovery, and HUD/focus restoration with a stale active world. Existing webhook, navigation, refill, drop, inventory, recovery, anti-AFK, and toggle checks remain. Live game/server behavior, picker-hook discovery in Delta, the teleport queue, and real Discord delivery still need in-game verification.
+Version 0.1.10 passes 137 offline checks: 21 configuration/layout/storage tests, 114 tests executing the generated runtime against mock services and a mock server, and two release checks. Attachment fixtures cover isolated shared environments, protected registry proxies, missing/renamed module keys, known-module loading and failure, missing Qz, complete attachment from world-function upvalues, GC fallback, ambiguous tables, and rejection of incomplete definitions without requiring unrelated modules. Harvest fixtures cover held blocks plus loose drops, repeated deposits of a 450-block stack, eight concurrent requests with room reservations, walking under a proximity-enforcing mock server, readiness/cooldown handling, unreachable/refused drops, denied deposits, late pickup settlement after Stop, and collection-to-transfer toggle/checkpoint behavior. Existing PNB, webhook, navigation, recovery, anti-AFK, and storage checks remain. Live attachment, pickup reach, farm-platform traversal, Delta behavior, and Discord delivery still need in-game verification.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 
 ## Sources and limitations
 
-See `RESEARCH.md` for the client-dump evidence behind the game adapter. Runtime access requires Delta's `getgc` and debug upvalue/function-name APIs. Randomized module references are resolved through the game's own shared registry. A future game update can change those references or private handlers; the script stops with a diagnostic when it cannot identify them.
+See `RESEARCH.md` for the client-dump evidence behind the game adapter. Runtime access requires Delta's `getgc` and debug upvalue/function-name APIs. Item definitions are identified through active-world function upvalues, the game's shared module registry, or a unique validated GC table. The fallback checks stable item IDs, names, and category fields from the dump; a future game update can change these or private handlers. The script stops with a diagnostic when definitions are missing or ambiguous.
 
 The original instructions and screenshot were read without modification.

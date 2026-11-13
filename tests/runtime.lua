@@ -3,6 +3,7 @@
 table.pack = table.pack or function(...) return { n = select("#", ...), ... } end
 table.unpack = table.unpack or unpack
 local passed = 0
+local nativeRequire = require
 local function test(name, fn)
     local ok, message = pcall(fn)
     assert(ok, name .. ": " .. tostring(message))
@@ -18,6 +19,10 @@ local function fixture()
     local ticks, serial = 0, 0
     local context = { pickups = 0, displays = 0 }
     request, http_request, syn, http = nil, nil, nil, nil
+    shared, getrenv, getrawmetatable, getgc = {}, nil, nil, nil
+    getupvalues, getupvalue, getinfo = nil, nil, nil
+    typeof = nil
+    require = nativeRequire
     os.clock = function() return ticks end
     getgenv = function() return env end
     isfile = function(path) return files[path] ~= nil end
@@ -127,8 +132,10 @@ local function fixture()
         world = world, inventory = inventory, controls = controls,
         body = { state = function() return avatar end, solidAt = function() return false end },
         items = {
-            [954] = { name = "Sugar Cane", hits = 2 }, [955] = { kind = "seed" },
-            [18] = { kind = "tool" }, [1422] = { display = true }, [12] = { door = true },
+            [0] = {name = "Blank", solid = false}, [2] = {name = "Dirt", solid = true, hits = 3},
+            [954] = { name = "Sugar Cane", hits = 2 }, [955] = { name = "Sugar Cane Seed", kind = "seed" },
+            [18] = { name = "Fist", kind = "tool" }, [1422] = { name = "Display Box", display = true },
+            [12] = { name = "Door", door = true },
         },
     }
     app.token, app.job, app.jobToken = 1, "transfer", 1
@@ -1175,7 +1182,7 @@ test("Pickup hook failures clear taking and restore native pickup suppression", 
 end)
 
 local function installToggles(f)
-    for _, mode in ipairs({"pnb", "transfer"}) do
+    for _, mode in ipairs({"pnb", "transfer", "harvest"}) do
         local control = {Value = false, history = {}}
         function control:Set(value, callback, instant)
             assert(callback == false and instant == false)
@@ -1297,19 +1304,20 @@ test("GC can recover the module map without access to game shared", function()
     assert(resolved == modules and source == "GC module map")
 end)
 
-test("Registry failure stays visible instead of being blamed on world entry", function()
+test("Attachment failure records registry availability and world discovery", function()
     local f = fixture()
     shared, getrenv = {}, nil
     getgc = function() return {} end
     f.app.runtime = nil
-    rejects(function() f.hooks.connectGame() end, "module registry is inaccessible")
+    rejects(function() f.hooks.connectGame() end, "Could not identify one active Growblox world table")
     assert(f.app.connectionError and not f.app.connectionError:find("Join a Growblox world", 1, true))
-    rejects(function() f.hooks.runtime() end, "module registry is inaccessible")
+    assert(f.app.discoveryReport[1]:find("unavailable; Qz attribute: present", 1, true))
+    assert(f.app.discoveryReport[2]:find("World tables: 0", 1, true))
+    rejects(function() f.hooks.runtime() end, "Could not identify one active Growblox world table")
 end)
 
 local function prepareDiscovery(f, liveInventory)
     local modules = moduleMap(f)
-    shared, getrenv = {}, nil
     f.world.displayPut, f.world.useDoor = function() end, function() end
     function f.world.backpackNow()
         local rows = {}
@@ -1318,10 +1326,178 @@ local function prepareDiscovery(f, liveInventory)
     end
     local objects = {f.world, modules}
     if liveInventory then table.insert(objects, f.inventory) end
+    f.discoveryObjects = objects
     getgc = function() return objects end
-    require = function(reference) return reference end
     return modules
 end
+
+local function copyDefinitions(items)
+    local copy = {}
+    for id, item in pairs(items) do copy[id] = item end
+    return copy
+end
+
+test("Protected registry proxies can be recovered from their method upvalues", function()
+    local f = fixture()
+    local modules = moduleMap(f)
+    local proxy = setmetatable({
+        WaitForChild = function(_, key) return modules[key] end,
+        FindFirstChild = function(_, key) return modules[key] end,
+    }, {__index = modules, __metatable = "locked"})
+    f.env.shared = {["session-registry"] = proxy}
+    local resolved, source = f.hooks.resolveRegistry({})
+    assert(resolved == modules and source == "executor globals")
+end)
+
+test("The item registry entry does not require unrelated packet and fingerprint keys", function()
+    local f = fixture()
+    local modules = prepareDiscovery(f, true)
+    modules.j1PKXTgzz, modules.hAYmgnN0A36 = nil, nil
+    require = function() error("Already loaded item tables do not require modules") end
+    local r = f.hooks.connectGame()
+    assert(r.items == modules.RnyflzPbj74 and r.inventory == f.inventory)
+end)
+
+local function mockItemModule()
+    typeof = function(value) return type(value) == "table" and value.mockModule and "Instance" or type(value) end
+    return {mockModule = true, IsA = function(_, class) return class == "ModuleScript" end}
+end
+
+test("Only the known item ModuleScript is required when registry access works", function()
+    local f = fixture()
+    local items = f.app.runtime.items
+    local modules = prepareDiscovery(f, true)
+    local reference, calls = mockItemModule(), 0
+    modules.RnyflzPbj74 = reference
+    require = function(value) assert(value == reference); calls = calls + 1; return items end
+    assert(f.hooks.connectGame().items == items and calls == 1)
+end)
+
+test("A failed registry require can fall back to a unique loaded GC definition table", function()
+    local f = fixture()
+    local items = f.app.runtime.items
+    local modules = prepareDiscovery(f, true)
+    modules.RnyflzPbj74 = mockItemModule()
+    table.insert(f.discoveryObjects, items)
+    require = function() error("Delta cannot require this reference") end
+    assert(f.hooks.connectGame().items == items)
+    assert(table.concat(f.app.discoveryReport, "\n"):find("Registry item lookup: item module require failed", 1, true))
+end)
+
+test("An invalid registry result does not trigger requires of arbitrary GC modules", function()
+    local f = fixture()
+    local modules = prepareDiscovery(f, true)
+    local reference, calls = mockItemModule(), 0
+    modules.RnyflzPbj74 = reference
+    table.insert(f.discoveryObjects, mockItemModule())
+    require = function(value) assert(value == reference); calls = calls + 1; return {} end
+    rejects(function() f.hooks.connectGame() end, "item definitions are inaccessible")
+    assert(calls == 1 and table.concat(f.app.discoveryReport, "\n"):find("definition fingerprint mismatch", 1, true))
+end)
+
+local function attachWorldHandlers(f, items)
+    local world = f.world
+    local handlers = {
+        setTile = function(_, x, y, id) assert(items[id]); world.fg[y][x] = id end,
+        hit = function(x, y) return items[world.fg[y][x]] end,
+        canPlace = function(x, y, id) return world.fg[y][x] == 0 and items[id] ~= nil end,
+    }
+    local body = f.app.runtime.body
+    local avatar = f.avatar
+    body.H, body.HW = 0.95, 0.3
+    body.state = function() assert(world.fg); return avatar end
+    f.controls.punchPressed, f.controls.setScale = function() end, function() end
+    f.controls.place, f.controls.edit = function() end, function() end
+    f.discoveryObjects[#f.discoveryObjects + 1] = body
+    f.discoveryObjects[#f.discoveryObjects + 1] = f.controls
+    local names = {}
+    for name, fn in pairs(handlers) do
+        names[fn] = name
+        f.discoveryObjects[#f.discoveryObjects + 1] = fn
+    end
+    getinfo = function(fn) return {name = names[fn]} end
+    return handlers
+end
+
+test("Live world handler upvalues allow complete attachment with renamed module keys", function()
+    local f = fixture()
+    local items = f.app.runtime.items
+    local modules = prepareDiscovery(f, true)
+    modules.RenamedItems, modules.RnyflzPbj74 = items, nil
+    local handlers = attachWorldHandlers(f, items)
+    require = function() error("Must not require unidentified modules") end
+    f.app.runtime = nil
+    local r = f.hooks.connectGame()
+    assert(r.ready and r.items == items and r.handlers.hit == handlers.hit and r.inventory == f.inventory)
+    assert(f.app.connectionError == nil and f.app.discoveryReport[1]:find("Registry: unavailable", 1, true))
+    assert(table.concat(f.app.discoveryReport, "\n"):find("Item definitions: live world function upvalues", 1, true))
+end)
+
+test("Unnamed world-owned functions can supply definitions without farming hook names", function()
+    local f = fixture()
+    local items = f.app.runtime.items
+    prepareDiscovery(f, true)
+    table.remove(f.discoveryObjects, 2)
+    local world = f.world
+    table.insert(f.discoveryObjects, function(id) assert(world.fg); return items[id] end)
+    local r = f.hooks.connectGame()
+    assert(r.items == items and not r.ready and r.inventory == f.inventory)
+end)
+
+test("Missing Qz and registry still allow a unique item table from GC", function()
+    local f = fixture()
+    local items = f.app.runtime.items
+    prepareDiscovery(f, true)
+    f.services.ReplicatedStorage.GetAttribute = function() return nil end
+    f.discoveryObjects[2] = items
+    table.insert(f.discoveryObjects, items) -- Same table appearing twice is unambiguous.
+    table.insert(f.discoveryObjects, {[1422] = {name = "Display Box", display = true}})
+    local r = f.hooks.connectGame()
+    assert(r.items == items and f.app.discoveryReport[1]:find("Qz attribute: missing", 1, true))
+    assert(table.concat(f.app.discoveryReport, "\n"):find("Item definitions: GC item definitions", 1, true))
+end)
+
+test("World-owned definitions take precedence over stale copies in GC", function()
+    local f = fixture()
+    local items = f.app.runtime.items
+    prepareDiscovery(f, true)
+    attachWorldHandlers(f, items)
+    f.discoveryObjects[2] = copyDefinitions(items)
+    assert(f.hooks.connectGame().items == items)
+end)
+
+test("Distinct world-owned item tables are rejected instead of arbitrarily selected", function()
+    local f = fixture()
+    local items = f.app.runtime.items
+    prepareDiscovery(f, true)
+    attachWorldHandlers(f, items)
+    local other = copyDefinitions(items)
+    f.world.otherItems = function() return other end
+    f.app.runtime = nil
+    rejects(function() f.hooks.connectGame() end, "item definitions are ambiguous")
+    assert(f.app.runtime == nil and table.concat(f.app.discoveryReport, "\n"):find("ambiguous live world tables (2)", 1, true))
+end)
+
+test("Distinct GC item tables are rejected when ownership cannot be established", function()
+    local f = fixture()
+    local items = f.app.runtime.items
+    prepareDiscovery(f, true)
+    f.discoveryObjects[2] = items
+    table.insert(f.discoveryObjects, copyDefinitions(items))
+    rejects(function() f.hooks.connectGame() end, "item definitions are ambiguous in GC")
+end)
+
+test("Incomplete definitions and unrelated GC metamethods cannot attach", function()
+    local f = fixture()
+    prepareDiscovery(f, true)
+    f.discoveryObjects[2] = {[954] = {name = "Sugar Cane", hits = 2}}
+    table.insert(f.discoveryObjects, setmetatable({}, {__index = function() error("Must not invoke GC metamethods") end}))
+    f.app.runtime = nil
+    rejects(function() f.hooks.connectGame() end, "item definitions are inaccessible from Delta")
+    assert(f.app.connectionError:find("script attachment failure", 1, true))
+    local report = table.concat(f.app.discoveryReport, "\n")
+    assert(report:find("World tables: 1", 1, true) and report:find("Item definitions: not found", 1, true))
+end)
 
 test("Missing motion and punch hooks do not prevent loading the live backpack", function()
     local f = fixture()
@@ -1589,6 +1765,235 @@ test("Discord reporting supports the http_request executor fallback", function()
     setupWebhook(f)
     http_request, f.env.request = f.env.request, nil
     assert(f.hooks.sendWebhook(true) and #f.posts == 1)
+end)
+
+local function harvestFixture()
+    local f = pickupFixture()
+    f.app.job, f.world.name = "harvest", "FARM"
+    f.app.config.points.farmBox = {world = "FARM", x = 12, y = 8, standX = 10, standY = 8}
+    f.boxes[12] = {}
+    f.deposits = {}
+    local originalServer = f.server
+    f.server = function(name, x, y, id, _, _, n)
+        if name ~= "DisplayItem" then return originalServer(name) end
+        assert(f.world.name == "FARM" and x == 12 and y == 8 and id == 954)
+        assert(n > 0 and n <= (f.serverItems[id] or 0))
+        f.serverItems[id] = f.serverItems[id] - n
+        local total = f.hooks.Core.storageCount(f.boxes[x], id)
+        f.boxes[x] = {{id, total + n}}
+        f.deposits[#f.deposits + 1] = n
+        return true
+    end
+    function f.harvest()
+        f.hooks.takeControls()
+        return f.hooks.runHarvest(1)
+    end
+    return f
+end
+
+local function harvestFloor(f)
+    f.app.runtime.items[1] = {solid = true}
+    f.app.runtime.items[1422].solid = true
+    for _, row in pairs(f.world.fg) do for x in pairs(row) do row[x] = 0 end end
+    for x = 0, f.world.w - 1 do f.world.fg[9][x] = 1 end
+    f.world.fg[8][12], f.avatar.y = 1422, 8.999
+    f.app.runtime.body.solidAt = function(x, y)
+        if x < 0 or x >= f.world.w or y >= f.world.h then return true end
+        local id = f.world.fg[y] and f.world.fg[y][x] or 0
+        return id == 1 or id == 1422
+    end
+    return f.hooks.navigationMap(f.app.runtime)
+end
+
+test("Harvest collection stores held blocks and all selected drops while leaving other items", function()
+    local f = harvestFixture()
+    f.inventory:add(954, 200)
+    f.serverItems[954] = 200
+    for uid = 1, 12 do f.addDrop(uid, 954, 10, uid + 0.5, 2.5) end
+    local pending = f.drops[12]
+    pending.pending = true
+    local seed, gems, other = f.addDrop(101, 955, 10), f.addDrop(102, 112, 20), f.addDrop(103, 1, 5)
+    f.onWait = function() if os.clock() >= 0.2 then pending.pending = false end end
+    f.harvest()
+    assert(f.hooks.Core.storageCount(f.boxes[12], 954) == 320 and f.inventory:count(954) == 0)
+    assert(f.app.stats.harvested == 120 and f.app.stats.stashed == 320)
+    assert(#f.drops == 3 and seed.n == 10 and gems.n == 20 and other.n == 5)
+    assert(f.app.status:find("Finished collecting harvest", 1, true))
+end)
+
+test("A large harvested stack is collected and deposited in capacity-sized trips", function()
+    local f = harvestFixture()
+    f.packetTaken = true -- Packet updates must not double-subtract a partial pickup.
+    f.addDrop(1, 954, 450, 25.5, 2.5)
+    f.harvest()
+    assert(#f.requests == 3 and f.requests[1].want == 200 and f.requests[2].want == 200 and f.requests[3].want == 50)
+    assert(#f.deposits == 3 and f.deposits[1] == 200 and f.deposits[2] == 200 and f.deposits[3] == 50)
+    assert(#f.drops == 0 and f.inventory:count(954) == 0 and f.app.stats.stashed == 450)
+end)
+
+test("Harvest pickups run eight at a time with room reserved across the batch", function()
+    local f = harvestFixture()
+    for uid = 1, 12 do f.addDrop(uid, 954, 10, uid + 0.5, 3.5) end
+    local peak = 0
+    f.hooks.takeControls()
+    f.spawn = function(fn)
+        peak = math.max(peak, f.app.pending)
+        task.defer(fn)
+    end
+    f.hooks.runHarvest(1)
+    assert(peak == 8 and #f.requests == 12 and f.app.pending == 0)
+    assert(f.app.stats.harvested == 120 and f.hooks.Core.storageCount(f.boxes[12], 954) == 120)
+end)
+
+test("Harvest collection walks to distant drops when the server requires proximity", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    local visited = attachPhysics(f, map)
+    f.addDrop(1, 954, 20, 4.5, 8.5)
+    local rejected = 0
+    f.accept = function(drop, want)
+        if math.abs(drop.x - f.avatar.x) > 0.6 then rejected = rejected + 1; return 0 end
+        return want
+    end
+    f.harvest()
+    assert(rejected == 1 and visited["4:8"] and #f.drops == 0)
+    assert(f.hooks.Core.storageCount(f.boxes[12], 954) == 20 and f.app.stats.stashed == 20)
+    assert(math.abs(f.avatar.x - 10.5) < 0.16 and f.controls.dir() == 0)
+end)
+
+test("An unreachable harvest drop produces a location diagnostic instead of completing", function()
+    local f = harvestFixture()
+    harvestFloor(f)
+    local drop = f.addDrop(9, 954, 20, 4.5, 1.5)
+    f.accept = function() return 0 end
+    rejects(f.harvest, "No reachable floor or platform")
+    assert(drop.n == 20 and f.app.stats.stashed == 0 and #f.deposits == 0)
+end)
+
+test("Harvest collection respects drop readiness and the native refusal cooldown", function()
+    local f = harvestFixture()
+    local drop = f.addDrop(1, 954, 20)
+    drop.readyAt, drop.refused = 0.4, 0
+    f.onWait = function() drop.refused = os.clock() end -- Suppressed native attempts must not postpone our pickup.
+    f.harvest()
+    assert(#f.requests == 1 and f.requests[1].time >= 1 and f.app.stats.stashed == 20)
+end)
+
+test("A harvested drop refused at the standing position stops after three spaced attempts", function()
+    local f = harvestFixture()
+    harvestFloor(f)
+    local drop = f.addDrop(5, 954, 20, 10.5, 8.5)
+    f.accept = function() return 0 end
+    rejects(f.harvest, "refused harvested drop uid 5")
+    assert(#f.requests == 3 and f.requests[2].time - f.requests[1].time >= 1)
+    assert(f.requests[3].time - f.requests[2].time >= 1 and drop.n == 20 and not drop.taking)
+    assert(f.app.pending == 0 and not f.app.controls.pausePickup and f.app.stats.stashed == 0)
+end)
+
+test("Rejected farm deposits retain backpack blocks and keep Moving Drops Off", function()
+    local f = harvestFixture()
+    f.inventory:add(954, 200)
+    f.serverItems[954] = 200
+    f.app.job = nil
+    installToggles(f)
+    local originalServer = f.server
+    f.server = function(name, ...)
+        if name == "DisplayItem" then return false, "Box access denied" end
+        return originalServer(name, ...)
+    end
+    f.hooks.start("harvest")
+    assert(f.inventory:count(954) == 200 and f.app.stats.stashed == 0 and f.app.job == nil)
+    assert(f.app.lastError:find("Box access denied", 1, true) and not f.app.runToggles.harvest.Value)
+    assert(not f.app.runToggles.transfer.Value)
+end)
+
+test("Stopping a harvest pickup keeps pending UIDs owned until late settlement", function()
+    local f = harvestFixture()
+    local first, second = f.addDrop(1, 954, 10), f.addDrop(2, 954, 10)
+    local launches, delayed = 0, {}
+    f.spawn = function(fn)
+        launches = launches + 1
+        if launches > 1 then delayed[#delayed + 1] = fn; return end
+        return fn()
+    end
+    f.onWait = function() if #delayed > 0 then f.onWait = nil; f.app:stop() end end
+    rejects(f.harvest, "Stopped")
+    assert(first.taking and second.taking and f.app.pending == 2 and #f.deposits == 0)
+    f.allowLatePickup = true
+    for _, complete in ipairs(delayed) do complete() end
+    assert(not first.taking and not second.taking and #f.drops == 0 and f.app.pending == 0)
+    assert(f.serverItems[954] == 20 and f.app.stats.harvested == 20 and f.app.stats.stashed == 0)
+end)
+
+local function harvestTransferFixture()
+    local f = harvestFixture()
+    f.app.job, f.app.config.options.moveAfterHarvest = nil, true
+    f.app.config.points.farmDoor = {world = "FARM", x = 13, y = 8, standX = 10, standY = 8}
+    f.app.config.points.blockBox.standX, f.app.config.points.breakDoor.standX = 10, 10
+    f.worldBoxes = {FARM = {}, BREAK = {}}
+    f.doors = 0
+    f.world.displays.get = function(x) return f.worldBoxes[f.world.name][x] or {} end
+    f.world.enter = function(name)
+        assert(name == "FARM" or name == "BREAK")
+        f.world.name, f.avatar.active = name, true
+        f.avatar.x, f.avatar.y = 10.5, 9
+        return true
+    end
+    f.server = function(name, x, y, id, _, _, n)
+        if name == "GetInventory" then
+            return {slots = (f.serverItems[954] or 0) > 0 and {{954, f.serverItems[954]}} or {}, capacity = 54}
+        end
+        if name == "UseDoor" then
+            assert(f.app.stats.stashed > 0 and #f.drops == 0, "Transfer must wait for all harvest drops to be stored")
+            f.doors = f.doors + 1
+            return true, {enter = f.world.name == "FARM" and "BREAK" or "FARM"}
+        end
+        assert(name == "DisplayItem" and x == 12 and y == 8)
+        local boxes = f.worldBoxes[f.world.name]
+        local total = f.hooks.Core.storageCount(boxes[x], 954)
+        if id == nil then
+            boxes[x] = {}
+            f.serverItems[954] = (f.serverItems[954] or 0) + total
+            return true, {taken = {{954, total}}}
+        end
+        assert(id == 954 and n <= (f.serverItems[954] or 0))
+        f.serverItems[954] = f.serverItems[954] - n
+        boxes[x] = {{954, total + n}}
+        return true
+    end
+    installToggles(f)
+    return f
+end
+
+test("Harvest completion switches to Moving Drops and transports the stored harvest", function()
+    local f = harvestTransferFixture()
+    f.addDrop(1, 954, 23)
+    f.hooks.start("harvest")
+    assert(not f.app.lastError and f.app.job == nil and f.doors == 2)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12], 954) == 23)
+    assert(f.app.stats.harvested == 23 and f.app.stats.stashed == 23 and f.app.stats.moved == 23)
+    assert(not f.app.runToggles.harvest.Value and not f.app.runToggles.transfer.Value)
+    assert(f.app.runToggles.transfer.history[1] == true and not f.hooks.readPNBResume())
+    local record = f.files["ClarisGrowblox/resume.json"]
+    assert(f.app.resume == nil and (not record or not f.services.HttpService:JSONDecode(record).active))
+end)
+
+test("Automatic transfer never starts after an uncollected harvest drop fails", function()
+    local f = harvestTransferFixture()
+    harvestFloor(f)
+    f.addDrop(1, 954, 23, 4.5, 1.5)
+    f.accept = function() return 0 end
+    f.hooks.start("harvest")
+    assert(f.app.lastError and f.doors == 0 and f.app.job == nil and f.app.stats.stashed == 0)
+    assert(not f.app.runToggles.harvest.Value and not f.app.runToggles.transfer.Value)
+end)
+
+test("Stopping during the empty-harvest settling check cancels automatic transfer", function()
+    local f = harvestTransferFixture()
+    f.onWait = function() f.onWait = nil; f.app:stop() end
+    f.hooks.start("harvest")
+    assert(f.doors == 0 and not f.app.lastError and f.app.job == nil)
+    assert(not f.app.runToggles.harvest.Value and not f.app.runToggles.transfer.Value)
 end)
 
 return string.format("%d actual-script runtime tests passed (mock services/server)", passed)

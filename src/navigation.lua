@@ -135,4 +135,28 @@ function Navigation.plan(map, start, goal, options)
     return nil, "No walking/jumping route reaches the saved spot. Check door access and stepping platforms."
 end
 
+function Navigation.pickupGoal(map, state, drop)
+    local start = {x = math.floor(state.x), y = math.floor(state.y - 0.01)}
+    local centerX, centerY = math.floor(drop.x), math.floor(drop.y)
+    local candidates = {}
+    for y = centerY - 1, centerY + 1 do
+        for x = centerX - 1, centerX + 1 do
+            if x >= 0 and x < map.w and y >= 0 and y < map.h - 1
+                and math.abs(drop.x - (x + 0.5)) <= 1.25
+                and drop.y >= y - 1.5 and drop.y <= y + 1.25
+                and not map.solid(x, y) and not (map.danger and map.danger(x, y))
+                and not (map.danger and map.danger(x, y + 1))
+                and (map.solid(x, y + 1) or (map.platform and map.platform(x, y + 1))) then
+                local distance = math.abs(drop.x - (x + 0.5)) + math.abs(drop.y - (y + 0.5))
+                table.insert(candidates, {x = x, y = y, score = distance})
+            end
+        end
+    end
+    table.sort(candidates, function(a, b) return a.score < b.score end)
+    for _, goal in ipairs(candidates) do
+        if Navigation.plan(map, start, goal) then return {x = goal.x, y = goal.y} end
+    end
+    return nil, "No reachable floor or platform is close to this harvested drop."
+end
+
 return Navigation

@@ -3,7 +3,7 @@ local Core = {}
 Core.VERSION = 1
 Core.REPO = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/"
 Core.POINTS = { "pnb", "blockBox", "seedBox", "farmBox", "farmDoor", "breakDoor" }
-Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin" }
+Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest" }
 Core.LIMITS = {
     placeDelay = { 0.15, 2 }, punchDelay = { 0.22, 2 },
     collectDelay = { 0, 5 }, actionTimeout = { 5, 30 },
@@ -14,7 +14,8 @@ function Core.defaults()
     return {
         version = Core.VERSION, blockId = 0, points = {},
         options = { placeDelay = 0.2, punchDelay = 0.24, collectDelay = 0.1,
-            actionTimeout = 10, moveTimeout = 30, seedThreshold = 200, antiAFK = true, autoRejoin = true },
+            actionTimeout = 10, moveTimeout = 30, seedThreshold = 200, antiAFK = true, autoRejoin = true,
+            moveAfterHarvest = false },
         webhook = { url = "", enabled = false, intervalMinutes = 5, includeBoxes = true },
     }
 end
@@ -146,8 +147,10 @@ function Core.itemCount(rows, itemId)
 end
 
 function Core.checkSetup(config, mode, items)
+    assert(mode == "pnb" or mode == "transfer" or mode == "harvest", "Unknown farming task.")
     assert(Core.farmable(items[config.blockId]), "Choose a farmable block from your inventory.")
     local keys = mode == "pnb" and { "pnb", "blockBox", "seedBox" }
+        or mode == "harvest" and { "farmBox" }
         or { "farmBox", "farmDoor", "blockBox", "breakDoor" }
     for _, key in ipairs(keys) do
         assert(config.points[key], "Save this location first: " .. key)
@@ -161,7 +164,7 @@ function Core.checkSetup(config, mode, items)
             and p.blockBox.x == p.pnb.x + 2 and p.blockBox.y == p.pnb.y,
             "Layout must be: seed box, empty tile, player, empty tile, block box.")
         assert(p.pnb.x >= 2 and p.pnb.y >= 1, "PNB tile or storage layout is outside the world.")
-    else
+    elseif mode == "transfer" then
         assert(p.farmBox.world == p.farmDoor.world, "Farm storage and farm door must be in the same world.")
         assert(p.blockBox.world == p.breakDoor.world, "Block storage and return door must be in the same world.")
         assert(p.farmBox.world ~= p.blockBox.world, "Farm and breaking worlds must be different.")
