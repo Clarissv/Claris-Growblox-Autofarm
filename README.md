@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.2.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.3.
+
+Version 0.1.3 collects nearby loose gems, seeds, and returned blocks directly by drop UID while standing at the PNB spot. It waits for drop readiness, respects backpack room and pickup retry cooldowns, and reconciles inventory with the server. Place & Break and Moving Drops now have On/Off toggles that reflect the running task and turn Off on completion, failure, or stop.
 
 Version 0.1.2 fixes Place & Break stopping after one block while waiting for a `tileChanged` echo. Placement is confirmed by a server inventory delta while automatic pickups are paused. Breaking uses the normal client hit completion and a short correction-settling period. The script leaves the game's existing tile-change listener intact.
 
@@ -8,10 +10,10 @@ Version 0.1.1 fixes startup when Delta's `shared` table differs from the game's 
 
 ## Features
 
-- **Place & Break:** choose a block from your inventory, fill the five columns and two rows above your saved PNB position, break those blocks, and collect loose gems, seeds, and returned blocks. Refill from the right Display Box when the backpack runs out. Put seeds in the left Display Box at the configured count, which defaults to 200. Stop when both backpack and block storage are empty.
+- **Place & Break:** choose a block from your inventory, fill the five columns and two rows above your saved PNB position, break those blocks, and collect nearby loose gems, seeds, and returned blocks without walking underneath them. Refill from the right Display Box when the backpack runs out. Put seeds in the left Display Box at the configured count, which defaults to 200. Stop when both backpack and block storage are empty.
 - **Moving Drops:** take the selected blocks from a dedicated farm Display Box, use the linked door to the breaking world, deposit the trip's blocks in the PNB storage box, and return through the other linked door. Continue until stopped or the farm box is empty. Harvesting remains manual.
 - **Named configurations:** Save, Load, New, and Delete multiple profiles containing the chosen block, every saved world and tile, the position from which to access each box/door, and timing settings.
-- **Control and recovery:** one task runs at a time. Stop restores the game controls. Server confirmations, request timeouts, and transfer checkpoints prevent an unsuccessful action from silently advancing the loop.
+- **Control and recovery:** one task runs at a time. Turn its toggle Off to restore the game controls. The toggle also turns Off when the task completes or encounters an error. Server confirmations, request timeouts, and transfer checkpoints prevent an unsuccessful action from silently advancing the loop.
 
 This implementation was traced from the supplied client dump. Offline compilation and mock tests verify the code paths described by their test output. It still needs an in-game test for Delta's debug APIs, actual server acceptance, navigation, and door transfers. Use **Settings → Copy diagnostics** to report the first failure.
 
@@ -42,6 +44,15 @@ The URL becomes usable after the upload. The loader downloads a specific release
 
 For a browser upload instead, open the empty repository's **uploading an existing file** link and drag this folder's contents into the upload area. Preserve `src`, `tests`, `vendor`, and `releases` as folders. Commit directly to `main`.
 
+For an existing checkout with the GitHub remote configured, upload this rebuilt update with:
+
+```powershell
+Set-Location -LiteralPath 'F:\VSCode\Luau\Claris Growblox Autofarm\logic'
+git add .
+git commit -m "Add direct drop collection and running toggles"
+git push
+```
+
 ## Set up Place & Break
 
 1. Select the block on the **Place & Break** tab. Press **Refresh inventory choices** after obtaining a new block.
@@ -49,9 +60,9 @@ For a browser upload instead, open the empty repository's **uploading an existin
 3. Stand still on the middle platform and press **Save PNB spot and matching boxes**. This saves the two boxes automatically when the screenshot's layout matches. If needed, stand beside each box and save it separately.
 4. Keep each Display Box dedicated to its corresponding item. Mixed boxes are rejected because Growblox's withdrawal action can take every item type in a box.
 5. On **Configurations**, enter a name such as `Sugar Cane - Farm 1`, then press **Save profile / Save as**.
-6. Press **Start Place & Break**. Press **Stop** to end it. The UI stays accessible through the floating Claris button.
+6. Turn **Place & Break** On. Turn it Off to end the task. The UI stays accessible through the floating Claris button.
 
-The script walks to saved positions through the game's normal 2D controls. Keep paths reachable and avoid moving the player manually during a task. If a position times out, check the path and save it again.
+The script walks to saved positions and storage through the game's normal 2D controls. Loose-drop collection itself keeps the player at the PNB spot and only targets drops around its grid. Full block stacks leave excess blocks for later cycles; reaching the seed threshold deposits seeds and frees room. Repeated server pickup refusal stops the task with a diagnostic. Keep paths reachable and avoid moving the player manually during a task. If a position times out, check the path and save it again.
 
 ## Set up Moving Drops
 
@@ -60,7 +71,7 @@ The script walks to saved positions through the game's normal 2D controls. Keep 
 3. Stand beside that box and press **Save Farm storage** on **Moving Drops**. Stand beside the linked door and save **Farm door to breaking world**.
 4. In the breaking world, save the destination Display Box using **Save block storage** on **Place & Break**. Stand beside the return door and save **Breaking door to farm world**.
 5. Verify the doors link to the intended worlds and arrival doors. Save the named profile after recording both worlds.
-6. Return to the farm world and press **Start Moving Drops**.
+6. Return to the farm world and turn **Moving Drops** On. Turn it Off to stop.
 
 The script records only the newly withdrawn blocks as each trip's cargo. Blocks already in the backpack are retained. If the backpack has no room, free up space before starting.
 
@@ -85,6 +96,8 @@ npm run test:lua
 ```
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
+
+Version 0.1.3 passes 49 offline checks: 12 configuration/layout/storage tests, 35 tests executing the generated runtime against mock services and a mock server, and two release checks. These include stationary pickup, partial/full stacks, seed deposits, duplicate packet updates, cooldowns, pending pickup cancellation, and toggle state on completion, errors, and resume. Live server acceptance remains an in-game check.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 

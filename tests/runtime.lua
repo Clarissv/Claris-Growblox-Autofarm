@@ -42,7 +42,10 @@ local function fixture()
     }
     game = { GetService = function(_, name) assert(services[name], name); return services[name] end }
     task = {
-        spawn = function(fn, ...) return fn(...) end,
+        spawn = function(fn, ...)
+            if context.spawn then return context.spawn(fn, ...) end
+            return fn(...)
+        end,
         defer = function(fn) queue[#queue + 1] = fn end,
         wait = function(seconds)
             ticks = ticks + (seconds or 0.03)
@@ -105,6 +108,15 @@ local function fixture()
         displays = { get = function(x) return boxes[x] end },
         displayTake = function() context.displays = context.displays + 1 end,
         takeDrop = function(_, n) context.pickups = context.pickups + 1; return n end,
+        dropTaken = function(uid, remaining)
+            for index, drop in pairs(drops) do
+                if drop.uid == uid then
+                    drop.n = remaining
+                    if remaining == 0 then table.remove(drops, index) end
+                    return
+                end
+            end
+        end,
         call = function(...) assert(context.server, "No mock server configured"); return context.server(...) end,
     }
     local controls = { dir = function() return -1 end, jumping = function() return true end }
@@ -117,7 +129,7 @@ local function fixture()
             [18] = { kind = "tool" }, [1422] = { display = true }, [12] = { door = true },
         },
     }
-    app.token, app.job = 1, "transfer"
+    app.token, app.job, app.jobToken = 1, "transfer", 1
     context.app, context.world, context.inventory = app, world, inventory
     context.controls, context.avatar, context.drops, context.boxes = controls, avatar, drops, boxes
     return context
@@ -305,6 +317,253 @@ test("One full ten-block PNB batch places and breaks without tile echoes", funct
     for _, cell in ipairs(f.hooks.Core.grid(f.app.config.points.pnb)) do
         assert(f.world.fg[cell.y][cell.x] == 0 and hits[cell.y * f.world.w + cell.x] == 2)
     end
+end)
+
+local function pickupFixture()
+    local f = fixture()
+    f.avatar.x = 10.5
+    f.serverItems, f.serverGems, f.requests = {}, 100, {}
+    function f.addDrop(uid, id, n, x, y)
+        local drop = {uid = uid, id = id, n = n, x = x or 10.5, y = y or 6.5}
+        f.drops[#f.drops + 1] = drop
+        return drop
+    end
+    f.world.takeDrop = function(uid, want)
+        assert(f.allowLatePickup or (f.app.controls and f.app.controls.pausePickup),
+            "Direct collection must quiesce native pickups")
+        assert(f.allowLatePickup or (f.controls.dir() == 0 and not f.controls.jumping()),
+            "Floating drops must not require walking")
+        local drop
+        for _, candidate in pairs(f.drops) do if candidate.uid == uid then drop = candidate end end
+        assert(drop and drop.taking)
+        f.requests[#f.requests + 1] = {uid = uid, want = want, time = os.clock()}
+        local got = want
+        if f.accept then got = f.accept(drop, want) end
+        if type(got) == "number" and got > 0 and got <= want then
+            if drop.id == 112 then f.serverGems = f.serverGems + got
+            else f.serverItems[drop.id] = (f.serverItems[drop.id] or 0) + got end
+            if f.packetTaken then f.world.dropTaken(uid, drop.n - got) end
+        end
+        return got
+    end
+    f.server = function(name)
+        if name == "GetGems" then return f.serverGems end
+        assert(name == "GetInventory")
+        local slots = {}
+        for id, n in pairs(f.serverItems) do if n > 0 then slots[#slots + 1] = {id, n} end end
+        return {slots = slots, capacity = 54}
+    end
+    function f.collect()
+        f.hooks.takeControls()
+        return f.hooks.collectDrops(f.app.config.points.pnb, 954, 955, 1)
+    end
+    return f
+end
+
+test("Floating PNB drops are claimed by UID without walking or double credit", function()
+    local f = pickupFixture()
+    f.addDrop(101, 954, 12, 8.2, 6.1)
+    f.addDrop(102, 955, 8, 12.8, 7)
+    f.addDrop(103, 112, 25)
+    local hudBalance
+    f.app.runtime.gemHud = {setGems = function(n) hudBalance = n end}
+    f.collect()
+    assert(#f.requests == 3 and #f.drops == 0)
+    assert(f.inventory:count(954) == 12 and f.inventory:count(955) == 8)
+    assert(f.inventory:count(112) == 0 and f.app.stats.gems == 25 and hudBalance == 125)
+    assert(f.avatar.x == 10.5 and f.avatar.y == 9 and not f.app.controls.pausePickup)
+end)
+
+test("Direct collection excludes boxes, pending, distant, and unrelated drops", function()
+    local f = pickupFixture()
+    f.addDrop(101, 954, 12).display = {x = 12, y = 8}
+    f.addDrop(102, 955, 8).pending = true
+    f.addDrop(103, 954, 1, 20, 6.5)
+    f.addDrop(104, 954, 1, 10.5, 3)
+    f.addDrop(105, 18, 1)
+    f.addDrop(106, 954, 1, 10.5, 12)
+    f.collect()
+    assert(#f.requests == 0 and #f.drops == 6)
+end)
+
+test("Partial pickups use remaining counts and recheck backpack room", function()
+    local f = pickupFixture()
+    f.serverItems[954] = 190
+    local drop = f.addDrop(101, 954, 15)
+    f.accept = function(_, want) return math.min(want, 4) end
+    f.collect()
+    assert(#f.requests == 3 and f.requests[1].want == 10 and f.requests[3].want == 2)
+    assert(f.inventory:count(954) == 200 and drop.n == 5 and not drop.taking)
+end)
+
+test("A packet count update before the pickup response is applied only once", function()
+    local f = pickupFixture()
+    f.serverItems[954], f.packetTaken = 198, true
+    local drop = f.addDrop(101, 954, 5)
+    f.collect()
+    assert(#f.requests == 1 and f.inventory:count(954) == 200 and drop.n == 3)
+end)
+
+test("Seed threshold deposits free room for the remaining loose seeds", function()
+    local f = pickupFixture()
+    f.serverItems[955] = 195
+    f.addDrop(101, 955, 15)
+    f.app.config.points.seedBox.standX = 10
+    local snapshot, deposited = f.server, 0
+    f.server = function(name, x, y, id, _, _, n)
+        if name ~= "DisplayItem" then return snapshot(name) end
+        assert(x == 8 and y == 8 and id == 955 and n == 200)
+        f.serverItems[955], deposited = f.serverItems[955] - n, deposited + n
+        return true, {}
+    end
+    f.collect()
+    assert(deposited == 200 and f.inventory:count(955) == 10 and #f.drops == 0)
+    assert(f.requests[1].want == 5 and f.requests[2].want == 10)
+end)
+
+test("Rejected pickups retry after the native cooldown and retain the drop", function()
+    local f = pickupFixture()
+    local drop = f.addDrop(101, 954, 5)
+    f.accept = function() return 0 end
+    rejects(f.collect, "server refused nearby drop pickups")
+    assert(#f.requests == 3 and drop.n == 5 and not drop.taking)
+    for index = 2, 3 do assert(f.requests[index].time - f.requests[index - 1].time >= 1) end
+    assert(not f.app.controls.pausePickup and f.app.pending == 0)
+end)
+
+test("A native ask timeout can recover on a later pickup attempt", function()
+    local f = pickupFixture()
+    f.addDrop(101, 954, 5)
+    f.accept = function(_, want) if #f.requests == 1 then return nil end; return want end
+    f.collect()
+    assert(#f.requests == 2 and f.inventory:count(954) == 5 and #f.drops == 0)
+    assert(f.requests[2].time - f.requests[1].time >= 1)
+end)
+
+test("Drop readiness and initial native refusal are respected", function()
+    local f = pickupFixture()
+    local drop = f.addDrop(101, 954, 5)
+    drop.readyAt, drop.refused = 2, 1.5
+    f.collect()
+    assert(#f.requests == 1 and f.requests[1].time >= 2.5)
+end)
+
+test("Another drop removed by a previous request is not claimed from a stale list", function()
+    local f = pickupFixture()
+    f.addDrop(101, 954, 5)
+    local other = f.addDrop(102, 955, 5)
+    f.accept = function(drop, want)
+        if drop.uid == 101 then f.world.dropTaken(other.uid, 0) end
+        return want
+    end
+    f.collect()
+    assert(#f.requests == 1 and #f.drops == 0)
+end)
+
+test("Stop during a pending pickup holds its UID until the accepted result settles", function()
+    local f = pickupFixture()
+    local drop = f.addDrop(101, 954, 5)
+    local spawns, delayed = 0, nil
+    f.spawn = function(fn)
+        spawns = spawns + 1
+        if spawns == 2 then delayed = fn; return end
+        return fn()
+    end
+    f.onWait = function()
+        if delayed then f.onWait = nil; f.app:stop() end
+    end
+    rejects(f.collect, "Stopped")
+    assert(delayed and drop.taking and f.app.pending == 1 and f.app.controls == nil)
+    -- The request has already started, so its late response still updates the drop.
+    f.allowLatePickup = true
+    delayed()
+    assert(not drop.taking and f.app.pending == 0 and #f.drops == 0)
+    assert(f.serverItems[954] == 5)
+end)
+
+test("Pickup hook failures clear taking and restore native pickup suppression", function()
+    local f = pickupFixture()
+    local drop = f.addDrop(101, 954, 5)
+    f.world.dropTaken = function() error("Drop render failure") end
+    rejects(f.collect, "Drop render failure")
+    assert(not drop.taking and f.app.pending == 0 and not f.app.controls.pausePickup)
+end)
+
+local function installToggles(f)
+    for _, mode in ipairs({"pnb", "transfer"}) do
+        local control = {Value = false, history = {}}
+        function control:Set(value, callback, instant)
+            assert(callback == false and instant == false)
+            self.Value = value
+            self.history[#self.history + 1] = value
+        end
+        f.app.runToggles[mode] = control
+    end
+    f.hooks.syncRunToggles()
+end
+
+test("Running toggles reflect the active task and turn Off immediately on Stop", function()
+    local f = fixture()
+    installToggles(f)
+    assert(f.app.runToggles.transfer.Value and not f.app.runToggles.pnb.Value)
+    f.app.pending = 1
+    assert(f.hooks.setRunningEnabled("transfer", false))
+    assert(not f.app.runToggles.transfer.Value and not f.app.runToggles.pnb.Value)
+    assert(f.app.status:find("pending server request", 1, true))
+end)
+
+test("A second task cannot turn its toggle On while the other task runs", function()
+    local f = fixture()
+    installToggles(f)
+    f.app.runToggles.pnb.Value = true -- User interaction.
+    local ok = f.hooks.setRunningEnabled("pnb", true)
+    assert(not ok and not f.app.runToggles.pnb.Value and f.app.runToggles.transfer.Value)
+end)
+
+test("Invalid setup rolls an attempted On toggle back Off", function()
+    local f = fixture()
+    f.app.job, f.app.jobToken = nil, nil
+    f.app.config.points.pnb = nil
+    installToggles(f)
+    f.app.runToggles.pnb.Value = true
+    local ok = f.hooks.setRunningEnabled("pnb", true)
+    assert(not ok and f.app.job == nil and not f.app.runToggles.pnb.Value)
+end)
+
+test("Worker completion switches an On toggle Off and releases controls", function()
+    local f = fixture()
+    f.app.job, f.app.jobToken, f.avatar.x = nil, nil, 10.5
+    f.boxes[12], f.app.config.points.blockBox.standX = {}, 10
+    f.server = function(name) assert(name == "GetInventory"); return {slots = {}, capacity = 54} end
+    installToggles(f)
+    f.spawn = function(fn) f.spawn = nil; task.defer(fn) end
+    assert(f.hooks.setRunningEnabled("pnb", true))
+    assert(f.app.runToggles.pnb.Value and f.app.job == "pnb")
+    task.wait(0.01)
+    assert(f.app.job == nil and f.app.controls == nil and not f.app.runToggles.pnb.Value)
+    assert(not f.app.lastError and f.app.status:find("Finished", 1, true))
+end)
+
+test("Worker setup failure switches the toggle Off and records its error", function()
+    local f = fixture()
+    f.app.job, f.app.jobToken, f.app.runtime.controls = nil, nil, nil
+    installToggles(f)
+    assert(f.hooks.setRunningEnabled("pnb", true))
+    assert(f.app.job == nil and f.app.controls == nil and not f.app.runToggles.pnb.Value)
+    assert(f.app.lastError and f.app.status:find("Paused", 1, true))
+end)
+
+test("A resumed transfer and unload also synchronize running toggles", function()
+    local f = fixture()
+    f.app.job, f.app.jobToken = nil, nil
+    installToggles(f)
+    f.spawn = function(fn) f.spawn = nil; task.defer(fn) end
+    f.hooks.start("transfer", {phase = "deliver", cargo = 50})
+    assert(f.app.runToggles.transfer.Value and not f.app.runToggles.pnb.Value)
+    f.app:destroy()
+    assert(not f.app.runToggles.transfer.Value and not f.app.alive)
+    task.wait(0.01)
+    assert(f.app.controls == nil and f.app.job == nil)
 end)
 
 test("Stop during placement releases pickup suppression and prevents another placement", function()

@@ -1,6 +1,6 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
-local VERSION = "0.1.2"
+local VERSION = "0.1.3"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -60,11 +60,22 @@ local App = {
     config = Core.defaults(), profile = "Default", status = "Connecting to Growblox...",
     logs = {}, controls = nil, runtime = nil, resume = nil,
     connectionError = nil, discoveryReport = {},
-    stats = { broken = 0, trips = 0, moved = 0 },
+    stats = { broken = 0, trips = 0, moved = 0, gems = 0 }, runToggles = {},
 }
 env.ClarisGrowbloxApp = App
 local WindUI
 local ui = {}
+
+local function syncRunToggles()
+    App.syncingRunToggles = true
+    for mode, control in pairs(App.runToggles) do
+        local enabled = App.alive and App.job == mode and App.jobToken == App.token
+        if control.Value ~= enabled then
+            pcall(function() control:Set(enabled, false, false) end)
+        end
+    end
+    App.syncingRunToggles = false
+end
 
 local function setStatus(text)
     App.status = text
@@ -247,6 +258,17 @@ local function discover()
     assert(#worlds == 1, "Could not identify one active Growblox world table (found " .. #worlds .. ").")
     local world = worlds[1]
     local issues = {}
+    local gemHud
+    for _, candidate in pairs(objects) do
+        if type(candidate) == "table" and type(rawget(candidate, "setGems")) == "function"
+            and type(rawget(candidate, "addGems")) == "function"
+            and type(rawget(candidate, "setWorld")) == "function"
+            and type(rawget(candidate, "isTyping")) == "function" then
+            if not gemHud or (type(rawget(candidate, "onMessage")) == "function" and owns(candidate.onMessage, world)) then
+                gemHud = candidate
+            end
+        end
+    end
     local body
     for _, candidate in ipairs(physics) do
         if owns(candidate.state, world) then
@@ -324,7 +346,7 @@ local function discover()
     local packets = require(registry.j1PKXTgzz)
     local runtime = { world = world, body = body, controls = controls[1], inventory = inventory,
         items = items, packets = packets, handlers = handlers, issues = issues,
-        readInventoryView = readInventoryView, ready = #issues == 0 }
+        readInventoryView = readInventoryView, ready = #issues == 0, gemHud = gemHud }
     table.insert(App.discoveryReport, "Inventory: " .. (readInventoryView and "readable snapshot" or "live backpack"))
     table.insert(App.discoveryReport, "Farming hooks: " .. (#issues == 0 and "ready" or table.concat(issues, " ")))
     -- The game already owns tileChanged handling. Own actions are optimistic and
@@ -665,27 +687,117 @@ local function breakTile(point, id, token)
 end
 
 local function collectDrops(anchor, blockId, seedId, token)
-    -- The normal client handles pickup, gems, local inventory, and drop removal.
-    -- Walk underneath relevant loose drops instead of racing its takeDrop coroutine.
     pause(App.config.options.collectDelay, token)
-    local r = worldCheck(anchor.world, token)
-    local columns = {}
-    for _, drop in pairs(r.world.dropList()) do
-        if not drop.display and not drop.pending and (drop.n or 0) > 0
-            and (drop.id == 112 or drop.id == blockId or drop.id == seedId)
-            and math.abs(drop.x - (anchor.x + 0.5)) <= 2.8
-            and drop.y >= anchor.y - 2.5 and drop.y <= anchor.y + 1.25 then
-            columns[math.clamp(math.floor(drop.x), anchor.x - 2, anchor.x + 2)] = true
+    return withoutPickups(function()
+        local r = worldCheck(anchor.world, token)
+        refreshInventory(token) -- Finish preexisting normal pickup callbacks first.
+        local take = App.controls and App.controls.takeDrop or r.world.takeDrop
+        assert(type(take) == "function" and type(r.world.dropTaken) == "function",
+            "The loose-drop pickup hooks are unavailable. Copy diagnostics from Settings.")
+        local attempts, retryAt, deadline = {}, {}, os.clock() + App.config.options.actionTimeout
+        local gemsTaken = 0
+        local function nearby(drop)
+            return not drop.display and not drop.pending and type(drop.uid) == "number"
+                and type(drop.n) == "number" and drop.n > 0 and not drop.taking
+                and (drop.id == 112 or drop.id == blockId or drop.id == seedId)
+                and type(drop.x) == "number" and type(drop.y) == "number"
+                and math.abs(drop.x - (anchor.x + 0.5)) <= 2.8
+                and drop.y >= anchor.y - 2.5 and drop.y <= anchor.y + 1.25
         end
-    end
-    for x = anchor.x - 2, anchor.x + 2 do
-        if columns[x] then
-            moveTo(x, anchor.y, anchor.world, token)
-            pause(App.config.options.collectDelay, token)
+        local function updateGems()
+            if gemsTaken > 0 and r.gemHud then
+                local gems = bounded(r.world.call, App.config.options.actionTimeout, token, "GetGems")
+                assert(type(gems) == "number" and gems >= 0, "Invalid gem balance from the server.")
+                r.gemHud.setGems(gems)
+            end
         end
-    end
-    moveToPoint(anchor, token)
-    refreshInventory(token)
+        while true do
+            worldCheck(anchor.world, token)
+            if count(seedId) >= App.config.options.seedThreshold then
+                setStatus("Putting collected seeds into the left storage box...")
+                deposit(App.config.points.seedBox, seedId, count(seedId), token)
+                moveToPoint(anchor, token)
+                deadline = os.clock() + App.config.options.actionTimeout
+            end
+            local targets, waiting, refused = {}, false, false
+            for _, drop in pairs(r.world.dropList()) do
+                if nearby(drop) then
+                    local room = drop.id == 112 and 65535 or r.inventory:room(drop.id)
+                    if room > 0 then
+                        -- Normal pickup uses a one-second refusal cooldown. Read
+                        -- its initial timestamp once: suppressed native attempts
+                        -- must not keep postponing our own requests.
+                        retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
+                        if (attempts[drop.uid] or 0) >= 3 then
+                            refused = true
+                        elseif math.max(drop.readyAt or 0, retryAt[drop.uid]) > os.clock() then
+                            waiting = true
+                        else
+                            table.insert(targets, drop)
+                        end
+                    end
+                end
+            end
+            if #targets == 0 then
+                updateGems()
+                assert(not refused, "The server refused nearby drop pickups. The drops remain available; copy diagnostics.")
+                if not waiting then return end
+                assert(os.clock() < deadline, "Nearby drops did not become ready for pickup.")
+                pause(0.15, token)
+            else
+                setStatus("Collecting nearby gems, seeds, and blocks without moving...")
+                for _, drop in ipairs(targets) do
+                    worldCheck(anchor.world, token)
+                    -- A previous request can remove another listed drop or fill
+                    -- its stack. Only claim a drop still in the current world.
+                    local present = false
+                    for _, current in pairs(r.world.dropList()) do
+                        if current == drop then present = true; break end
+                    end
+                    local room = drop.id == 112 and 65535 or r.inventory:room(drop.id)
+                    local want = math.floor(math.min(drop.n, room, 65535))
+                    if want > 0 and present and nearby(drop) then
+                        local before, grid = drop.n, r.world.fg
+                        local uid, dropId = drop.uid, drop.id
+                        attempts[uid] = (attempts[uid] or 0) + 1
+                        drop.taking = true
+                        -- Apply drop removal inside the owned request. If Stop occurs
+                        -- during a pending request, the accepted result still settles
+                        -- once, and the normal picker cannot race the same UID.
+                        local got = bounded(function()
+                            local ok, result = pcall(function()
+                                local amount = take(uid, want)
+                                if amount == nil then amount = 0 end -- Native ask timeout.
+                                assert(type(amount) == "number" and amount >= 0 and amount <= want
+                                    and amount == math.floor(amount), "Invalid pickup response from the server.")
+                                if amount > 0 and r.world.name == anchor.world and r.world.fg == grid then
+                                    local remaining = math.min(drop.n, math.max(0, before - amount))
+                                    r.world.dropTaken(uid, remaining)
+                                    if dropId == 112 then App.stats.gems = App.stats.gems + amount end
+                                end
+                                return amount
+                            end)
+                            drop.taking = false
+                            assert(ok, tostring(result))
+                            return result
+                        end, App.config.options.actionTimeout, token)
+                        if got > 0 then
+                            if dropId == 112 then gemsTaken = gemsTaken + got end
+                            attempts[uid] = 0
+                            deadline = os.clock() + App.config.options.actionTimeout
+                            refreshInventory(token)
+                        else
+                            retryAt[uid] = os.clock() + 1
+                            drop.refused = os.clock()
+                        end
+                    end
+                end
+                updateGems()
+                gemsTaken = 0
+                pause(0.15, token)
+            end
+        end
+    end)
 end
 
 local function runPNB(token)
@@ -797,6 +909,7 @@ end
 function App:stop()
     self.token = self.token + 1
     self.teleporting = false
+    syncRunToggles()
     releaseControls()
     clearResume()
     setStatus(self.pending > 0 and "Stopped; waiting for a pending server request." or "Stopped.")
@@ -816,14 +929,19 @@ local function start(mode, saved)
     App.token = App.token + 1
     local token = App.token
     App.job = mode
+    App.jobToken = token
     App.lastError = nil
-    takeControls()
+    syncRunToggles()
     task.spawn(function()
         local ok, message = xpcall(function()
+            checkpoint(token)
+            takeControls()
             if mode == "pnb" then runPNB(token) else runTransfer(token, saved) end
         end, function(err) return tostring(err) end)
         releaseControls()
         App.job = nil
+        App.jobToken = nil
+        syncRunToggles()
         if not ok and token == App.token and App.alive then
             App.lastError = message
             setStatus("Paused: " .. message)
@@ -833,13 +951,29 @@ local function start(mode, saved)
     end)
 end
 
+local function setRunningEnabled(mode, enabled)
+    if App.syncingRunToggles then return true end
+    local ok, message = pcall(function()
+        if enabled then
+            if App.job == mode and App.jobToken == App.token then return end
+            start(mode)
+        elseif App.job == mode and App.jobToken == App.token then
+            App:stop()
+        end
+    end)
+    syncRunToggles()
+    if not ok then notify(tostring(message)) end
+    return ok, message
+end
+
 if env.ClarisGrowbloxTest then
     return { App = App, Core = Core, start = start, checkpoint = checkpoint,
         runTransfer = runTransfer, runPNB = runPNB, refreshInventory = refreshInventory,
         withdraw = withdraw, deposit = deposit, releaseControls = releaseControls,
         takeControls = takeControls, collectDrops = collectDrops, enterDoor = enterDoor,
         settleTile = settleTile, placeTile = placeTile, breakTile = breakTile, resolveRegistry = resolveRegistry,
-        discover = discover, connectGame = connectGame, runtime = runtime }
+        discover = discover, connectGame = connectGame, runtime = runtime,
+        syncRunToggles = syncRunToggles, setRunningEnabled = setRunningEnabled }
 end
 
 local function loadWindUI()
@@ -891,12 +1025,6 @@ local function uiAction(fn)
             App.configuring = false
             if not ok then setStatus(message); notify(message) end
         end)
-    end
-end
-local function startAction(mode)
-    return function()
-        local ok, message = pcall(start, mode)
-        if not ok then notify(tostring(message)) end
     end
 end
 local function captureNearby(key, kind)
@@ -997,8 +1125,9 @@ end
 pnbTab:Button({ Title = "Save PNB spot and matching boxes", Desc = "Stand on the middle platform, then press this button.", Callback = uiAction(capturePNB) })
 pnbTab:Button({ Title = "Save block storage", Desc = "Stand beside the right Display Box.", Callback = uiAction(function() captureNearby("blockBox", "box") end) })
 pnbTab:Button({ Title = "Save seed storage", Desc = "Stand beside the left Display Box.", Callback = uiAction(function() captureNearby("seedBox", "box") end) })
-pnbTab:Button({ Title = "Start Place & Break", Callback = startAction("pnb") })
-pnbTab:Button({ Title = "Stop", Callback = function() App:stop() end })
+App.runToggles.pnb = pnbTab:Toggle({ Title = "Place & Break", Value = false,
+    Desc = "On runs the farm. Off stops it. Turns off automatically when the task ends.",
+    Callback = function(enabled) setRunningEnabled("pnb", enabled) end })
 
 ui.transferStatus = transferTab:Paragraph({ Title = "Status", Desc = App.status })
 transferTab:Paragraph({ Title = "Moving Drops setup", Desc = "Harvest manually and put the selected blocks in the farm Display Box. Save both boxes and both linked doors. Start in the farm world." })
@@ -1009,8 +1138,9 @@ for _, key in ipairs({ "farmBox", "farmDoor", "breakDoor" }) do
         Callback = uiAction(function() captureNearby(pointKey, pointKey == "farmBox" and "box" or "door") end) })
 end
 transferTab:Paragraph({ Title = "Destination storage", Desc = "Use Save block storage on the Place & Break tab for the breaking world's destination box." })
-transferTab:Button({ Title = "Start Moving Drops", Callback = startAction("transfer") })
-transferTab:Button({ Title = "Stop", Callback = function() App:stop() end })
+App.runToggles.transfer = transferTab:Toggle({ Title = "Moving Drops", Value = false,
+    Desc = "On moves the blocks. Off stops it. Turns off automatically when the task ends.",
+    Callback = function(enabled) setRunningEnabled("transfer", enabled) end })
 
 local selectedProfile, profileNameInput, profileDropdown = nil, nil, nil
 local settingsControls = {}
@@ -1185,8 +1315,10 @@ task.spawn(function()
 end)
 task.spawn(function()
     while App.alive do
+        syncRunToggles()
         local suffix = "\nProfile: " .. App.profile .. "  |  Blocks broken: " .. App.stats.broken
             .. "  |  Trips: " .. App.stats.trips .. "  |  Blocks moved: " .. App.stats.moved
+            .. "  |  Gems collected: " .. App.stats.gems
         pcall(function()
             paragraphSet(ui.status, "Status", App.status .. suffix)
             paragraphSet(ui.transferStatus, "Status", App.status .. suffix)
