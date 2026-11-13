@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.12"
+local VERSION = "0.1.13"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -713,7 +713,8 @@ local function moveTo(x, y, worldName, token)
     tileAt(x, y)
     local hold = takeControls()
     local targetX, targetY = x + 0.5, y + 1
-    local timeout = App.job == "plant" and math.max(90, App.config.options.moveTimeout) or App.config.options.moveTimeout
+    local farmNavigation = App.job == "plant" or App.job == "harvest"
+    local timeout = farmNavigation and math.max(90, App.config.options.moveTimeout) or App.config.options.moveTimeout
     local deadline, banned, replans = os.clock() + timeout, {}, 0
     -- Waypoints and the final destination must agree. A looser waypoint
     -- tolerance can otherwise accept an empty route without ever moving.
@@ -727,7 +728,7 @@ local function moveTo(x, y, worldName, token)
         if reached(state, targetX, targetY) then hold.direction, hold.jump = 0, false; return end
         assert(os.clock() < deadline, "Could not reach the saved position. Check stepping platforms and door access.")
         hold.direction, hold.jump = 0, false
-        local landingDeadline = math.min(deadline, os.clock() + 2.5)
+        local landingDeadline = math.min(deadline, os.clock() + 2.5 + r.world.h / 24)
         while not state.grounded do
             assert(os.clock() < landingDeadline, "The avatar did not land on a reachable floor or platform.")
             pause(0.03, token)
@@ -736,8 +737,8 @@ local function moveTo(x, y, worldName, token)
         end
         local start = {x = math.floor(state.x), y = math.floor(state.y - 0.01)}
         local route, message = Navigation.plan(navigationMap(r), start, {x = x, y = y}, {
-            banned = banned, fullWorld = App.job == "plant",
-            maxNodes = App.job == "plant" and math.min(12000, r.world.w * r.world.h) or 1600,
+            banned = banned, fullWorld = farmNavigation,
+            maxNodes = farmNavigation and math.min(12000, r.world.w * r.world.h) or 1600,
             step = function() pause(0, token); worldCheck(worldName, token) end,
         })
         assert(route, message)
@@ -1265,7 +1266,9 @@ local function runHarvest(token)
                     else pause(0.05, token) end
                 elseif rangeLimited and nextDrop and (not near(state, nextDrop) or needsApproach[nextDrop.uid]) then
                     setStatus("Walking to harvested drop uid " .. nextDrop.uid .. "...")
-                    local goal, message = Navigation.pickupGoal(navigationMap(r), state, nextDrop)
+                    local goal, message = Navigation.pickupGoal(navigationMap(r), state, nextDrop, {
+                        step = function() pause(0, token); worldCheck(box.world, token) end,
+                    })
                     assert(goal, tostring(message) .. " Drop uid " .. nextDrop.uid .. " at " .. nextDrop.x .. ", " .. nextDrop.y)
                     moveTo(goal.x, goal.y, box.world, token)
                     needsApproach[nextDrop.uid], approached[nextDrop.uid] = nil, true

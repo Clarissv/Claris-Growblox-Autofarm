@@ -53,7 +53,10 @@ function Navigation.plan(map, start, goal, options)
     local function travel(from, to, jumping)
         local x, feet, vx, vy = from.x + 0.5, from.y + 1, 0, jumping and -jumpSpeed or 0
         local targetX, dt = to.x + 0.5, 0.025
-        for step = 1, 100 do
+        -- A farm's open columns can extend all the way to its bottom floor.
+        -- Keep the simulation long enough to reach that landing surface.
+        local steps = math.ceil((2.5 + math.max(0, to.y - from.y) / 24) / dt)
+        for step = 1, steps do
             local direction = Navigation.steer(targetX - x, vx)
             local desired = direction * speed
             local acceleration = direction == 0 and 17 or 22
@@ -122,7 +125,7 @@ function Navigation.plan(map, start, goal, options)
                 end
             end
             for _, dx in ipairs({-1, 1}) do
-                for dy = 0, 8 do
+                for dy = 0, maxY - node.y do
                     if standable(node.x + dx, node.y + dy) then offer(node.x + dx, node.y + dy, false); break end
                     if solid(node.x + dx, node.y + dy) then break end
                 end
@@ -137,11 +140,13 @@ function Navigation.plan(map, start, goal, options)
     return nil, "No walking/jumping route reaches the saved spot. Check door access and stepping platforms."
 end
 
-function Navigation.pickupGoal(map, state, drop)
+function Navigation.pickupGoal(map, state, drop, options)
+    options = options or {}
+    local search = {fullWorld = true, maxNodes = math.min(12000, map.w * map.h), step = options.step}
     local start = {x = math.floor(state.x), y = math.floor(state.y - 0.01)}
     local centerX, centerY = math.floor(drop.x), math.floor(drop.y)
     local candidates = {}
-    for y = centerY - 1, centerY + 1 do
+    for y = centerY - 1, centerY + 2 do
         for x = centerX - 1, centerX + 1 do
             if x >= 0 and x < map.w and y >= 0 and y < map.h - 1
                 and math.abs(drop.x - (x + 0.5)) <= 1.25
@@ -155,10 +160,14 @@ function Navigation.pickupGoal(map, state, drop)
         end
     end
     table.sort(candidates, function(a, b) return a.score < b.score end)
+    local reason
     for _, goal in ipairs(candidates) do
-        if Navigation.plan(map, start, goal) then return {x = goal.x, y = goal.y} end
+        local route, message = Navigation.plan(map, start, goal, search)
+        if route then return {x = goal.x, y = goal.y} end
+        reason = message
     end
     return nil, "No reachable floor or platform is close to this harvested drop."
+        .. (#candidates == 0 and " No safe supported pickup tile is in range." or " " .. tostring(reason))
 end
 
 return Navigation

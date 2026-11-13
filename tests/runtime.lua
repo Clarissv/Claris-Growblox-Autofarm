@@ -1867,6 +1867,88 @@ test("Harvest collection walks to distant drops when the server requires proximi
     assert(math.abs(f.avatar.x - 10.5) < 0.16 and f.controls.dir() == 0)
 end)
 
+test("Harvest collection uses distant edge platforms and returns to storage from a lower row", function()
+    local f = harvestFixture()
+    f.world.w, f.world.h, f.world.fg = 82, 15, {}
+    f.app.runtime.items[102] = {platform = true}
+    for y = 0, 14 do
+        f.world.fg[y] = {}
+        for x = 0, 81 do f.world.fg[y][x] = (y == 12 or y == 9 and x <= 77) and 2 or 0 end
+    end
+    f.world.fg[10][78], f.world.fg[9][79], f.world.fg[8][12] = 102, 102, 1422
+    f.app.runtime.body.solidAt = function(x, y)
+        if x < 0 or x >= 82 or y >= 15 then return true end
+        return f.world.fg[y] and f.world.fg[y][x] == 2 or false
+    end
+    f.avatar.x, f.avatar.y = 10.5, 8.999
+    local visited = attachPhysics(f, f.hooks.navigationMap(f.app.runtime))
+    f.addDrop(1799, 954, 20, 4.5, 11.5)
+    f.accept = function(drop, want)
+        if math.abs(drop.x - f.avatar.x) > 0.6 or math.abs(drop.y - (f.avatar.y - 0.5)) > 0.6 then return 0 end
+        return want
+    end
+    f.harvest()
+    assert(visited["4:11"] and #f.drops == 0 and f.app.stats.stashed == 20)
+    assert(f.hooks.Core.storageCount(f.boxes[12], 954) == 20)
+    assert(math.abs(f.avatar.x - 10.5) < 0.16 and math.abs(f.avatar.y - 9) < 0.22)
+    assert(not f.controls.jumping() and f.controls.dir() == 0)
+end)
+
+test("Dirt farm navigation descends through an open column beyond eight tiles", function()
+    local f = fixture()
+    local map = {w = 30, h = 16,
+        solid = function(x, y)
+            return y == 15 or y >= 3 and y <= 13 and y % 2 == 1
+                and x >= 2 and x <= 27 and x ~= 10 and x ~= 11 and x ~= 12 and x ~= 20 and x ~= 21 and x ~= 22
+        end,
+        platform = function(x, y)
+            return y >= 3 and y <= 13 and y % 2 == 1
+                and (x == 1 or x == 28 or x == 10 or x == 12 or x == 20 or x == 22)
+        end}
+    local route, message = f.hooks.Navigation.plan(map, {x = 27, y = 2}, {x = 2, y = 12},
+        {fullWorld = true, maxNodes = 4000})
+    assert(route, message)
+    local descended = false
+    for _, step in ipairs(route) do if not step.jump and step.y - step.fromY > 8 then descended = true end end
+    assert(descended, "The route must descend a shaft rather than require jumping through dirt")
+end)
+
+test("Harvest pickup can stand two tiles below a floating block within native vertical reach", function()
+    local f = fixture()
+    local map = {w = 8, h = 16, solid = function(_, y) return y == 11 end,
+        platform = function() return false end}
+    local goal, message = f.hooks.Navigation.pickupGoal(map, {x = 4.5, y = 10.999}, {x = 4.5, y = 8.5})
+    assert(goal, message)
+    assert(goal.x == 4 and goal.y == 10)
+end)
+
+test("Harvest pickup route search yields and honors cancellation during a distant detour", function()
+    local f = fixture()
+    local map = {w = 82, h = 15, solid = function(x, y) return y == 12 or y == 9 and x <= 77 end,
+        platform = function(x, y) return x == 78 and y == 10 or x == 79 and y == 9 end}
+    local yields = 0
+    rejects(function()
+        f.hooks.Navigation.pickupGoal(map, {x = 10.5, y = 8.999}, {x = 4.5, y = 11.5}, {
+            step = function() yields = yields + 1; error("Stopped during pickup route search") end,
+        })
+    end, "Stopped during pickup route search")
+    assert(yields == 1)
+end)
+
+test("The movement follower lands after a tall fall through a world-edge column", function()
+    local f = fixture()
+    f.world.w, f.world.h = 8, 64
+    local map = {w = 8, h = 64,
+        solid = function(x, y) return x < 0 or x >= 8 or y >= 63 or y == 3 and x <= 5 end,
+        platform = function() return false end}
+    f.app.runtime.body.solidAt = map.solid
+    f.avatar.x, f.avatar.y, f.app.job = 5.5, 2.999, "harvest"
+    local visited = attachPhysics(f, map)
+    f.hooks.moveTo(6, 62, "BREAK", 1)
+    assert(visited["6:62"] and f.avatar.grounded and math.abs(f.avatar.y - 63) < 0.22)
+    assert(f.controls.dir() == 0 and not f.controls.jumping())
+end)
+
 test("An unreachable harvest drop produces a location diagnostic instead of completing", function()
     local f = harvestFixture()
     harvestFloor(f)

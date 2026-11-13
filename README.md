@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.12.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.13.
+
+Version 0.1.13 fixes Harvest Drops navigation stopping at storage when a drop requires a route through distant edge platforms. Both pickup approach and the movement follower now search the full world, with up to 90 seconds per harvest movement. The planner can descend open columns longer than eight tiles and allows enough simulation time to land after a tall fall. Planting uses the same descent fix. Supported pickup positions cover the native vertical reach, and failed approaches distinguish missing support from a missing route.
 
 Version 0.1.12 reduces startup work after a reported freeze before the UI appeared. Discovery yields between batches and caches function metadata for the duration of attachment. The seed dropdown shows up to 40 relevant or matching choices, builds them once per refresh, and includes a separate search field for other seeds. Diagnostics include the current startup stage, discovery yields, and rendered seed count.
 
@@ -105,7 +107,7 @@ Existing profiles and saved locations still work. Collect any drops remaining in
 
 Collection reads the current world's loose-drop list and targets only the selected block. It respects drop readiness, retry cooldowns, and backpack capacity. There is no identified server action to move loose drops directly into a Display Box, so collection and verified deposit are separate actions. If distant UID pickups are accepted, the script can stay at the box. If refused, it uses the collision-aware walking/jumping planner to get near the drops and returns to storage as needed. Live pickup reach determines which path is used.
 
-Keep the saved box and farm platforms reachable. A failed deposit retains the backpack blocks; an unreachable or repeatedly refused drop stops with its UID and coordinates. Automatic transport begins only after successful collection, including a short empty-list settling check. A world change or respawn interrupts harvest collection; PNB's automatic rejoin remains specific to Place & Break. Pending accepted pickups still settle after Stop, so wait for requests before restarting collection. Tree cutting, seed collection, and gem collection remain manual for this task.
+Pickup routes and returns to storage search the full world, including distant edge platforms and long open columns. Each harvest movement has up to 90 seconds. Route search yields and checks for Stop or a world change. Keep the saved box and farm platforms reachable. A failed deposit retains the backpack blocks; an unreachable or repeatedly refused drop stops with its UID and coordinates. Automatic transport begins only after successful collection, including a short empty-list settling check. A world change or respawn interrupts harvest collection; PNB's automatic rejoin remains specific to Place & Break. Pending accepted pickups still settle after Stop, so wait for requests before restarting collection. Tree cutting, seed collection, and gem collection remain manual for this task.
 
 ## Set up Moving Drops
 
@@ -175,7 +177,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.12 passes 172 offline checks: 27 configuration/layout/storage tests, 143 tests executing the generated runtime against mock services and a mock server, and two release checks. The new UI fixture executes startup beyond the usual test hooks, loads a 10,000-seed synthetic catalog, verifies bounded rendering with one rebuild, searches the catalog, changes the selected seed, and checks that another input is preserved. Large discovery fixtures cover 10,000 unrelated tables and 5,000 unrelated functions, frame yields, one upvalue read per function, and cancellation on unload. Existing attachment, planting, PNB, harvest, webhook, navigation, recovery, anti-AFK, and storage checks remain. These mocks do not establish live Delta frame times, planting reach, route geometry, world permissions, teleport queue behavior, or Discord delivery.
+Version 0.1.13 passes 177 offline checks: 27 configuration/layout/storage tests, 148 tests executing the generated runtime against mock services and a mock server, and two release checks. Navigation regressions cover harvest collection and storage return via an 82-column farm's distant edge, descent through a gap longer than eight tiles, a 60-tile fall with the actual movement follower, pickup from a supported tile two rows below the drop, and cancellation during pickup route search. Existing startup, attachment, planting, PNB, harvest, webhook, recovery, anti-AFK, and storage checks remain. These mocks do not establish live Delta frame times, planting reach, route geometry, world permissions, teleport queue behavior, or Discord delivery.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 
