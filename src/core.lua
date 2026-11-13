@@ -5,14 +5,14 @@ Core.REPO = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm
 Core.POINTS = { "pnb", "blockBox", "seedBox", "farmBox", "farmDoor", "breakDoor" }
 Core.LIMITS = {
     placeDelay = { 0.15, 2 }, punchDelay = { 0.22, 2 },
-    collectDelay = { 0.3, 5 }, actionTimeout = { 5, 30 },
+    collectDelay = { 0, 5 }, actionTimeout = { 5, 30 },
     moveTimeout = { 5, 90 }, seedThreshold = { 1, 200 },
 }
 
 function Core.defaults()
     return {
         version = Core.VERSION, blockId = 0, points = {},
-        options = { placeDelay = 0.2, punchDelay = 0.24, collectDelay = 0.75,
+        options = { placeDelay = 0.2, punchDelay = 0.24, collectDelay = 0.1,
             actionTimeout = 10, moveTimeout = 30, seedThreshold = 200 },
     }
 end
@@ -67,12 +67,8 @@ end
 
 function Core.grid(anchor)
     local result = {}
-    -- Screenshot: five columns, two rows directly above the standing tile.
-    for row = 1, 2 do
-        for dx = -2, 2 do
-            table.insert(result, { x = anchor.x + dx, y = anchor.y - row })
-        end
-    end
+    -- One block directly above the player keeps new drops within pickup reach.
+    table.insert(result, { x = anchor.x, y = anchor.y - 1 })
     return result
 end
 
@@ -117,7 +113,7 @@ function Core.checkSetup(config, mode, items)
         assert(p.seedBox.x == p.pnb.x - 2 and p.seedBox.y == p.pnb.y
             and p.blockBox.x == p.pnb.x + 2 and p.blockBox.y == p.pnb.y,
             "Layout must be: seed box, empty tile, player, empty tile, block box.")
-        assert(p.pnb.x >= 2 and p.pnb.y >= 2, "PNB grid is outside the world.")
+        assert(p.pnb.x >= 2 and p.pnb.y >= 1, "PNB tile or storage layout is outside the world.")
     else
         assert(p.farmBox.world == p.farmDoor.world, "Farm storage and farm door must be in the same world.")
         assert(p.blockBox.world == p.breakDoor.world, "Block storage and return door must be in the same world.")

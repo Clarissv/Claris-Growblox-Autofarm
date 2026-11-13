@@ -287,13 +287,13 @@ test("A correction during the settling period stops the action", function()
     rejects(function() f.hooks.settleTile(10, 7, 954, 0.2, "BREAK", 1) end, "changed while the action settled")
 end)
 
-test("One full ten-block PNB batch places and breaks without tile echoes", function()
+test("Ten single-block PNB cycles use only the tile directly above the player", function()
     local f = fixture()
     f.inventory:add(954, 10)
     f.avatar.x = 10.5
     f.app.config.points.blockBox.standX = 10
     f.boxes[12] = {}
-    local serverCount, placements, hits = 10, 0, {}
+    local serverCount, placements, hits, totalHits = 10, 0, {}, 0
     f.server = function(name)
         assert(name == "GetInventory", "Empty storage should not cause a withdrawal request")
         return {slots = {{954, serverCount}}, capacity = 54}
@@ -302,18 +302,21 @@ test("One full ten-block PNB batch places and breaks without tile echoes", funct
         canPlace = function() return true end,
         setTile = function(layer, x, y, id)
             assert(layer == "fg" and f.world.fg[y][x] == 0)
+            assert(x == 10 and y == 7, "PNB must not create distant outer-column drops")
             f.world.fg[y][x] = id
+            hits[y * f.world.w + x] = 0
             serverCount, placements = serverCount - 1, placements + 1
         end,
         hit = function(x, y)
             local key = y * f.world.w + x
             hits[key] = (hits[key] or 0) + 1
+            totalHits = totalHits + 1
             if hits[key] == 2 then f.world.fg[y][x] = 0 end
         end,
     }
     f.hooks.takeControls()
     f.hooks.runPNB(1)
-    assert(placements == 10 and f.app.stats.broken == 10 and serverCount == 0)
+    assert(placements == 10 and f.app.stats.broken == 10 and serverCount == 0 and totalHits == 20)
     for _, cell in ipairs(f.hooks.Core.grid(f.app.config.points.pnb)) do
         assert(f.world.fg[cell.y][cell.x] == 0 and hits[cell.y * f.world.w + cell.x] == 2)
     end
@@ -362,8 +365,8 @@ end
 
 test("Floating PNB drops are claimed by UID without walking or double credit", function()
     local f = pickupFixture()
-    f.addDrop(101, 954, 12, 8.2, 6.1)
-    f.addDrop(102, 955, 8, 12.8, 7)
+    f.addDrop(101, 954, 12, 9.3, 7.1)
+    f.addDrop(102, 955, 8, 11.7, 7)
     f.addDrop(103, 112, 25)
     local hudBalance
     f.app.runtime.gemHud = {setGems = function(n) hudBalance = n end}
@@ -382,8 +385,113 @@ test("Direct collection excludes boxes, pending, distant, and unrelated drops", 
     f.addDrop(104, 954, 1, 10.5, 3)
     f.addDrop(105, 18, 1)
     f.addDrop(106, 954, 1, 10.5, 12)
+    f.addDrop(107, 112, 1, 8.5, 7.5) -- Old outer columns are outside the new farming area.
+    f.addDrop(108, 112, 1, 12.5, 7.5)
     f.collect()
-    assert(#f.requests == 0 and #f.drops == 6)
+    assert(#f.requests == 0 and #f.drops == 8)
+end)
+
+test("Multiple drop requests start together and share one inventory reconciliation", function()
+    local f = pickupFixture()
+    f.addDrop(101, 954, 12)
+    f.addDrop(102, 955, 8)
+    f.addDrop(103, 112, 25)
+    local snapshot, reads, balances, peak = f.server, 0, 0, 0
+    f.server = function(name)
+        if name == "GetInventory" then reads = reads + 1 end
+        if name == "GetGems" then balances = balances + 1 end
+        return snapshot(name)
+    end
+    f.app.runtime.gemHud = {setGems = function() end}
+    f.spawn = function(fn)
+        peak = math.max(peak, f.app.pending)
+        task.defer(fn) -- Simulate pending RPC replies rather than immediate responses.
+    end
+    f.collect()
+    assert(peak == 3, "All three pickup requests must be in flight together")
+    assert(reads == 2 and balances == 1, "Only pre-batch and post-batch snapshots are needed")
+    assert(#f.requests == 3 and f.requests[1].time == f.requests[3].time)
+    assert(f.inventory:count(954) == 12 and f.inventory:count(955) == 8 and f.app.pending == 0)
+end)
+
+test("Single-block PNB claims returned blocks and other drops before placing again", function()
+    local f = pickupFixture()
+    f.serverItems[954] = 1
+    f.app.config.points.blockBox.standX, f.boxes[12] = 10, {}
+    local placements, hits, uid = 0, 0, 100
+    f.app.runtime.handlers = {
+        canPlace = function() return true end,
+        setTile = function(_, x, y, id)
+            assert(x == 10 and y == 7 and #f.drops == 0,
+                "Each break must be collected before the next placement")
+            placements, hits = placements + 1, 0
+            assert(placements <= 3)
+            f.serverItems[954] = f.serverItems[954] - 1
+            f.world.fg[y][x] = id
+        end,
+        hit = function(x, y)
+            hits = hits + 1
+            if hits < 2 then return end
+            f.world.fg[y][x] = 0
+            uid = uid + 3
+            f.addDrop(uid, 955, 2, 10.5, 7.5)
+            f.addDrop(uid + 1, 112, 3, 10.5, 7.5)
+            if placements < 3 then f.addDrop(uid + 2, 954, 1, 10.5, 7.5) end
+        end,
+    }
+    f.hooks.takeControls()
+    f.hooks.runPNB(1)
+    assert(placements == 3 and f.app.stats.broken == 3 and #f.drops == 0)
+    assert(f.inventory:count(954) == 0 and f.inventory:count(955) == 6 and f.app.stats.gems == 9)
+end)
+
+test("Punching waits only for the unelapsed placement grace period", function()
+    local f = fixture()
+    f.avatar.x = 10.5
+    local serverCount, placedAt, hitAt = 1, nil, nil
+    f.server = function() return {slots = {{954, serverCount}}, capacity = 54} end
+    f.app.runtime.handlers = {
+        canPlace = function() return true end,
+        setTile = function(_, x, y, id)
+            placedAt, serverCount = os.clock(), 0
+            f.world.fg[y][x] = id
+        end,
+        hit = function(x, y)
+            hitAt = os.clock()
+            f.world.fg[y][x] = 0
+        end,
+    }
+    f.hooks.takeControls()
+    f.hooks.placeTile({x = 10, y = 7}, 954, 1)
+    f.hooks.breakTile({x = 10, y = 7}, 954, 1)
+    assert(hitAt - placedAt >= 0.32 and hitAt - placedAt < 0.38,
+        "The completed placement delay must count toward the initial hit grace period")
+end)
+
+test("Concurrent item pickups reserve room across every drop of the same item", function()
+    local f = pickupFixture()
+    f.serverItems[954] = 190
+    f.addDrop(101, 954, 8)
+    f.addDrop(102, 954, 8)
+    f.addDrop(103, 954, 8)
+    f.spawn = function(fn) task.defer(fn) end
+    f.collect()
+    assert(#f.requests == 2 and f.requests[1].want == 8 and f.requests[2].want == 2)
+    assert(f.inventory:count(954) == 200 and #f.drops == 2)
+    assert(f.drops[1].n == 6 and f.drops[2].n == 8)
+end)
+
+test("Pickup bursts cap the number of in-flight requests", function()
+    local f = pickupFixture()
+    for uid = 1, 11 do f.addDrop(uid, 112, 1) end
+    local peak = 0
+    f.spawn = function(fn)
+        peak = math.max(peak, f.app.pending)
+        task.defer(fn)
+    end
+    f.collect()
+    assert(peak == 8 and #f.requests == 11 and #f.drops == 0 and f.app.stats.gems == 11)
+    assert(f.requests[1].time == f.requests[8].time and f.requests[9].time > f.requests[8].time)
 end)
 
 test("Partial pickups use remaining counts and recheck backpack room", function()
@@ -460,25 +568,28 @@ test("Another drop removed by a previous request is not claimed from a stale lis
     assert(#f.requests == 1 and #f.drops == 0)
 end)
 
-test("Stop during a pending pickup holds its UID until the accepted result settles", function()
+test("Stop during a pickup batch holds every UID until its accepted result settles", function()
     local f = pickupFixture()
     local drop = f.addDrop(101, 954, 5)
-    local spawns, delayed = 0, nil
+    local seed = f.addDrop(102, 955, 2)
+    local gem = f.addDrop(103, 112, 3)
+    local spawns, delayed = 0, {}
     f.spawn = function(fn)
         spawns = spawns + 1
-        if spawns == 2 then delayed = fn; return end
+        if spawns > 1 then delayed[#delayed + 1] = fn; return end
         return fn()
     end
     f.onWait = function()
-        if delayed then f.onWait = nil; f.app:stop() end
+        if #delayed > 0 then f.onWait = nil; f.app:stop() end
     end
     rejects(f.collect, "Stopped")
-    assert(delayed and drop.taking and f.app.pending == 1 and f.app.controls == nil)
+    assert(#delayed == 3 and drop.taking and seed.taking and gem.taking)
+    assert(f.app.pending == 3 and f.app.controls == nil)
     -- The request has already started, so its late response still updates the drop.
     f.allowLatePickup = true
-    delayed()
-    assert(not drop.taking and f.app.pending == 0 and #f.drops == 0)
-    assert(f.serverItems[954] == 5)
+    for _, fn in ipairs(delayed) do fn() end
+    assert(not drop.taking and not seed.taking and not gem.taking and f.app.pending == 0 and #f.drops == 0)
+    assert(f.serverItems[954] == 5 and f.serverItems[955] == 2 and f.app.stats.gems == 3)
 end)
 
 test("Pickup hook failures clear taking and restore native pickup suppression", function()

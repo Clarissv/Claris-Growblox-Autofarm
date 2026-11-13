@@ -39,24 +39,18 @@ end
 
 test("A saved sugar cane setup survives validation without sharing mutable data", function()
     local config = setup()
+    config.options.collectDelay = 0.75 -- Existing profiles retain their saved extra delay.
     local saved = Core.validate(config)
+    assert(saved.options.collectDelay == 0.75 and Core.defaults().options.collectDelay == 0.1)
     assert(Core.checkSetup(saved, "pnb", items))
     assert(Core.checkSetup(saved, "transfer", items))
     saved.points.pnb.x = 11
     saved.options.punchDelay = 1
     assert(config.points.pnb.x == 10 and config.options.punchDelay == 0.24)
 end)
-test("The screenshot grid contains ten unique tiles above the player", function()
+test("PNB selects exactly one tile directly above the player", function()
     local grid = Core.grid(setup().points.pnb)
-    local seen = {}
-    assert(#grid == 10)
-    for _, tile in ipairs(grid) do
-        assert(tile.x >= 8 and tile.x <= 12 and (tile.y == 6 or tile.y == 7))
-        local key = tile.x .. ":" .. tile.y
-        assert(not seen[key])
-        seen[key] = true
-    end
-    assert(seen["8:6"] and seen["12:7"] and not seen["10:8"])
+    assert(#grid == 1 and grid[1].x == 10 and grid[1].y == 7)
 end)
 test("Sugar cane and shared-seed variants select the proper seed", function()
     assert(Core.seedId(items, 954) == 955)

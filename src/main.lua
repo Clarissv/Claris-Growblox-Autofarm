@@ -1,6 +1,6 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
-local VERSION = "0.1.3"
+local VERSION = "0.1.4"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -105,25 +105,31 @@ local function pause(seconds, token)
         task.wait(math.min(0.05, math.max(0, deadline - os.clock())))
     until os.clock() >= deadline
 end
-local function bounded(fn, seconds, token, ...)
+local function beginRequest(fn, ...)
     local arguments = table.pack(...)
-    local done, result = false, nil
+    local request = { done = false }
     App.pending = App.pending + 1
     task.spawn(function()
-        result = table.pack(pcall(fn, table.unpack(arguments, 1, arguments.n)))
+        request.result = table.pack(pcall(fn, table.unpack(arguments, 1, arguments.n)))
         App.pending = App.pending - 1
-        done = true
+        request.done = true
     end)
-    local deadline = os.clock() + seconds
-    while not done do
+    return request
+end
+local function awaitRequest(request, deadline, token)
+    while not request.done do
         if token then checkpoint(token) end
         assert(App.alive, "Script unloaded.")
         assert(os.clock() < deadline, "Request timed out. Wait for it to finish before restarting.")
         task.wait(0.05)
     end
     if token then checkpoint(token) end
-    assert(result[1], tostring(result[2]))
-    return table.unpack(result, 2, result.n)
+    assert(request.result[1], tostring(request.result[2]))
+    return table.unpack(request.result, 2, request.result.n)
+end
+local function bounded(fn, seconds, token, ...)
+    local deadline = os.clock() + seconds
+    return awaitRequest(beginRequest(fn, ...), deadline, token)
 end
 
 local function upvalues(fn)
@@ -647,6 +653,7 @@ local function placeTile(point, id, token)
             "Cannot place at " .. point.x .. ", " .. point.y .. ". Check reach, access, and empty tiles.")
         assert(before > 0, "No blocks are left in your backpack.")
         r.handlers.setTile("fg", point.x, point.y, id, false, (position().facing or 1) < 0)
+        App.lastPlacement = {x = point.x, y = point.y, world = name, grid = r.world.fg, at = os.clock()}
         r.inventory:remove(id, 1)
         pause(App.config.options.placeDelay, token)
         local deadline = os.clock() + App.config.options.actionTimeout
@@ -667,7 +674,12 @@ local function breakTile(point, id, token)
     local r = worldCheck(name, token)
     assert(tileAt(point.x, point.y) == id, "The target tile changed. Stopping before punching another block.")
     local deadline = os.clock() + App.config.options.actionTimeout + (r.items[id].hits or 1) * App.config.options.punchDelay
-    pause(0.32, token) -- Growblox ignores hits during its initial placement grace period.
+    local placed = App.lastPlacement
+    if placed and placed.world == name and placed.grid == r.world.fg
+        and placed.x == point.x and placed.y == point.y then
+        local remaining = 0.32 - (os.clock() - placed.at)
+        if remaining > 0 then pause(remaining, token) end
+    end
     while tileAt(point.x, point.y) == id do
         worldCheck(name, token)
         assert(os.clock() < deadline, "Block did not break. Check permissions and your punching range.")
@@ -701,14 +713,15 @@ local function collectDrops(anchor, blockId, seedId, token)
                 and type(drop.n) == "number" and drop.n > 0 and not drop.taking
                 and (drop.id == 112 or drop.id == blockId or drop.id == seedId)
                 and type(drop.x) == "number" and type(drop.y) == "number"
-                and math.abs(drop.x - (anchor.x + 0.5)) <= 2.8
-                and drop.y >= anchor.y - 2.5 and drop.y <= anchor.y + 1.25
+                and math.abs(drop.x - (anchor.x + 0.5)) <= 1.25
+                and drop.y >= anchor.y - 1.5 and drop.y <= anchor.y + 1.25
         end
         local function updateGems()
             if gemsTaken > 0 and r.gemHud then
                 local gems = bounded(r.world.call, App.config.options.actionTimeout, token, "GetGems")
                 assert(type(gems) == "number" and gems >= 0, "Invalid gem balance from the server.")
                 r.gemHud.setGems(gems)
+                gemsTaken = 0
             end
         end
         while true do
@@ -740,31 +753,46 @@ local function collectDrops(anchor, blockId, seedId, token)
             end
             if #targets == 0 then
                 updateGems()
-                assert(not refused, "The server refused nearby drop pickups. The drops remain available; copy diagnostics.")
+                if refused then
+                    local details = {}
+                    for _, drop in pairs(r.world.dropList()) do
+                        if nearby(drop) and (attempts[drop.uid] or 0) >= 3 then
+                            table.insert(details, string.format("uid %d, item %d, count %d at %.2f, %.2f",
+                                drop.uid, drop.id, drop.n, drop.x, drop.y))
+                        end
+                    end
+                    error("The server refused nearby drop pickups: " .. table.concat(details, "; ")
+                        .. ". Check reach and access; copy diagnostics.")
+                end
                 if not waiting then return end
                 assert(os.clock() < deadline, "Nearby drops did not become ready for pickup.")
-                pause(0.15, token)
+                pause(0.05, token)
             else
-                setStatus("Collecting nearby gems, seeds, and blocks without moving...")
+                setStatus("Collecting nearby drops together...")
+                local jobs, reserved = {}, {}
+                local requestDeadline = os.clock() + App.config.options.actionTimeout
                 for _, drop in ipairs(targets) do
+                    if #jobs >= 8 then break end
                     worldCheck(anchor.world, token)
-                    -- A previous request can remove another listed drop or fill
-                    -- its stack. Only claim a drop still in the current world.
+                    -- Reserve stack room before launching concurrent requests.
+                    -- A previous response can also remove another listed drop.
                     local present = false
                     for _, current in pairs(r.world.dropList()) do
                         if current == drop then present = true; break end
                     end
-                    local room = drop.id == 112 and 65535 or r.inventory:room(drop.id)
+                    local room = drop.id == 112 and 65535
+                        or math.max(0, r.inventory:room(drop.id) - (reserved[drop.id] or 0))
                     local want = math.floor(math.min(drop.n, room, 65535))
                     if want > 0 and present and nearby(drop) then
                         local before, grid = drop.n, r.world.fg
                         local uid, dropId = drop.uid, drop.id
+                        if dropId ~= 112 then reserved[dropId] = (reserved[dropId] or 0) + want end
                         attempts[uid] = (attempts[uid] or 0) + 1
                         drop.taking = true
                         -- Apply drop removal inside the owned request. If Stop occurs
                         -- during a pending request, the accepted result still settles
                         -- once, and the normal picker cannot race the same UID.
-                        local got = bounded(function()
+                        local request = beginRequest(function()
                             local ok, result = pcall(function()
                                 local amount = take(uid, want)
                                 if amount == nil then amount = 0 end -- Native ask timeout.
@@ -774,27 +802,34 @@ local function collectDrops(anchor, blockId, seedId, token)
                                     local remaining = math.min(drop.n, math.max(0, before - amount))
                                     r.world.dropTaken(uid, remaining)
                                     if dropId == 112 then App.stats.gems = App.stats.gems + amount end
+                                elseif amount == 0 then
+                                    retryAt[uid] = os.clock() + 1
+                                    drop.refused = os.clock()
                                 end
                                 return amount
                             end)
                             drop.taking = false
                             assert(ok, tostring(result))
                             return result
-                        end, App.config.options.actionTimeout, token)
-                        if got > 0 then
-                            if dropId == 112 then gemsTaken = gemsTaken + got end
-                            attempts[uid] = 0
-                            deadline = os.clock() + App.config.options.actionTimeout
-                            refreshInventory(token)
-                        else
-                            retryAt[uid] = os.clock() + 1
-                            drop.refused = os.clock()
-                        end
+                        end)
+                        table.insert(jobs, {request = request, uid = uid, id = dropId})
                     end
                 end
-                updateGems()
-                gemsTaken = 0
-                pause(0.15, token)
+                local accepted = false
+                for _, job in ipairs(jobs) do
+                    local got = awaitRequest(job.request, requestDeadline, token)
+                    if got > 0 then
+                        accepted = true
+                        if job.id == 112 then gemsTaken = gemsTaken + got end
+                        attempts[job.uid] = 0
+                    end
+                end
+                if accepted then
+                    -- Reconcile once after the whole batch settles, so pickups
+                    -- do not wait for a second RPC between each drop.
+                    refreshInventory(token)
+                    deadline = os.clock() + App.config.options.actionTimeout
+                end
             end
         end
     end)
@@ -810,7 +845,7 @@ local function runPNB(token)
     local grid = Core.grid(p.pnb)
     for _, point in ipairs(grid) do
         local id = tileAt(point.x, point.y)
-        assert(id == 0 or id == blockId, "Clear the 2 x 5 grid above the PNB spot before starting.")
+        assert(id == 0 or id == blockId, "Clear the tile directly above the PNB spot before starting.")
     end
     storageCount(p.blockBox, blockId)
     storageCount(p.seedBox, seedId)
@@ -835,7 +870,7 @@ local function runPNB(token)
             end
             moveToPoint(p.pnb, token)
         end
-        setStatus("Placing " .. runtime().items[blockId].name .. " in the 2 x 5 grid...")
+        setStatus("Placing one " .. runtime().items[blockId].name .. " directly above the player...")
         for _, point in ipairs(grid) do
             local id = tileAt(point.x, point.y)
             assert(id == 0 or id == blockId, "A different block appeared in the PNB grid.")
@@ -1118,7 +1153,7 @@ blockDropdown = pnbTab:Dropdown({
     end,
 })
 pnbTab:Button({ Title = "Refresh inventory choices", Callback = uiAction(refreshBlocks) })
-pnbTab:Paragraph({ Title = "PNB layout", Desc = "Seed box - Empty - Player - Empty - Block box\nFive columns and two rows of empty foreground tiles directly above the player." })
+pnbTab:Paragraph({ Title = "PNB layout", Desc = "Seed box - Empty - Player - Empty - Block box\nPlace one block directly above the player, break it, collect nearby drops, and repeat." })
 for _, key in ipairs({ "pnb", "blockBox", "seedBox" }) do
     ui.points[key] = pnbTab:Paragraph({ Title = ui.pointTitles[key], Desc = "Not saved" })
 end

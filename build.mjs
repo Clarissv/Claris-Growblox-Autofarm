@@ -6,10 +6,12 @@ import { fileURLToPath } from 'node:url';
 const root = dirname(fileURLToPath(import.meta.url));
 const version = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
 const windRoot = join(root, '..', 'WindUI');
-const core = readFileSync(join(root, 'src/core.lua'), 'utf8');
-const main = readFileSync(join(root, 'src/main.lua'), 'utf8');
-const wind = readFileSync(join(windRoot, 'dist/main.lua'), 'utf8');
-const license = readFileSync(join(windRoot, 'LICENSE'), 'utf8');
+// Git's Windows checkout settings must not change a release revision or digest.
+const readText = path => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+const core = readText(join(root, 'src/core.lua'));
+const main = readText(join(root, 'src/main.lua'));
+const wind = readText(join(windRoot, 'dist/main.lua'));
+const license = readText(join(windRoot, 'LICENSE'));
 const bundle = main.replace('__CLARIS_CORE__', `(function()\n${core}\nend)()`);
 if (bundle.includes('__CLARIS_CORE__')) throw new Error('Unresolved bundle marker');
 const digest = data => createHash('sha256').update(data).digest('hex');

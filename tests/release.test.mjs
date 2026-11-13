@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(readFileSync(join(root, 'release.json'), 'utf8'));
-const read = name => readFileSync(join(root, name), 'utf8');
+const read = name => readFileSync(join(root, name), 'utf8').replace(/\r\n/g, '\n');
 const hash = text => createHash('sha256').update(text).digest('hex');
 
 test('loader selects a complete immutable release for the agreed GitHub repository', () => {
