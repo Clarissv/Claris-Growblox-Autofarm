@@ -255,6 +255,66 @@ test("The actual movement controller climbs from the lock via the side entrance"
     assert(f.controls.dir() == 0 and not f.controls.jumping() and f.avatar.grounded)
 end)
 
+test("An avatar already on the destination tile finishes its small centering move", function()
+    for _, offset in ipairs({-0.20, 0.20}) do
+        local f = fixture()
+        local map = raisedFarm(f)
+        f.avatar.x, f.avatar.y = 10.5 + offset, 8.999
+        attachPhysics(f, map)
+        local originalPlan, plans = f.hooks.Navigation.plan, 0
+        f.hooks.Navigation.plan = function(...)
+            plans = plans + 1
+            assert(plans <= 4, "Centering on the current tile must yield to movement, not repeatedly plan an empty route")
+            return originalPlan(...)
+        end
+        local began = os.clock()
+        f.hooks.moveTo(10, 8, "BREAK", 1)
+        assert(math.abs(f.avatar.x - 10.5) < 0.16 and f.avatar.grounded)
+        assert(os.clock() > began and os.clock() - began < 0.75)
+        assert(f.controls.dir() == 0 and not f.controls.jumping())
+    end
+end)
+
+test("PNB refills from the box, returns to the dirt, and continues placing and breaking", function()
+    local f = fixture()
+    local map = raisedFarm(f)
+    f.world.fg[8][8], f.world.fg[8][12] = 1422, 1422
+    f.avatar.x, f.avatar.y, f.app.job = 10.5, 8.999, "pnb"
+    f.app.config.points.blockBox.standX = 11
+    f.boxes[12] = {{954, 1}}
+    attachPhysics(f, map)
+    local originalPlan, plans = f.hooks.Navigation.plan, 0
+    f.hooks.Navigation.plan = function(...)
+        plans = plans + 1
+        assert(plans <= 12, "A refill must not spin while the avatar is already on a saved standing tile")
+        return originalPlan(...)
+    end
+    local serverCount, withdrawals, placements, hits = 0, 0, 0, 0
+    f.server = function(name, x, y)
+        if name == "GetInventory" then return {slots = serverCount > 0 and {{954, serverCount}} or {}, capacity = 54} end
+        assert(name == "DisplayItem" and x == 12 and y == 8)
+        assert(withdrawals == 0)
+        serverCount, withdrawals, f.boxes[12] = 1, withdrawals + 1, {}
+        return true, {taken = {{954, 1}}}
+    end
+    f.app.runtime.handlers = {
+        canPlace = function() return true end,
+        setTile = function(_, x, y, id)
+            assert(withdrawals == 1 and serverCount == 1 and x == 10 and y == 7)
+            assert(math.abs(f.avatar.x - 10.5) < 0.16)
+            f.world.fg[y][x], serverCount, placements = id, 0, placements + 1
+        end,
+        hit = function(x, y)
+            hits = hits + 1
+            if hits == 2 then f.world.fg[y][x] = 0 end
+        end,
+    }
+    f.hooks.takeControls()
+    f.hooks.runPNB(1)
+    assert(withdrawals == 1 and placements == 1 and f.app.stats.broken == 1 and serverCount == 0)
+    assert(f.app.status:find("Finished", 1, true))
+end)
+
 test("Stopping while following a route restores controls and prevents later jumps", function()
     local f = fixture()
     raisedFarm(f)

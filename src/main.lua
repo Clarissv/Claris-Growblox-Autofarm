@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.5"
+local VERSION = "0.1.6"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -512,8 +512,10 @@ local function moveTo(x, y, worldName, token)
     local hold = takeControls()
     local targetX, targetY = x + 0.5, y + 1
     local deadline, banned, replans = os.clock() + App.config.options.moveTimeout, {}, 0
-    local function reached(state, tx, ty, tolerance)
-        return state.grounded and math.abs(state.x - tx) < (tolerance or 0.16)
+    -- Waypoints and the final destination must agree. A looser waypoint
+    -- tolerance can otherwise accept an empty route without ever moving.
+    local function reached(state, tx, ty)
+        return state.grounded and math.abs(state.x - tx) < 0.16
             and math.abs(state.y - ty) < 0.22 and math.abs(state.vx or 0) < 0.8
     end
     while true do
@@ -541,7 +543,7 @@ local function moveTo(x, y, worldName, token)
             while true do
                 worldCheck(worldName, token)
                 state = position()
-                if reached(state, waypoint.x + 0.5, waypoint.y + 1, 0.24) then break end
+                if reached(state, waypoint.x + 0.5, waypoint.y + 1) then break end
                 assert(os.clock() < deadline, "Returning to the saved position timed out. Check the route.")
                 if UserInputService:GetFocusedTextBox() then
                     hold.direction, hold.jump = 0, false

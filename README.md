@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.5.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.6.
+
+Version 0.1.6 fixes a false movement timeout during storage refill or the return to PNB. Waypoints and the final destination now use the same arrival checks, so an avatar slightly off-center on the saved tile finishes moving and resumes farming.
 
 Version 0.1.5 adds Anti-AFK and automatic PNB recovery from the world picker. It re-enters the saved breaking world, waits for the avatar and outstanding requests, then plans a walking/jumping route back to the saved PNB position. Movement now uses accessible floors, entrances, and stepping platforms instead of steering straight toward the final position and repeatedly jumping under the dirt.
 
@@ -55,7 +57,7 @@ For an existing checkout with the GitHub remote configured, upload this rebuilt 
 ```powershell
 Set-Location -LiteralPath 'F:\VSCode\Luau\Claris Growblox Autofarm\logic'
 git add .
-git commit -m "Add anti-AFK, world recovery, and platform navigation"
+git commit -m "Fix PNB movement after storage refill"
 git push
 ```
 
@@ -111,7 +113,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.5 passes 75 offline checks: 14 configuration/layout/storage tests, 59 tests executing the generated runtime against mock services and a mock server, and two release checks. New cases include a simulated climb around blocked dirt through a side entrance, inaccessible/harmful supports, stop during navigation/rejoin, re-entry from the picker including an interrupted inventory RPC, loading/respawn, failed entry retry limits, anti-AFK settings and cleanup, and account/expiry/renewal checks for PNB recovery. Existing drop, inventory, and toggle checks remain. Live server acceptance, actual navigation, and Delta's teleport queue still need in-game verification.
+Version 0.1.6 passes 77 offline checks: 14 configuration/layout/storage tests, 61 tests executing the generated runtime against mock services and a mock server, and two release checks. New regression cases verify centering from either side of the destination tile and a complete storage refill, return to the dirt, placement, and break. Existing checks cover a simulated climb through a side entrance, inaccessible/harmful supports, navigation/rejoin cancellation, picker and respawn recovery, anti-AFK settings and cleanup, PNB recovery checkpoints, drops, inventory, and toggles. Live server acceptance, actual navigation, and Delta's teleport queue still need in-game verification.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 
