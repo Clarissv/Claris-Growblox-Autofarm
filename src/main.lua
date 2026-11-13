@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.7"
+local VERSION = "0.1.8"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -176,6 +176,40 @@ end
 local function readField(value, key)
     local ok, field = pcall(function() return value[key] end)
     if ok then return field end
+end
+local function findWorldPicker(world, objects)
+    if type(world.enter) ~= "function" then return nil end
+    local found
+    for _, fn in pairs(objects or {}) do
+        if type(fn) == "function" and functionName(fn) == "enter" then
+            local adapter, panel, hud, input
+            for _, value in pairs(upvalues(fn)) do
+                if type(value) == "table" and rawget(value, "enter") == world.enter then adapter = value end
+                if type(value) == "function" and functionName(value) == "hud" then hud = value end
+                local isInstance = type(typeof) == "function" and typeof(value) == "Instance"
+                if isInstance then
+                    if value:IsA("GuiObject") and value:FindFirstChild("recent", true)
+                        and value:FindFirstChild("WorldName", true) then panel = value end
+                    if value:IsA("TextBox") then input = value end
+                end
+            end
+            if adapter and panel and hud then
+                if found and found.panel ~= panel then return nil end
+                found = {panel = panel, complete = function()
+                    -- Match the normal picker entry's HUD and focus cleanup.
+                    panel.Visible = false
+                    hud()
+                    if input then input:ReleaseFocus() end
+                end}
+            end
+        end
+    end
+    return found
+end
+local function pickerOpen(r)
+    if not r or not r.picker then return false end
+    local ok, visible = pcall(function() return r.picker.panel.Visible end)
+    return ok and visible == true
 end
 
 local function registryMap(candidate)
@@ -357,9 +391,11 @@ local function discover()
     local packets = require(registry.j1PKXTgzz)
     local runtime = { world = world, body = body, controls = controls[1], inventory = inventory,
         items = items, packets = packets, handlers = handlers, issues = issues,
-        readInventoryView = readInventoryView, ready = #issues == 0, gemHud = gemHud }
+        readInventoryView = readInventoryView, ready = #issues == 0, gemHud = gemHud,
+        picker = findWorldPicker(world, objects) }
     table.insert(App.discoveryReport, "Inventory: " .. (readInventoryView and "readable snapshot" or "live backpack"))
     table.insert(App.discoveryReport, "Farming hooks: " .. (#issues == 0 and "ready" or table.concat(issues, " ")))
+    table.insert(App.discoveryReport, "World picker: " .. (runtime.picker and "UI cleanup ready" or "UI hook unavailable"))
     -- The game already owns tileChanged handling. Own actions are optimistic and
     -- need not receive an echo; do not add a listener or require an acknowledgment.
     return runtime
@@ -395,7 +431,7 @@ end
 local function worldCheck(name, token)
     checkpoint(token)
     local r = runtime()
-    if r.world.name == "" or r.world.name == nil then
+    if r.world.name == "" or r.world.name == nil or pickerOpen(r) then
         error(recoverable("Returned to the world picker.", name, "worldPicker"), 0)
     end
     assert(r.world.name == name, "The world changed. Stopping to protect the saved locations.")
@@ -435,7 +471,17 @@ local function refreshInventory(token)
             pause(0.05, token)
         end
     end
-    local snapshot = bounded(r.world.call, App.config.options.actionTimeout, token, "GetInventory")
+    local name = App.job == "pnb" and App.config.points.pnb.world or r.world.name
+    local snapshot
+    for attempt = 1, 3 do
+        if token then worldCheck(name, token) end
+        snapshot = bounded(r.world.call, App.config.options.actionTimeout, token, "GetInventory")
+        -- A response can arrive after leaving the world or beginning its exit
+        -- animation. Check that state before treating it as a damaged backpack.
+        if token then worldCheck(name, token) end
+        if type(snapshot) == "table" and type(snapshot.slots) == "table" then break end
+        if attempt < 3 then pause(0.25, token) end
+    end
     assert(type(snapshot) == "table" and type(snapshot.slots) == "table", "Invalid backpack response.")
     local desired = {}
     for _, slot in pairs(snapshot.slots) do
@@ -996,6 +1042,22 @@ local function runPNB(token)
     end
 end
 
+local function recentPNBWorld(name, token)
+    setStatus("Checking Recently Visited Worlds for " .. name .. "...")
+    local ok, lists = pcall(bounded, runtime().world.call, App.config.options.actionTimeout, token, "ListWorlds")
+    checkpoint(token)
+    assert(App.pending == 0, "The recent-world request did not settle. Wait for it before rejoining.")
+    if ok and type(lists) == "table" and type(lists.recent) == "table" then
+        for index, world in ipairs(lists.recent) do
+            if type(world) == "string" and world:upper() == name:upper() then
+                App.recentWorldDebug = "Saved PNB world found at Recent position " .. index .. ": " .. world
+                return world, true
+            end
+        end
+    end
+    App.recentWorldDebug = "Saved PNB world absent from Recent or list unavailable; using " .. name
+    return name, false
+end
 local function recoverPNB(problem, token)
     assert(App.config.options.autoRejoin, tostring(problem))
     local name = App.config.points.pnb.world
@@ -1009,38 +1071,64 @@ local function recoverPNB(problem, token)
         assert(os.clock() < pendingDeadline, "A previous request did not settle; cannot rejoin yet.")
         pause(0.05, token)
     end
-    if r.world.name == nil or r.world.name == "" then
-        assert(type(r.world.enter) == "function", "The world re-entry hook is unavailable.")
-        savePNBResume()
-        local canResume = queueResume()
-        local entered, message, teleport
-        for attempt = 1, 3 do
-            checkpoint(token)
-            setStatus("Rejoining " .. name .. " (attempt " .. attempt .. "/3)...")
-            pause(attempt == 1 and 1 or 2, token)
-            entered, message, teleport = bounded(r.world.enter, App.config.options.actionTimeout + 15, token, name)
-            if entered or teleport then break end
-            assert(App.pending == 0, "A world entry request is still pending.")
-        end
-        if teleport then
-            App.teleporting = true
-            setStatus(canResume and "Changing servers; the saved farm will resume after loading."
-                or "Changing servers. Run the loader after arrival, then use Resume saved farm.")
-            local deadline = os.clock() + 45
-            while os.clock() < deadline do pause(0.2, token) end
-            error("Server teleport did not finish. Use Resume saved farm after checking the world.")
-        end
-        assert(entered, tostring(message or "Could not rejoin the saved world."))
-    end
     setStatus("Waiting for the saved world and avatar to load...")
     local readyDeadline = os.clock() + App.config.options.actionTimeout + 15
+    local stableSince, entryWaitUntil, attempts = nil, 0, 0
+    local recentChecked, target, fromRecent = false, name, false
     while true do
         checkpoint(token)
-        local state = r.body and r.body.state()
-        if r.world.name == name and state and state.active and not state.dead
-            and not player:GetAttribute("Frozen") then break end
         assert(r.world.name == name or r.world.name == "" or r.world.name == nil,
             "Arrived in another world. Check the saved PNB world.")
+        -- The exit animation can become inactive before the world name clears.
+        -- Reconsider re-entry throughout loading, including a second picker return.
+        if (r.world.name == nil or r.world.name == "" or pickerOpen(r)) and os.clock() >= entryWaitUntil then
+            assert(type(r.world.enter) == "function", "The world re-entry hook is unavailable.")
+            attempts = attempts + 1
+            assert(attempts <= 3, "The saved world repeatedly returned to the picker during recovery.")
+            savePNBResume()
+            local canResume = queueResume()
+            setStatus("Rejoining " .. name .. " (attempt " .. attempts .. "/3)...")
+            pause(attempts == 1 and 1 or 2, token)
+            assert(r.world.name == name or r.world.name == "" or r.world.name == nil,
+                "Arrived in another world. Check the saved PNB world.")
+            if r.world.name ~= name or pickerOpen(r) then
+                if not recentChecked then
+                    target, fromRecent = recentPNBWorld(name, token)
+                    recentChecked = true
+                    assert(r.world.name == name or r.world.name == "" or r.world.name == nil,
+                        "Arrived in another world. Check the saved PNB world.")
+                    setStatus("Rejoining " .. target .. (fromRecent and " from Recently Visited Worlds" or "")
+                        .. " (attempt " .. attempts .. "/3)...")
+                end
+                local entered, message, teleport = bounded(r.world.enter,
+                    App.config.options.actionTimeout + 15, token, target)
+                if teleport then
+                    App.teleporting = true
+                    setStatus(canResume and "Changing servers; the saved farm will resume after loading."
+                        or "Changing servers. Run the loader after arrival, then use Resume saved farm.")
+                    local deadline = os.clock() + 45
+                    while os.clock() < deadline do pause(0.2, token) end
+                    error("Server teleport did not finish. Use Resume saved farm after checking the world.")
+                end
+                if not entered then
+                    assert(App.pending == 0, "A world entry request is still pending.")
+                    assert(attempts < 3, tostring(message or "Could not rejoin the saved world."))
+                elseif r.picker then
+                    assert(r.world.name == name, "Arrived in another world. Check the saved PNB world.")
+                    r.picker.complete()
+                end
+                entryWaitUntil = os.clock() + (entered and 2 or 0)
+            end
+            stableSince = nil
+            readyDeadline = os.clock() + App.config.options.actionTimeout + 15
+            setStatus("Waiting for the saved world and avatar to load...")
+        end
+        local state = r.body and r.body.state()
+        if r.world.name == name and not pickerOpen(r) and state and state.active and not state.dead
+            and not player:GetAttribute("Frozen") then
+            stableSince = stableSince or os.clock()
+            if os.clock() - stableSince >= 1 then break end
+        else stableSince = nil end
         assert(os.clock() < readyDeadline, "The saved world or avatar did not become ready.")
         pause(0.1, token)
     end
@@ -1051,6 +1139,28 @@ local function recoverPNB(problem, token)
     moveToPoint(App.config.points.pnb, token)
     App.recovering = false
     setStatus("Back at the breaking spot. Resuming Place & Break...")
+end
+
+local function classifyPNBFault(problem, token)
+    if type(problem) == "table" and problem.recoverable then return problem end
+    releaseControls()
+    local name, deadline = App.config.points.pnb.world, os.clock() + 1.5
+    -- An interrupted RPC can fail before the local exit state changes. Allow
+    -- that short transition to reveal itself without retrying mutating actions.
+    repeat
+        checkpoint(token)
+        local r = runtime()
+        if r.world.name == "" or r.world.name == nil or pickerOpen(r) then
+            return recoverable("Returned to the world picker during an action: " .. tostring(problem), name, "worldPicker")
+        end
+        if r.world.name ~= name then return problem end
+        local state = r.body and r.body.state()
+        if state and (not state.active or state.dead) then
+            return recoverable("The avatar became unavailable during an action: " .. tostring(problem), name, "avatar")
+        end
+        if os.clock() >= deadline then return problem end
+        pause(0.1, token)
+    until false
 end
 
 local function runTransfer(token, saved)
@@ -1150,13 +1260,20 @@ local function start(mode, saved)
                     local completed, problem = pcall(runPNB, token)
                     if completed then break end
                     checkpoint(token)
-                    if (runtime().world.name == "" or runtime().world.name == nil)
-                        and not (type(problem) == "table" and problem.recoverable) then
-                        problem = recoverable("Returned to the world picker during an action: " .. tostring(problem),
-                            App.config.points.pnb.world, "worldPicker")
-                    end
+                    problem = classifyPNBFault(problem, token)
                     if type(problem) == "table" and problem.recoverable and App.config.options.autoRejoin then
-                        recoverPNB(problem, token)
+                        local interruptions = 0
+                        while true do
+                            local recovered, nextProblem = pcall(recoverPNB, problem, token)
+                            if recovered then break end
+                            checkpoint(token)
+                            -- Entry denials and route failures remain terminal. A
+                            -- new picker/respawn fault during recovery can retry.
+                            if type(nextProblem) ~= "table" or not nextProblem.recoverable then error(nextProblem, 0) end
+                            interruptions = interruptions + 1
+                            assert(interruptions < 3, "Recovery was interrupted three times. Check the saved world and connection.")
+                            problem = nextProblem
+                        end
                     else error(problem, 0) end
                 end
             else runTransfer(token, saved) end
@@ -1403,7 +1520,8 @@ if env.ClarisGrowbloxTest then
         recoverPNB = recoverPNB, recoverable = recoverable, installAntiAFK = installAntiAFK,
         savePNBResume = savePNBResume, readPNBResume = readPNBResume, refreshPNBCheckpoint = refreshPNBCheckpoint,
         webhookPayload = webhookPayload, setWebhookSetting = setWebhookSetting,
-        resetWebhookSchedule = resetWebhookSchedule, sendWebhook = sendWebhook, pollWebhook = pollWebhook }
+        resetWebhookSchedule = resetWebhookSchedule, sendWebhook = sendWebhook, pollWebhook = pollWebhook,
+        findWorldPicker = findWorldPicker, pickerOpen = pickerOpen }
 end
 
 local function loadWindUI()
@@ -1779,6 +1897,8 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
         .. "\nRecovery save: " .. (App.recoverySaveError or "ready")
         .. "\nWebhook: " .. App.webhookState.status .. "\nWebhook pending requests: " .. App.webhookState.pending
+        .. "\nWorld picker: " .. (App.runtime and App.runtime.picker and (pickerOpen(App.runtime) and "visible" or "hidden") or "UI hook unavailable")
+        .. "\nRecent world selection: " .. (App.recentWorldDebug or "not requested")
         .. "\n" .. table.concat(App.discoveryReport, "\n")
     local clipboard = setclipboard or toclipboard
     if clipboard then clipboard(text); notify("Diagnostics copied.") else print(text); notify("Diagnostics printed to the console.") end

@@ -390,6 +390,204 @@ test("Being sent to the picker during an inventory RPC still triggers recovery",
     assert(f.entries == 1 and not f.app.lastError and f.app.job == nil)
 end)
 
+test("Recovery enters the world when an inactive exit becomes the picker later", function()
+    local f = entryFixture()
+    f.world.name = "BREAK"
+    f.onWait = function() f.onWait = nil; f.world.name = "" end
+    f.hooks.start("pnb")
+    assert(f.entries == 1 and not f.app.lastError and f.app.status:find("Finished", 1, true))
+end)
+
+test("Recovery rejects a briefly ready avatar before a second picker transition", function()
+    local f = entryFixture()
+    local interrupted = false
+    f.onWait = function()
+        if f.entries == 1 and not interrupted then
+            interrupted = true
+            f.world.name, f.avatar.active = "", false
+        end
+    end
+    f.hooks.start("pnb")
+    assert(interrupted and f.entries == 2 and not f.app.lastError)
+    assert(f.app.status:find("Finished", 1, true))
+end)
+
+test("An invalid inventory reply with an inactive avatar and stale world name recovers", function()
+    local f = entryFixture()
+    f.world.name, f.avatar.active = "BREAK", true
+    local first = true
+    f.server = function(name)
+        assert(name == "GetInventory")
+        if first then first = false; f.avatar.active = false; return nil end
+        return {slots = {}, capacity = 54}
+    end
+    f.onWait = function()
+        if not f.avatar.active then f.world.name = ""; f.onWait = nil end
+    end
+    f.hooks.start("pnb")
+    assert(f.entries == 1 and not f.app.lastError and f.app.job == nil)
+end)
+
+test("A picker transition appearing after the failed inventory response still recovers", function()
+    local f = entryFixture()
+    f.world.name, f.avatar.active = "BREAK", true
+    local began, interrupted = os.clock(), false
+    f.server = function(name)
+        assert(name == "GetInventory")
+        if not interrupted then return nil end
+        return {slots = {}, capacity = 54}
+    end
+    f.onWait = function()
+        if not interrupted and os.clock() - began >= 0.75 then
+            interrupted = true
+            f.world.name, f.avatar.active = "", false
+        end
+    end
+    f.hooks.start("pnb")
+    assert(interrupted and f.entries == 1 and not f.app.lastError)
+end)
+
+test("A genuinely malformed backpack stops after bounded reads without erasing items", function()
+    local f = entryFixture()
+    f.world.name, f.avatar.active = "BREAK", true
+    f.inventory:add(954, 7)
+    local reads = 0
+    f.server = function(name) assert(name == "GetInventory"); reads = reads + 1; return {} end
+    f.hooks.start("pnb")
+    assert(reads == 3 and f.entries == 0 and f.app.job == nil and f.inventory:count(954) == 7)
+    assert(f.app.lastError:find("Invalid backpack response", 1, true))
+end)
+
+test("Inventory replies arriving after a world exit are not applied before re-entry", function()
+    local f = entryFixture()
+    f.world.name, f.avatar.active = "BREAK", true
+    f.inventory:add(954, 7)
+    local originalEnter, first = f.world.enter, true
+    f.world.enter = function(name)
+        assert(f.inventory:count(954) == 7, "A world exit must not reconcile an interrupted inventory reply")
+        return originalEnter(name)
+    end
+    f.server = function(name)
+        assert(name == "GetInventory")
+        if first then first = false; f.world.name, f.avatar.active = "", false end
+        return {slots = {}, capacity = 54}
+    end
+    f.hooks.start("pnb")
+    assert(f.entries == 1 and not f.app.lastError and f.inventory:count(954) == 0)
+end)
+
+test("A second picker return during recovery inventory refresh retries recovery", function()
+    local f = entryFixture()
+    local first = true
+    f.server = function(name)
+        assert(name == "GetInventory")
+        if first then
+            first = false
+            f.world.name, f.avatar.active = "", false
+            return nil
+        end
+        return {slots = {}, capacity = 54}
+    end
+    f.hooks.start("pnb")
+    assert(f.entries == 2 and not f.app.lastError and f.app.status:find("Finished", 1, true))
+end)
+
+test("Entering a different world during the rejoin delay cancels the saved entry", function()
+    local f = entryFixture()
+    f.onWait = function() f.onWait = nil; f.world.name, f.avatar.active = "OTHER", true end
+    f.hooks.start("pnb")
+    assert(f.entries == 0 and f.app.job == nil and f.app.lastError:find("another world", 1, true))
+end)
+
+test("Repeated picker interruptions during recovery stop after three recovery attempts", function()
+    local f = entryFixture()
+    f.server = function(name)
+        assert(name == "GetInventory")
+        f.world.name, f.avatar.active = "", false
+        return nil
+    end
+    f.hooks.start("pnb")
+    assert(f.entries == 3 and f.app.job == nil and f.app.controls == nil)
+    assert(f.app.lastError:find("interrupted three times", 1, true))
+end)
+
+test("Picker discovery binds the correct entry adapter, HUD cleanup, and text focus", function()
+    local f = entryFixture()
+    local hudCalls, focusCalls = 0, 0
+    local panel = {Visible = true, mockInstance = true,
+        IsA = function(_, kind) return kind == "GuiObject" end,
+        FindFirstChild = function(_, name) if name == "recent" or name == "WorldName" then return {} end end}
+    local input = {mockInstance = true, IsA = function(_, kind) return kind == "TextBox" end,
+        ReleaseFocus = function() focusCalls = focusCalls + 1 end}
+    local hud = function() hudCalls = hudCalls + 1 end
+    local wrapper, foreign = function() end, function() end
+    local oldTypeof, oldUpvalues, oldInfo = typeof, getupvalues, getinfo
+    typeof = function(value) return type(value) == "table" and value.mockInstance and "Instance" or type(value) end
+    getinfo = function(fn) return {name = fn == hud and "hud" or "enter"} end
+    getupvalues = function(fn)
+        if fn == wrapper then return {{enter = f.world.enter}, panel, input, hud} end
+        if fn == foreign then return {{enter = function() end}, panel, input, hud} end
+        return {}
+    end
+    local picker = f.hooks.findWorldPicker(f.world, {foreign, wrapper})
+    assert(picker and picker.panel == panel)
+    picker.complete()
+    assert(not panel.Visible and hudCalls == 1 and focusCalls == 1)
+    typeof, getupvalues, getinfo = oldTypeof, oldUpvalues, oldInfo
+end)
+
+test("A visible picker with a stale active world re-enters and restores the game HUD", function()
+    local f = entryFixture()
+    f.world.name, f.avatar.active = "BREAK", true
+    local panel, cleanup = {Visible = true}, 0
+    f.app.runtime.picker = {panel = panel, complete = function() panel.Visible = false; cleanup = cleanup + 1 end}
+    f.server = function(name)
+        if name == "ListWorlds" then return {recent = {"BREAK", "FARM"}} end
+        assert(name == "GetInventory" and not panel.Visible, "No inventory request should run underneath the world picker")
+        return {slots = {}, capacity = 54}
+    end
+    f.hooks.start("pnb")
+    assert(f.entries == 1 and cleanup == 1 and not panel.Visible and not f.app.lastError)
+    assert(f.app.status:find("Finished", 1, true))
+end)
+
+test("Recovery selects the most recent matching breaking world from ListWorlds", function()
+    local f = entryFixture()
+    local lists = 0
+    f.server = function(name)
+        if name == "ListWorlds" then lists = lists + 1; return {recent = {"BREAK", "FARM"}} end
+        assert(name == "GetInventory")
+        return {slots = {}, capacity = 54}
+    end
+    f.hooks.start("pnb")
+    assert(lists == 1 and f.entries == 1 and not f.app.lastError)
+    assert(f.app.recentWorldDebug:find("Recent position 1: BREAK", 1, true))
+end)
+
+test("A different newest recent world does not redirect the saved breaking setup", function()
+    local f = entryFixture()
+    f.server = function(name)
+        if name == "ListWorlds" then return {recent = {"OTHER", "BREAK"}} end
+        assert(name == "GetInventory")
+        return {slots = {}, capacity = 54}
+    end
+    f.hooks.start("pnb")
+    assert(f.entries == 1 and not f.app.lastError)
+    assert(f.app.recentWorldDebug:find("Recent position 2: BREAK", 1, true))
+end)
+
+test("An unavailable recent-world list falls back to the saved PNB world", function()
+    local f = entryFixture()
+    f.server = function(name)
+        if name == "ListWorlds" then error("ListWorlds unavailable") end
+        assert(name == "GetInventory")
+        return {slots = {}, capacity = 54}
+    end
+    f.hooks.start("pnb")
+    assert(f.entries == 1 and not f.app.lastError and f.app.pending == 0)
+    assert(f.app.recentWorldDebug:find("using BREAK", 1, true))
+end)
+
 test("Starting PNB saves its profile and arms the loader for a server teleport", function()
     local f = entryFixture()
     local queued

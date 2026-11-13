@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.7.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.8.
+
+Version 0.1.8 fixes recovery when the picker appears during an exit animation, inventory read, or an earlier recovery attempt. It also detects the visible picker even if the game still reports the old world and avatar, and performs the normal picker HUD/focus cleanup after successful entry. Rejoining looks for the saved breaking world in Recently Visited Worlds, falls back to its saved name, waits for one second of stable loading, then returns to PNB. Interrupted inventory replies are checked against current world/avatar state before being applied.
 
 Version 0.1.7 adds a Discord Webhook tab with Send stats now, an automatic reporting toggle, an interval input in minutes, and optional saved Display Box counts. Reports include player level and gem balance, world/profile, farm status, backpack blocks/seeds, and session totals. Webhook settings are saved per profile; older profiles default to reports Off.
 
@@ -60,7 +62,7 @@ For an existing checkout with the GitHub remote configured, upload this rebuilt 
 ```powershell
 Set-Location -LiteralPath 'F:\VSCode\Luau\Claris Growblox Autofarm\logic'
 git add .
-git commit -m "Add Discord stats reports with configurable minutes"
+git commit -m "Fix world picker recovery and recent world re-entry"
 git push
 ```
 
@@ -76,6 +78,8 @@ git push
 The script walks to saved positions and storage through the game's normal 2D controls. Loose-drop collection itself keeps the player at the PNB spot and targets drops close to the single farming tile. Full block stacks leave excess blocks for later cycles; reaching the seed threshold deposits seeds and frees room. Repeated server pickup refusal stops the task with a diagnostic containing the rejected UIDs, item IDs, and positions. Keep paths reachable and avoid moving the player manually during a task. If a position times out, check the path and save it again.
 
 For the raised dirt setup, save the PNB position while standing on top of the dirt. Keep access to the entrance beside the world lock and the stepping platforms. The planner reads the current collision map, uses entrances only when the game allows walking through them, and avoids harmful blocks. It can move sideways or down to reach a better jump position, then jump back onto the dirt. A stalled route is replanned up to four times within the movement timeout; a sealed or unreachable spot produces a diagnostic.
+
+Recovery checks the picker throughout loading, including when it appears after an inactive exit animation or interrupts a previous recovery. The script uses the same Recent worlds list as the game, selects the first matching entry for the saved PNB world, and uses the saved name if the list has no match or returns an error. Another world at the top of Recent does not replace the saved farming setup. When the picker UI hook is available, recovery recognizes its visibility separately from the internal world name and restores the game's HUD after entry. Copied diagnostics report the picker hook/visibility and Recent selection. Entry is limited to three attempts per recovery; three consecutive interrupted recoveries stop with a diagnostic. Malformed inventory responses get up to three read-only attempts, and a genuine invalid response still stops the task.
 
 **Settings → Anti-AFK** and **Rejoin world and return to PNB** both default to On. Loading an older profile adds these defaults without changing its saved locations. Rejoining applies to Place & Break; Moving Drops retains its transfer checkpoints and existing recovery rules. If Roblox changes servers, the script arms Delta's teleport queue before farming starts. When that function is available, the same GitHub loader resumes the saved farm after arrival. Otherwise, run the loader again and use **Configurations → Resume saved farm**. A different live world is treated as an unexpected change and stops PNB.
 
@@ -131,7 +135,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.7 passes 97 offline checks: 19 configuration/layout/storage tests, 76 tests executing the generated runtime against mock services and a mock server, and two release checks. New webhook checks cover backward-compatible profiles, URL and interval validation, mixed/empty/unavailable box counts, actual POST options and payload, minutes-to-seconds scheduling, settings changes during farming, manual cooldowns, Discord rate limits, token-safe errors, executor fallback, and cancellation/late responses. Existing navigation, refill, drop, inventory, recovery, anti-AFK, and toggle checks remain. Live game/server behavior, Delta's teleport queue, and real Discord delivery still need in-game verification.
+Version 0.1.8 passes 111 offline checks: 19 configuration/layout/storage tests, 90 tests executing the generated runtime against mock services and a mock server, and two release checks. Added recovery fixtures cover delayed picker transitions, brief false readiness, invalid/interrupted inventory responses, a second picker return during recovery, bounded retries, Recent selection/fallback, correct picker discovery, and HUD/focus restoration with a stale active world. Existing webhook, navigation, refill, drop, inventory, recovery, anti-AFK, and toggle checks remain. Live game/server behavior, picker-hook discovery in Delta, the teleport queue, and real Discord delivery still need in-game verification.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 
