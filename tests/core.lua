@@ -144,4 +144,23 @@ test("Profile filenames allow readable names and reject path traversal", functio
     rejects(function() Core.profileName(string.rep("x", 49)) end)
 end)
 
+test("Old profiles gain recovery settings and new profiles retain explicit choices", function()
+    local config = setup()
+    config.options.antiAFK, config.options.autoRejoin = nil, nil
+    local saved = Core.validate(config)
+    assert(saved.options.antiAFK and saved.options.autoRejoin)
+    config.options.antiAFK, config.options.autoRejoin = false, false
+    saved = Core.validate(config)
+    assert(not saved.options.antiAFK and not saved.options.autoRejoin)
+end)
+
+test("Invalid anti-AFK or world-recovery values are rejected", function()
+    local config = setup()
+    config.options.antiAFK = "yes"
+    rejects(function() Core.validate(config) end, "antiAFK")
+    config = setup()
+    config.options.autoRejoin = 1
+    rejects(function() Core.validate(config) end, "autoRejoin")
+end)
+
 return string.format("%d configuration/layout/storage tests passed", passed)

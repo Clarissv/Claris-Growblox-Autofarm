@@ -52,7 +52,7 @@ local function fixture()
             local pending = queue
             queue = {}
             for _, fn in ipairs(pending) do fn() end
-            if context.onWait then context.onWait() end
+            if context.onWait then context.onWait(seconds or 0.03) end
             return seconds
         end,
     }
@@ -131,9 +131,323 @@ local function fixture()
     }
     app.token, app.job, app.jobToken = 1, "transfer", 1
     context.app, context.world, context.inventory = app, world, inventory
+    context.player, context.services = localPlayer, services
     context.controls, context.avatar, context.drops, context.boxes = controls, avatar, drops, boxes
     return context
 end
+
+local function raisedFarm(f)
+    for _, row in pairs(f.world.fg) do for x in pairs(row) do row[x] = 0 end end
+    f.app.runtime.items[1] = {solid = true}
+    f.app.runtime.items[102] = {platform = true}
+    f.app.runtime.items[224] = {entrance = true, solid = true}
+    local grid = f.world.fg
+    for x = 4, 16 do grid[13][x] = 1 end
+    for y = 11, 12 do
+        for x = 6, 9 do grid[y][x] = 1 end
+        for x = 12, 14 do grid[y][x] = 1 end
+    end
+    grid[11][10], grid[9][10] = 1, 1 -- World lock and raised dirt.
+    grid[12][11], grid[11][11] = 1, 224 -- Entrance beside the lock, with a floor below.
+    grid[10][9] = 1 -- This representative route has its left approach closed.
+    grid[10][11], grid[9][11], grid[9][12] = 102, 102, 102
+    for x = 7, 13 do grid[4][x] = 1 end
+    for y = 5, 9 do grid[y][7], grid[y][13] = 1, 1 end
+    f.avatar.x, f.avatar.y = 10.5, 11
+    f.app.runtime.body.solidAt = function(x, y)
+        if x < 0 or x >= f.world.w or y >= f.world.h then return true end
+        local id = grid[y] and grid[y][x] or 0
+        if id == 224 then return f.entranceClosed or false end
+        return id == 1
+    end
+    return f.hooks.navigationMap(f.app.runtime)
+end
+
+test("Raised-farm navigation uses the side entrance instead of jumping under dirt", function()
+    local f = fixture()
+    local map = raisedFarm(f)
+    local route, message = f.hooks.Navigation.plan(map, {x = 10, y = 10}, {x = 10, y = 8})
+    assert(route, message)
+    local entrance, jumped = false, false
+    for _, step in ipairs(route) do
+        if step.x == 11 and step.y == 11 then entrance = true end
+        if step.jump then jumped = true end
+    end
+    assert(entrance and jumped and route[#route].x == 10 and route[#route].y == 8)
+end)
+
+test("The movement map respects closed entrances and excludes harmful supports", function()
+    local f = fixture()
+    local map = raisedFarm(f)
+    f.entranceClosed = true
+    assert(map.solid(11, 11))
+    f.app.runtime.items[4] = {solid = true, hurts = true}
+    f.world.fg[13][17] = 4
+    assert(map.danger(17, 13))
+    local route, message = f.hooks.Navigation.plan(map, {x = 10, y = 10}, {x = 17, y = 12})
+    assert(not route and message:find("support", 1, true))
+end)
+
+test("Navigation refuses a sealed destination rather than repeatedly jumping", function()
+    local f = fixture()
+    local map = raisedFarm(f)
+    for x = 9, 11 do f.world.fg[8][x] = 1 end
+    local route, message = f.hooks.Navigation.plan(map, {x = 10, y = 10}, {x = 10, y = 8})
+    assert(not route and message:find("headroom", 1, true))
+end)
+
+local function attachPhysics(f, map)
+    local previousJump = false
+    local visited = {}
+    local function fits(x, feet)
+        for tx = math.floor(x - 0.299), math.floor(x + 0.299) do
+            for ty = math.floor(feet - 0.949), math.floor(feet - 0.002) do
+                if map.solid(tx, ty) then return false end
+            end
+        end
+        return true
+    end
+    f.onWait = function(seconds)
+        if not f.avatar.active or f.avatar.dead then return end
+        local subdivisions = math.max(1, math.ceil(seconds / 0.005))
+        local dt, state = seconds / subdivisions, f.avatar
+        for _ = 1, subdivisions do
+            local jump, direction = f.controls.jumping(), f.controls.dir()
+            if jump and not previousJump and state.grounded then state.vy, state.grounded = -19.8997487421324, false end
+            previousJump = jump
+            local acceleration = direction == 0 and (state.grounded and 48 or 17) or (state.grounded and 36 or 22)
+            local desired = direction * 7.2
+            if state.vx < desired then state.vx = math.min(desired, state.vx + acceleration * dt)
+            else state.vx = math.max(desired, state.vx - acceleration * dt) end
+            local nextX = state.x + state.vx * dt
+            if fits(nextX, state.y) then state.x = nextX else state.vx = 0 end
+            state.vy = math.min(24, state.vy + (state.vy < 0 and not jump and 143 or 55) * dt)
+            local nextFeet, landed = state.y + state.vy * dt, false
+            if state.vy >= 0 then
+                for row = math.ceil(state.y - 0.001), math.floor(nextFeet + 0.001) do
+                    for x = math.floor(state.x - 0.299), math.floor(state.x + 0.299) do
+                        if map.solid(x, row) or map.platform(x, row) then
+                            state.y, state.vy, landed = row - 0.001, 0, true
+                            break
+                        end
+                    end
+                    if landed then break end
+                end
+            end
+            if not landed then
+                if fits(state.x, nextFeet) then state.y = nextFeet
+                else state.vy = 0 end
+            end
+            state.grounded = landed
+            if landed then visited[math.floor(state.x) .. ":" .. math.floor(state.y - 0.01)] = true end
+        end
+    end
+    return visited
+end
+
+test("The actual movement controller climbs from the lock via the side entrance", function()
+    local f = fixture()
+    local map = raisedFarm(f)
+    local visited = attachPhysics(f, map)
+    f.hooks.moveTo(10, 8, "BREAK", 1)
+    assert(visited["11:11"], "The avatar must reach the side entrance approach")
+    assert(math.abs(f.avatar.x - 10.5) < 0.16 and math.abs(f.avatar.y - 9) < 0.22)
+    assert(f.controls.dir() == 0 and not f.controls.jumping() and f.avatar.grounded)
+end)
+
+test("Stopping while following a route restores controls and prevents later jumps", function()
+    local f = fixture()
+    raisedFarm(f)
+    local original = f.controls.jumping
+    f.onWait = function() f.onWait = nil; f.app:stop() end
+    rejects(function() f.hooks.moveTo(10, 8, "BREAK", 1) end, "Stopped")
+    assert(f.app.controls == nil and f.controls.jumping == original)
+end)
+
+local function entryFixture()
+    local f = fixture()
+    f.app.job, f.app.jobToken, f.avatar.x = nil, nil, 10.5
+    f.app.config.points.blockBox.standX, f.boxes[12] = 10, {}
+    f.world.name, f.avatar.active = "", false
+    f.entries = 0
+    f.world.enter = function(name)
+        assert(name == "BREAK")
+        assert(f.app.pending == 1, "Only the owned entry request should be pending")
+        f.entries = f.entries + 1
+        f.world.name, f.avatar.active, f.avatar.dead = "BREAK", true, false
+        f.avatar.x, f.avatar.y = 10.5, 9
+        return true
+    end
+    f.server = function(name)
+        assert(name == "GetInventory" and f.avatar.active and f.world.name == "BREAK")
+        return {slots = {}, capacity = 54}
+    end
+    return f
+end
+
+test("PNB re-enters the saved world from the picker and resumes the loop", function()
+    local f = entryFixture()
+    f.hooks.start("pnb")
+    assert(f.entries == 1 and f.app.job == nil and not f.app.lastError)
+    assert(not f.app.recovering and f.app.status:find("Finished", 1, true))
+    assert(not f.hooks.readPNBResume(), "Normal completion must clear automatic farm recovery")
+end)
+
+test("World re-entry follows the side-platform route before restarting PNB", function()
+    local f = entryFixture()
+    local map = raisedFarm(f)
+    f.world.fg[8][8], f.world.fg[8][12] = 1422, 1422
+    f.world.name, f.avatar.active = "", false
+    local visited = attachPhysics(f, map)
+    f.world.enter = function(name)
+        assert(name == "BREAK")
+        f.entries = f.entries + 1
+        f.world.name, f.avatar.active = "BREAK", true
+        f.avatar.x, f.avatar.y, f.avatar.vx, f.avatar.vy = 10.5, 11, 0, 0
+        return true
+    end
+    f.hooks.start("pnb")
+    assert(f.entries == 1 and visited["11:11"] and not f.app.lastError)
+    assert(f.app.job == nil and f.app.status:find("Finished", 1, true))
+end)
+
+test("Being sent to the picker during an inventory RPC still triggers recovery", function()
+    local f = entryFixture()
+    f.world.name, f.avatar.active = "BREAK", true
+    local first = true
+    f.server = function(name)
+        assert(name == "GetInventory")
+        if first then
+            first = false
+            f.world.name, f.avatar.active = "", false
+            return nil
+        end
+        return {slots = {}, capacity = 54}
+    end
+    f.hooks.start("pnb")
+    assert(f.entries == 1 and not f.app.lastError and f.app.job == nil)
+end)
+
+test("Starting PNB saves its profile and arms the loader for a server teleport", function()
+    local f = entryFixture()
+    local queued
+    f.env.ClarisGrowbloxLoaderURL = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/loader.lua"
+    queue_on_teleport = function(code) queued = code end
+    f.spawn = function(fn) f.spawn = nil; task.defer(fn) end
+    f.hooks.start("pnb")
+    local saved = f.hooks.readPNBResume()
+    assert(saved and saved.config.points.pnb.world == "BREAK" and saved.config.blockId == 954)
+    assert(queued:find("ClarisGrowbloxAutoResume", 1, true) and queued:find(f.env.ClarisGrowbloxLoaderURL, 1, true))
+    f.app:stop()
+    task.wait(0.01)
+    assert(not f.hooks.readPNBResume())
+    queue_on_teleport = nil
+end)
+
+test("Farm recovery files reject another account or an expired checkpoint", function()
+    local f = fixture()
+    f.hooks.savePNBResume()
+    local saved = f.hooks.readPNBResume()
+    saved.userId = 999
+    rejects(function() f.hooks.readPNBResume() end, "another account")
+    saved.userId, saved.updatedAt = f.player.UserId, os.time() - 7 * 3600
+    rejects(function() f.hooks.readPNBResume() end, "six hours")
+end)
+
+test("Farm checkpoints refresh during a long run but never after Stop", function()
+    local f = fixture()
+    f.app.job = "pnb"
+    f.hooks.savePNBResume()
+    local first = f.files["ClarisGrowblox/pnb-resume.json"]
+    task.wait(121)
+    f.hooks.refreshPNBCheckpoint()
+    assert(f.files["ClarisGrowblox/pnb-resume.json"] ~= first)
+    f.app:stop()
+    task.wait(121)
+    f.hooks.refreshPNBCheckpoint()
+    assert(not f.files["ClarisGrowblox/pnb-resume.json"])
+end)
+
+test("Failed world entry stops after three attempts with the farm toggle Off", function()
+    local f = entryFixture()
+    f.world.enter = function() f.entries = f.entries + 1; return false, "World access denied" end
+    f.app.runToggles.pnb = {Value = false, Set = function(self, value) self.Value = value end}
+    f.hooks.start("pnb")
+    assert(f.entries == 3 and f.app.job == nil and f.app.controls == nil)
+    assert(f.app.lastError:find("World access denied", 1, true) and not f.app.runToggles.pnb.Value)
+end)
+
+test("World recovery can be disabled in a saved profile", function()
+    local f = entryFixture()
+    f.app.config.options.autoRejoin = false
+    f.hooks.start("pnb")
+    assert(f.entries == 0 and f.app.job == nil and f.app.lastError:find("world picker", 1, true))
+end)
+
+test("Stopping during rejoin cancels subsequent entry attempts", function()
+    local f = entryFixture()
+    f.onWait = function() f.onWait = nil; f.app:stop() end
+    f.hooks.start("pnb")
+    assert(f.entries == 0 and f.app.job == nil and f.app.controls == nil and not f.app.lastError)
+    assert(not f.hooks.readPNBResume())
+end)
+
+test("Unexpected entry into a different live world does not redirect or farm it", function()
+    local f = entryFixture()
+    f.world.name, f.avatar.active = "OTHER", true
+    f.hooks.start("pnb")
+    assert(f.entries == 0 and f.app.job == nil and f.app.lastError:find("world changed", 1, true))
+end)
+
+test("Recovery waits for pending pickup settlement before entering the world", function()
+    local f = entryFixture()
+    f.app.job, f.app.jobToken, f.app.pending = "pnb", 1, 1
+    f.onWait = function() f.onWait = nil; f.app.pending = 0 end
+    f.hooks.recoverPNB(f.hooks.recoverable("World picker", "BREAK", "worldPicker"), 1)
+    assert(f.entries == 1 and f.app.pending == 0 and not f.app.recovering)
+end)
+
+test("A ready avatar after respawn resumes without another world entry", function()
+    local f = entryFixture()
+    f.app.job, f.app.jobToken, f.world.name, f.avatar.dead = "pnb", 1, "BREAK", true
+    f.onWait = function() f.onWait = nil; f.avatar.active, f.avatar.dead = true, false end
+    f.hooks.recoverPNB(f.hooks.recoverable("Respawning", "BREAK", "avatar"), 1)
+    assert(f.entries == 0 and f.app.controls and not f.app.recovering)
+end)
+
+test("The anti-AFK handler follows the setting and disconnects on unload", function()
+    local f = fixture()
+    local inputs, captured, callback, disconnected = 0, 0, nil, false
+    Vector2 = {new = function(x, y) return {x = x, y = y} end}
+    f.services.VirtualUser = {
+        CaptureController = function() captured = captured + 1 end,
+        ClickButton2 = function(_, point) assert(point.x == 0 and point.y == 0); inputs = inputs + 1 end,
+    }
+    f.player.Idled = {Connect = function(_, fn)
+        callback = fn
+        return {Disconnect = function() disconnected = true end}
+    end}
+    assert(f.hooks.installAntiAFK())
+    callback()
+    callback()
+    assert(inputs == 1 and captured == 1, "Repeated idle events must not spam input")
+    f.app.config.options.antiAFK = false
+    task.wait(61)
+    callback()
+    assert(inputs == 1)
+    f.app.config.options.antiAFK = true
+    callback()
+    assert(inputs == 2)
+    f.app:destroy()
+    callback()
+    assert(disconnected and inputs == 2 and f.app.idleConnection == nil)
+end)
+
+test("Unavailable idle input records a diagnostic without stopping the farm", function()
+    local f = fixture()
+    assert(not f.hooks.installAntiAFK())
+    assert(f.app.antiAFKError and f.app.alive and f.app.job == "transfer")
+end)
 
 test("Storage auto-pickup is suppressed and all wrappers restore on stop", function()
     local f = fixture()

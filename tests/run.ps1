@@ -50,6 +50,7 @@ try {
     $projectPath = Split-Path -Parent $PSScriptRoot
     $coreSource = [IO.File]::ReadAllText((Join-Path $projectPath 'src\core.lua'))
     Invoke-Lua $coreSource 'src/core.lua' $false
+    Invoke-Lua ([IO.File]::ReadAllText((Join-Path $projectPath 'src\navigation.lua'))) 'src/navigation.lua' $false
     Invoke-Lua ([IO.File]::ReadAllText((Join-Path $projectPath 'src\main.lua'))) 'src/main.lua' $false
     if (-not $SkipArtifacts) {
         foreach ($artifact in @('main.lua', 'loader.lua')) {

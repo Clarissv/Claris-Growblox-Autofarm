@@ -3,6 +3,7 @@ local Core = {}
 Core.VERSION = 1
 Core.REPO = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/"
 Core.POINTS = { "pnb", "blockBox", "seedBox", "farmBox", "farmDoor", "breakDoor" }
+Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin" }
 Core.LIMITS = {
     placeDelay = { 0.15, 2 }, punchDelay = { 0.22, 2 },
     collectDelay = { 0, 5 }, actionTimeout = { 5, 30 },
@@ -13,7 +14,7 @@ function Core.defaults()
     return {
         version = Core.VERSION, blockId = 0, points = {},
         options = { placeDelay = 0.2, punchDelay = 0.24, collectDelay = 0.1,
-            actionTimeout = 10, moveTimeout = 30, seedThreshold = 200 },
+            actionTimeout = 10, moveTimeout = 30, seedThreshold = 200, antiAFK = true, autoRejoin = true },
     }
 end
 
@@ -46,6 +47,13 @@ function Core.validate(input)
             assert(value == math.floor(value), "Seed threshold must be a whole number.")
         end
         out.options[key] = value
+    end
+    for _, key in ipairs(Core.BOOL_OPTIONS) do
+        local value = input.options[key]
+        if value ~= nil then
+            assert(type(value) == "boolean", "Invalid setting: " .. key)
+            out.options[key] = value
+        end
     end
     for _, key in ipairs(Core.POINTS) do
         local point = input.points[key]
