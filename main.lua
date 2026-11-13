@@ -17,6 +17,7 @@ function Core.defaults()
         version = Core.VERSION, blockId = 0, points = {},
         options = { placeDelay = 0.2, punchDelay = 0.24, collectDelay = 0.1,
             actionTimeout = 10, moveTimeout = 30, seedThreshold = 200, antiAFK = true, autoRejoin = true },
+        webhook = { url = "", enabled = false, intervalMinutes = 5, includeBoxes = true },
     }
 end
 
@@ -36,11 +37,37 @@ function Core.profileName(value)
     return name
 end
 
+function Core.webhookURL(value)
+    assert(type(value) == "string", "Enter a Discord webhook URL.")
+    local url = value:match("^%s*(.-)%s*$")
+    if url == "" then return url end
+    local host, path = url:match("^https://([^/]+)/api/(.+)$")
+    assert(host and (host == "discord.com" or host == "discordapp.com"
+        or host == "canary.discord.com" or host == "ptb.discord.com"), "Use an HTTPS Discord webhook URL.")
+    path = path:gsub("^v%d+/", ""):gsub("/$", "")
+    assert(#url <= 300 and path:match("^webhooks/%d+/[%w_%-]+$"), "Use a valid Discord webhook URL.")
+    return url:gsub("/$", "")
+end
+
+function Core.validateWebhook(input)
+    local out = Core.defaults().webhook
+    if input == nil then return out end
+    assert(type(input) == "table", "Invalid webhook settings.")
+    out.url = Core.webhookURL(input.url)
+    assert(type(input.enabled) == "boolean" and type(input.includeBoxes) == "boolean", "Invalid webhook toggles.")
+    assert(finite(input.intervalMinutes) and input.intervalMinutes >= 1 and input.intervalMinutes <= 1440,
+        "Webhook interval must be between 1 and 1440 minutes.")
+    assert(not input.enabled or out.url ~= "", "Set the Discord webhook URL before enabling reports.")
+    out.enabled, out.includeBoxes, out.intervalMinutes = input.enabled, input.includeBoxes, input.intervalMinutes
+    return out
+end
+
 function Core.validate(input)
     assert(type(input) == "table" and input.version == Core.VERSION, "Unsupported or damaged profile.")
     assert(integer(input.blockId, 0, 65535), "Invalid block ID in profile.")
     assert(type(input.points) == "table" and type(input.options) == "table", "Incomplete profile.")
     local out = Core.defaults()
+    out.webhook = Core.validateWebhook(input.webhook)
     out.blockId = input.blockId
     for key, limits in pairs(Core.LIMITS) do
         local value = input.options[key]
@@ -106,6 +133,18 @@ function Core.storageCount(rows, itemId)
         count = count + row[2]
     end
     return count
+end
+
+-- Reporting can count the selected item in mixed boxes without changing them.
+function Core.itemCount(rows, itemId)
+    assert(type(rows) == "table", "Display contents are unavailable.")
+    local total = 0
+    for _, row in pairs(rows) do
+        assert(type(row) == "table" and integer(row[1], 0, 65535)
+            and integer(row[2], 0, 4294967295), "Invalid display contents.")
+        if row[1] == itemId then total = total + row[2] end
+    end
+    return total
 end
 
 function Core.checkSetup(config, mode, items)
@@ -276,7 +315,7 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.6"
+local VERSION = "0.1.7"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -339,6 +378,8 @@ local App = {
     logs = {}, controls = nil, runtime = nil, resume = nil,
     connectionError = nil, discoveryReport = {},
     stats = { broken = 0, trips = 0, moved = 0, gems = 0 }, runToggles = {},
+    webhookState = { pending = 0, generation = 0, status = "Automatic reports are Off." },
+    loadedAt = os.clock(),
 }
 env.ClarisGrowbloxApp = App
 local WindUI
@@ -1485,6 +1526,185 @@ local function installAntiAFK()
     return true
 end
 
+local function resetWebhookSchedule()
+    local state = App.webhookState
+    state.generation = state.generation + 1
+    state.nextAt = os.clock() + App.config.webhook.intervalMinutes * 60
+    state.status = App.config.webhook.enabled and "Automatic reports are On." or "Automatic reports are Off."
+end
+local function setWebhookSetting(key, value)
+    assert(App.alive, "Script unloaded.")
+    assert(key == "url" or key == "enabled" or key == "intervalMinutes" or key == "includeBoxes", "Unknown webhook setting.")
+    local nextSettings = {}
+    for name, current in pairs(App.config.webhook) do nextSettings[name] = current end
+    nextSettings[key] = value
+    App.config.webhook = Core.validateWebhook(nextSettings)
+    resetWebhookSchedule()
+    if key == "enabled" and value then App.webhookState.nextAt = os.clock() end
+end
+local function reportText(value, limit)
+    return tostring(value):sub(1, limit or 250)
+end
+local function reportBox(point, itemId)
+    if not point then return "Not saved" end
+    if not itemId then return "Unavailable (choose a block)" end
+    local r = App.runtime
+    if not r or r.world.name ~= point.world then
+        return "Unavailable (box is in " .. reportText(point.world, 100) .. ")"
+    end
+    local ok, total = pcall(function() return Core.itemCount(boxRows(point), itemId) end)
+    if not ok then return "Unavailable (check the saved Display Box)" end
+    return tostring(total) .. " in " .. reportText(point.world, 100) .. " at " .. point.x .. ", " .. point.y
+end
+local function webhookPayload(config, profile, metrics)
+    metrics = metrics or {}
+    local r, fields = App.runtime, {}
+    local function field(name, value, inline)
+        table.insert(fields, {name = name, value = reportText(value, 700), inline = inline == true})
+    end
+    local blockId = config.blockId ~= 0 and config.blockId or nil
+    local seedId
+    if r and blockId then
+        local ok, id = pcall(Core.seedId, r.items, blockId)
+        if ok then seedId = id end
+    end
+    local function backpack(id)
+        if not r or not id then return "Unavailable" end
+        local ok, total = pcall(function()
+            if r.readInventoryView then return Core.itemCount(r.world.backpackNow(), id) end
+            return r.inventory:count(id)
+        end)
+        return ok and tostring(total) or "Unavailable"
+    end
+    local name = player.Name or tostring(player.UserId)
+    field("Player", reportText(player.DisplayName or name, 100) .. " (@" .. reportText(name, 100) .. ")", true)
+    field("World", r and r.world.name ~= "" and r.world.name or "World picker / unconnected", true)
+    field("Profile", reportText(profile, 48), true)
+    field("Level", metrics.level or "Unavailable", true)
+    field("Gems", metrics.gems or "Unavailable", true)
+    local mode = App.job == "pnb" and "Place & Break" or App.job == "transfer" and "Moving Drops" or "Off"
+    field("Farm status", mode .. (App.recovering and " (recovering)" or "") .. "\n" .. reportText(App.status, 600))
+    local item = r and blockId and r.items[blockId]
+    field("Selected block", item and (reportText(item.name or blockId, 100) .. " [" .. blockId .. "]") or "Not selected", true)
+    field("Backpack", "Blocks: " .. backpack(blockId) .. "\nSeeds: " .. backpack(seedId), true)
+    local minutes = math.floor((os.clock() - App.loadedAt) / 60)
+    field("This script session", "Time loaded: " .. minutes .. " min\nBlocks broken: " .. App.stats.broken
+        .. "\nGems collected: " .. App.stats.gems .. "\nBlocks moved: " .. App.stats.moved .. "\nTrips: " .. App.stats.trips)
+    if config.webhook.includeBoxes then
+        field("Block Display Box", reportBox(config.points.blockBox, blockId), true)
+        field("Seed Display Box", reportBox(config.points.seedBox, seedId), true)
+        field("Farm Display Box", reportBox(config.points.farmBox, blockId), true)
+    end
+    return { username = "Claris Growblox", allowed_mentions = {parse = {}}, embeds = {{
+        title = "Growblox player stats", color = 0x65C18C, fields = fields,
+        footer = {text = "Claris Growblox v" .. VERSION .. " | " .. os.date("!%Y-%m-%d %H:%M:%S UTC")},
+    }} }
+end
+local function webhookTransport()
+    local candidates = {request, http_request, env.request, env.http_request,
+        type(syn) == "table" and syn.request or false,
+        type(http) == "table" and http.request or false}
+    for _, fn in pairs(candidates) do if type(fn) == "function" then return fn end end
+end
+-- Reporting owns its own requests: a slow Discord connection cannot stop the farm.
+-- Keep unsettled requests reserved even after a timeout to prevent overlapping reports.
+local function beginWebhookRequest(fn, ...)
+    local arguments, state = table.pack(...), App.webhookState
+    local result = {done = false}
+    state.pending = state.pending + 1
+    task.spawn(function()
+        result.values = table.pack(pcall(fn, table.unpack(arguments, 1, arguments.n)))
+        result.done = true
+        state.pending = state.pending - 1
+    end)
+    return result
+end
+local function webhookMetrics()
+    local r, metrics = App.runtime, {}
+    if not r or not r.world.name or r.world.name == "" then return metrics end
+    local gems = beginWebhookRequest(r.world.call, "GetGems")
+    local level = beginWebhookRequest(r.world.call, "GetLevel")
+    local deadline = os.clock() + 8
+    while App.alive and not (gems.done and level.done) and os.clock() < deadline do task.wait(0.05) end
+    local function number(result)
+        local values = result.done and result.values
+        local value = values and values[1] and values[2]
+        if type(value) == "number" and value == value and value >= 0 and value < math.huge then return value end
+    end
+    metrics.gems, metrics.level = number(gems), number(level)
+    return metrics
+end
+local function discordRetry(response)
+    local retry
+    for key, value in pairs(type(response.Headers) == "table" and response.Headers or {}) do
+        if tostring(key):lower() == "retry-after" then retry = tonumber(value) end
+    end
+    if type(response.Body) == "string" then
+        local ok, body = pcall(decode, response.Body)
+        if ok and type(body) == "table" then retry = tonumber(body.retry_after) or retry end
+    end
+    if not retry or retry ~= retry or retry == math.huge then retry = 60 end
+    return math.max(1, math.min(retry, 86400))
+end
+local function sendWebhook(manual)
+    local state, now = App.webhookState, os.clock()
+    if not App.alive then return false, "Script unloaded." end
+    if state.inFlight or state.pending > 0 then return false, "Waiting for the previous report request to finish." end
+    if now < (state.retryAt or 0) then return false, "Discord requested a cooldown. Try again later." end
+    if state.lastAttempt and now - state.lastAttempt < 5 then return false, "Wait five seconds between reports." end
+    local valid, settings = pcall(Core.validateWebhook, App.config.webhook)
+    if not valid then return false, tostring(settings) end
+    if settings.url == "" then return false, "Set the Discord webhook URL first." end
+    if not manual and not settings.enabled then return false, "Automatic reports are Off." end
+    local transport = webhookTransport()
+    if not transport then
+        state.status = "Delta HTTP request function is unavailable."
+        state.nextAt = now + settings.intervalMinutes * 60
+        return false, state.status
+    end
+    local generation, config, profile = state.generation, App.config, App.profile
+    state.inFlight, state.lastAttempt = true, now
+    state.nextAt, state.status = now + settings.intervalMinutes * 60, "Sending player stats..."
+    task.spawn(function()
+        local ok, message = pcall(function()
+            local metrics = webhookMetrics()
+            if not App.alive or state.generation ~= generation then return end
+            local payload = webhookPayload(config, profile, metrics)
+            local response = beginWebhookRequest(transport, {
+                Url = settings.url .. "?wait=true", Method = "POST",
+                Headers = {["Content-Type"] = "application/json"}, Body = encode(payload),
+            })
+            local deadline = os.clock() + 15
+            while App.alive and not response.done and os.clock() < deadline do task.wait(0.05) end
+            if not App.alive or state.generation ~= generation then return end
+            assert(response.done, "Discord request timed out; waiting for it to settle before sending again.")
+            -- Executor exceptions/response bodies can contain the URL's secret token.
+            assert(response.values[1], "Discord request failed. Check your connection and webhook URL.")
+            local result = response.values[2]
+            assert(type(result) == "table", "Invalid response from the executor HTTP function.")
+            local status = tonumber(result.StatusCode or result.Status)
+            if status == 429 then
+                local seconds = discordRetry(result)
+                state.retryAt = os.clock() + seconds
+                error("Discord rate limit: retry after " .. math.ceil(seconds) .. " seconds.", 0)
+            end
+            assert(status and status >= 200 and status < 300 and result.Success ~= false,
+                "Discord rejected the report (HTTP " .. tostring(status or "unknown") .. "). Check your webhook URL.")
+            state.lastSent, state.status = os.date("%H:%M:%S"), "Report sent."
+        end)
+        state.inFlight = false
+        if not ok and App.alive and state.generation == generation then state.status = tostring(message) end
+    end)
+    return true
+end
+local function pollWebhook()
+    local state = App.webhookState
+    if App.alive and App.config.webhook.enabled and not App.configuring and App.runtime
+        and os.clock() >= (state.nextAt or 0) then
+        sendWebhook(false)
+    end
+end
+
 if env.ClarisGrowbloxTest then
     return { App = App, Core = Core, start = start, checkpoint = checkpoint,
         runTransfer = runTransfer, runPNB = runPNB, refreshInventory = refreshInventory,
@@ -1495,7 +1715,9 @@ if env.ClarisGrowbloxTest then
         syncRunToggles = syncRunToggles, setRunningEnabled = setRunningEnabled,
         Navigation = Navigation, navigationMap = navigationMap, moveTo = moveTo, worldCheck = worldCheck,
         recoverPNB = recoverPNB, recoverable = recoverable, installAntiAFK = installAntiAFK,
-        savePNBResume = savePNBResume, readPNBResume = readPNBResume, refreshPNBCheckpoint = refreshPNBCheckpoint }
+        savePNBResume = savePNBResume, readPNBResume = readPNBResume, refreshPNBCheckpoint = refreshPNBCheckpoint,
+        webhookPayload = webhookPayload, setWebhookSetting = setWebhookSetting,
+        resetWebhookSchedule = resetWebhookSchedule, sendWebhook = sendWebhook, pollWebhook = pollWebhook }
 end
 
 local function loadWindUI()
@@ -1517,6 +1739,7 @@ window:OnDestroy(function() App:destroy() end)
 local pnbTab = window:Tab({ Title = "Place & Break", Icon = "hammer" })
 local transferTab = window:Tab({ Title = "Moving Drops", Icon = "truck" })
 local profileTab = window:Tab({ Title = "Configurations", Icon = "save" })
+local webhookTab = window:Tab({ Title = "Discord Webhook", Icon = "bell" })
 local settingsTab = window:Tab({ Title = "Settings", Icon = "settings" })
 
 local function paragraphSet(paragraph, title, desc)
@@ -1666,12 +1889,23 @@ App.runToggles.transfer = transferTab:Toggle({ Title = "Moving Drops", Value = f
 
 local selectedProfile, profileNameInput, profileDropdown = nil, nil, nil
 local settingsControls = {}
+local webhookControls = {}
+local function syncWebhookControls()
+    App.syncingWebhookUI = true
+    for key, control in pairs(webhookControls) do
+        local value = App.config.webhook[key]
+        control:Set(key == "intervalMinutes" and tostring(value) or value)
+    end
+    App.syncingWebhookUI = false
+end
 local function syncUI()
     App.syncingUI = true
     for key, control in pairs(settingsControls) do control:Set(App.config.options[key]) end
     profileNameInput:Set(App.profile)
     if App.runtime then refreshBlocks() end
     updatePoints()
+    resetWebhookSchedule()
+    syncWebhookControls()
     App.syncingUI = false
 end
 local function profilePath(name)
@@ -1690,7 +1924,7 @@ local function listProfiles()
     if selectedProfile then profileDropdown:Select(selectedProfile) end
     return names
 end
-profileTab:Paragraph({ Title = "Named configurations", Desc = "Each profile saves the chosen block, every world/tile/standing position, and timing settings. Give each farm setup its own name. Files stay in Delta's ClarisGrowblox/profiles folder." })
+profileTab:Paragraph({ Title = "Named configurations", Desc = "Each profile saves the chosen block, saved locations, timing settings, and Discord webhook settings. Give each farm setup its own name. Files stay in Delta's ClarisGrowblox/profiles folder." })
 profileNameInput = profileTab:Input({ Title = "Profile name", Value = App.profile, Placeholder = "e.g. Sugar Cane - Farm 1", Callback = function() end })
 profileDropdown = profileTab:Dropdown({ Title = "Saved profiles", Values = {}, SearchBarEnabled = true,
     Callback = function(name) selectedProfile = name end })
@@ -1772,6 +2006,32 @@ profileTab:Button({ Title = "Clear saved transfer", Desc = "Use after checking a
     setStatus("Cleared saved transfer.")
 end) })
 
+webhookTab:Paragraph({ Title = "Discord player reports", Desc = "Send player level and gems, farm status, session totals, backpack blocks/seeds, and saved Display Box counts. Save the profile to keep these settings. Keep your webhook URL private." })
+local function webhookChanged(key)
+    return function(value)
+        if App.syncingWebhookUI or App.syncingUI then return end
+        if key == "intervalMinutes" then value = tonumber(value) end
+        local ok, message = pcall(setWebhookSetting, key, value)
+        if not ok then notify(tostring(message)) end
+        syncWebhookControls()
+    end
+end
+App.syncingWebhookUI = true
+webhookControls.url = webhookTab:Input({ Title = "Discord webhook URL", Value = App.config.webhook.url,
+    Placeholder = "https://discord.com/api/webhooks/...", Callback = webhookChanged("url") })
+webhookControls.intervalMinutes = webhookTab:Input({ Title = "Send every (minutes)", Value = tostring(App.config.webhook.intervalMinutes),
+    Desc = "Enter 1-1440 minutes, for example 1, 5, or 30.", Placeholder = "5", Callback = webhookChanged("intervalMinutes") })
+webhookControls.includeBoxes = webhookTab:Toggle({ Title = "Include Display Box counts", Value = App.config.webhook.includeBoxes,
+    Desc = "Count selected blocks/seeds in saved boxes. Boxes in another world show as unavailable.", Callback = webhookChanged("includeBoxes") })
+webhookControls.enabled = webhookTab:Toggle({ Title = "Automatic webhook reports", Value = App.config.webhook.enabled,
+    Desc = "On sends a report, then repeats at your interval while the script is loaded. Off stops future reports.", Callback = webhookChanged("enabled") })
+App.syncingWebhookUI = false
+webhookTab:Button({ Title = "Send stats now", Callback = function()
+    local ok, message = sendWebhook(true)
+    if not ok then notify(message) end
+end })
+ui.webhookStatus = webhookTab:Paragraph({ Title = "Webhook status", Desc = App.webhookState.status })
+
 settingsTab:Paragraph({ Title = "Settings", Desc = "These settings are saved separately in each named configuration." })
 for _, info in ipairs({
     {"antiAFK", "Anti-AFK", "Keep the session active when Roblox detects idle time."},
@@ -1832,6 +2092,7 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nAnti-AFK: " .. (App.antiAFKError or "ready")
         .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
         .. "\nRecovery save: " .. (App.recoverySaveError or "ready")
+        .. "\nWebhook: " .. App.webhookState.status .. "\nWebhook pending requests: " .. App.webhookState.pending
         .. "\n" .. table.concat(App.discoveryReport, "\n")
     local clipboard = setclipboard or toclipboard
     if clipboard then clipboard(text); notify("Diagnostics copied.") else print(text); notify("Diagnostics printed to the console.") end
@@ -1879,6 +2140,7 @@ task.spawn(function()
     while App.alive do
         syncRunToggles()
         refreshPNBCheckpoint()
+        pollWebhook()
         local suffix = "\nProfile: " .. App.profile .. "  |  Blocks broken: " .. App.stats.broken
             .. "  |  Trips: " .. App.stats.trips .. "  |  Blocks moved: " .. App.stats.moved
             .. "  |  Gems collected: " .. App.stats.gems
@@ -1886,6 +2148,14 @@ task.spawn(function()
             paragraphSet(ui.status, "Status", App.status .. suffix)
             paragraphSet(ui.transferStatus, "Status", App.status .. suffix)
             paragraphSet(ui.log, "Recent activity", table.concat(App.logs, "\n"))
+            local state = App.webhookState
+            local details = state.status .. "\nInterval: " .. App.config.webhook.intervalMinutes .. " min"
+                .. "\nLast sent: " .. (state.lastSent or "Never")
+            if App.config.webhook.enabled then
+                local nextAt = math.max(state.nextAt or os.clock(), state.retryAt or 0)
+                details = details .. "\nNext report in: " .. math.ceil(math.max(0, nextAt - os.clock()) / 60) .. " min"
+            end
+            paragraphSet(ui.webhookStatus, "Webhook status", details)
         end)
         task.wait(1)
     end

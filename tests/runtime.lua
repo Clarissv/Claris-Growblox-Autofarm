@@ -17,6 +17,7 @@ local function fixture()
     local env, files, encoded, queue = { ClarisGrowbloxTest = true }, {}, {}, {}
     local ticks, serial = 0, 0
     local context = { pickups = 0, displays = 0 }
+    request, http_request, syn, http = nil, nil, nil, nil
     os.clock = function() return ticks end
     getgenv = function() return env end
     isfile = function(path) return files[path] ~= nil end
@@ -34,7 +35,7 @@ local function fixture()
         end,
         JSONDecode = function(_, text) return encoded[text] end,
     }
-    local localPlayer = { UserId = 1234, GetAttribute = function() return nil end }
+    local localPlayer = { UserId = 1234, Name = "TestPlayer", DisplayName = "Test Player", GetAttribute = function() return nil end }
     local services = {
         HttpService = http, Players = { LocalPlayer = localPlayer },
         ReplicatedStorage = { GetAttribute = function() return "session-registry" end },
@@ -60,6 +61,7 @@ local function fixture()
 -- CLARIS_RUNTIME_SOURCE
     end)()
     context.hooks, context.env, context.files = hooks, env, files
+    context.encoded = encoded
     local app = hooks.App
     app.config.blockId = 954
     local function point(world, x)
@@ -1144,6 +1146,251 @@ test("Backpack snapshots can populate the selector without private inventory upv
     f.inventory:add(954, 10)
     r.readInventoryView()
     assert(r.inventory:count(954) == 71)
+end)
+
+local function reportField(payload, name)
+    for _, field in ipairs(payload.embeds[1].fields) do if field.name == name then return field.value end end
+end
+local function setupWebhook(f)
+    f.posts = {}
+    f.hooks.setWebhookSetting("url", "https://discord.com/api/webhooks/123/test_token")
+    f.server = function(name)
+        if name == "GetGems" then return 12345 end
+        assert(name == "GetLevel", "Reporting must not issue inventory or storage actions")
+        return 12, 500, 1000
+    end
+    f.env.request = function(options)
+        f.posts[#f.posts + 1] = options
+        return {StatusCode = 204, Success = true}
+    end
+end
+
+test("Discord stats include player, session totals, backpack, and matching mixed-box counts", function()
+    local f = fixture()
+    f.inventory:add(954, 17)
+    f.inventory:add(955, 45)
+    f.boxes[12] = {{954, 1000}, {955, 10}, {954, 300}}
+    f.app.stats.broken, f.app.stats.gems, f.app.stats.trips, f.app.stats.moved = 30, 55, 2, 400
+    local payload = f.hooks.webhookPayload(f.app.config, "Sugar Cane", {level = 12, gems = 0})
+    assert(reportField(payload, "Player"):find("TestPlayer", 1, true))
+    assert(reportField(payload, "World") == "BREAK" and reportField(payload, "Profile") == "Sugar Cane")
+    assert(reportField(payload, "Level") == "12" and reportField(payload, "Gems") == "0")
+    assert(reportField(payload, "Backpack") == "Blocks: 17\nSeeds: 45")
+    assert(reportField(payload, "Block Display Box"):find("1300 in BREAK", 1, true))
+    assert(reportField(payload, "Seed Display Box"):find("500 in BREAK", 1, true))
+    assert(reportField(payload, "Farm Display Box"):find("Unavailable", 1, true))
+    assert(reportField(payload, "This script session"):find("Blocks broken: 30", 1, true))
+    assert(#payload.allowed_mentions.parse == 0 and #f.boxes[12] == 3)
+    assert(f.app.pending == 0 and f.app.stats.moved == 400)
+end)
+
+test("Box reports distinguish empty boxes, missing places, and invalid saved tiles", function()
+    local f = fixture()
+    f.boxes[12] = {}
+    f.app.config.points.farmBox = nil
+    f.world.fg[8][8] = 0
+    local payload = f.hooks.webhookPayload(f.app.config, "Default")
+    assert(reportField(payload, "Block Display Box"):find("0 in BREAK", 1, true))
+    assert(reportField(payload, "Seed Display Box"):find("Unavailable", 1, true))
+    assert(reportField(payload, "Farm Display Box") == "Not saved")
+    f.world.name = ""
+    payload = f.hooks.webhookPayload(f.app.config, "Default")
+    assert(reportField(payload, "World") == "World picker / unconnected")
+    assert(reportField(payload, "Block Display Box"):find("Unavailable", 1, true))
+end)
+
+test("Display Box reporting can be disabled without requiring a farming setup", function()
+    local f = fixture()
+    f.hooks.setWebhookSetting("includeBoxes", false)
+    f.app.config.blockId, f.app.config.points = 0, {}
+    local payload = f.hooks.webhookPayload(f.app.config, "New Farm")
+    assert(reportField(payload, "Block Display Box") == nil and reportField(payload, "Seed Display Box") == nil)
+    assert(reportField(payload, "Backpack") == "Blocks: Unavailable\nSeeds: Unavailable")
+end)
+
+test("Send now posts JSON using Delta's HTTP function while automatic reports are Off", function()
+    local f = fixture()
+    setupWebhook(f)
+    assert(f.hooks.sendWebhook(true))
+    assert(not f.app.config.webhook.enabled and #f.posts == 1)
+    local options, state = f.posts[1], f.app.webhookState
+    assert(options.Method == "POST" and options.Headers["Content-Type"] == "application/json")
+    assert(options.Url == "https://discord.com/api/webhooks/123/test_token?wait=true")
+    assert(reportField(f.encoded[options.Body], "Gems") == "12345")
+    assert(reportField(f.encoded[options.Body], "Level") == "12")
+    assert(state.status == "Report sent." and state.lastSent and state.pending == 0)
+    assert(f.app.job == "transfer" and f.app.pending == 0)
+end)
+
+test("Automatic reporting converts entered minutes to seconds and stops when switched Off", function()
+    local f = fixture()
+    setupWebhook(f)
+    f.hooks.setWebhookSetting("intervalMinutes", 1.5)
+    f.hooks.setWebhookSetting("enabled", true)
+    f.hooks.pollWebhook()
+    assert(#f.posts == 1)
+    task.wait(89)
+    f.hooks.pollWebhook()
+    assert(#f.posts == 1)
+    task.wait(1)
+    f.hooks.pollWebhook()
+    assert(#f.posts == 2)
+    f.hooks.setWebhookSetting("enabled", false)
+    task.wait(300)
+    f.hooks.pollWebhook()
+    assert(#f.posts == 2 and f.app.job == "transfer")
+end)
+
+test("Changing minutes while farming reschedules reports and invalid input preserves settings", function()
+    local f = fixture()
+    setupWebhook(f)
+    f.hooks.setWebhookSetting("enabled", true)
+    f.hooks.pollWebhook()
+    f.hooks.setWebhookSetting("intervalMinutes", 2)
+    rejects(function() f.hooks.setWebhookSetting("intervalMinutes", nil) end, "interval")
+    assert(f.app.config.webhook.intervalMinutes == 2)
+    task.wait(119)
+    f.hooks.pollWebhook()
+    assert(#f.posts == 1)
+    task.wait(1)
+    f.hooks.pollWebhook()
+    assert(#f.posts == 2 and f.app.job == "transfer")
+end)
+
+test("Manual reports respect a cooldown even with automatic reporting disabled", function()
+    local f = fixture()
+    setupWebhook(f)
+    assert(f.hooks.sendWebhook(true))
+    local ok, message = f.hooks.sendWebhook(true)
+    assert(not ok and message:find("five seconds", 1, true) and #f.posts == 1)
+    task.wait(5)
+    assert(f.hooks.sendWebhook(true) and #f.posts == 2)
+end)
+
+test("Missing executor HTTP support does not issue game requests or interrupt farming", function()
+    local f = fixture()
+    setupWebhook(f)
+    f.env.request = nil
+    f.server = function() error("Must check HTTP support before fetching stats") end
+    local ok, message = f.hooks.sendWebhook(true)
+    assert(not ok and message:find("unavailable", 1, true))
+    assert(f.app.job == "transfer" and f.app.pending == 0 and f.app.webhookState.pending == 0)
+end)
+
+test("Network exceptions and rejected responses never expose webhook tokens in diagnostics", function()
+    local f = fixture()
+    setupWebhook(f)
+    f.env.request = function() error("connection failed to https://discord.com/api/webhooks/123/test_token") end
+    assert(f.hooks.sendWebhook(true))
+    assert(f.app.webhookState.status:find("request failed", 1, true))
+    assert(not f.app.webhookState.status:find("test_token", 1, true) and #f.app.logs == 0)
+    task.wait(5)
+    f.env.request = function() return {StatusCode = 404, Body = "test_token"} end
+    f.hooks.sendWebhook(true)
+    assert(f.app.webhookState.status:find("HTTP 404", 1, true))
+    assert(not f.app.webhookState.status:find("test_token", 1, true) and f.app.job == "transfer")
+end)
+
+test("Discord rate limits delay both automatic and manual reports", function()
+    local f = fixture()
+    setupWebhook(f)
+    f.hooks.setWebhookSetting("intervalMinutes", 1)
+    f.hooks.setWebhookSetting("enabled", true)
+    f.env.request = function()
+        return {StatusCode = 429, Body = f.services.HttpService:JSONEncode({retry_after = 120})}
+    end
+    f.hooks.pollWebhook()
+    assert(f.app.webhookState.retryAt == 120)
+    f.env.request = function(options) f.posts[#f.posts + 1] = options; return {StatusCode = 200} end
+    task.wait(119)
+    f.hooks.pollWebhook()
+    assert(not f.hooks.sendWebhook(true) and #f.posts == 0)
+    task.wait(1)
+    f.hooks.pollWebhook()
+    assert(#f.posts == 1 and f.app.webhookState.status == "Report sent.")
+end)
+
+test("Unavailable level or gem stats still allow a report with clearly unavailable values", function()
+    local f = fixture()
+    setupWebhook(f)
+    f.server = function(name)
+        if name == "GetGems" then return {} end
+        error("GetLevel unsupported")
+    end
+    f.hooks.sendWebhook(true)
+    local payload = f.encoded[f.posts[1].Body]
+    assert(reportField(payload, "Gems") == "Unavailable" and reportField(payload, "Level") == "Unavailable")
+    assert(reportField(payload, "Block Display Box"):find("1000", 1, true))
+end)
+
+local function deferReportRequests(f, firstDeferred)
+    -- The Lua 5.1 runner cannot yield through pcall; delay spawned request
+    -- completion explicitly instead of using Luau's yielding coroutines.
+    f.delayed = {}
+    local launches = 0
+    f.spawn = function(fn, ...)
+        launches = launches + 1
+        if launches < firstDeferred then return fn(...) end
+        local arguments = table.pack(...)
+        f.delayed[#f.delayed + 1] = function() return fn(table.unpack(arguments, 1, arguments.n)) end
+    end
+end
+
+test("A timed-out Discord request remains reserved until its late response settles", function()
+    local f = fixture()
+    setupWebhook(f)
+    deferReportRequests(f, 4) -- Worker and both stat queries run; HTTP completion is delayed.
+    f.hooks.sendWebhook(true)
+    local state = f.app.webhookState
+    assert(state.status:find("timed out", 1, true) and state.pending == 1 and not state.inFlight)
+    assert(f.app.pending == 0 and f.app.job == "transfer" and not f.hooks.sendWebhook(true))
+    assert(#f.posts == 0 and #f.delayed == 1)
+    f.delayed[1]()
+    assert(state.pending == 0 and state.lastSent == nil)
+    f.spawn = nil
+    assert(f.hooks.sendWebhook(true) and #f.posts == 2 and state.lastSent)
+end)
+
+test("Disabling reporting during a stat query cancels its pending post", function()
+    local f = fixture()
+    setupWebhook(f)
+    deferReportRequests(f, 2) -- Both stat-query completions are delayed.
+    f.hooks.setWebhookSetting("enabled", true)
+    f.onWait = function()
+        f.onWait = nil
+        f.hooks.setWebhookSetting("enabled", false)
+    end
+    f.hooks.pollWebhook()
+    assert(#f.posts == 0 and f.app.webhookState.pending == 2 and f.app.pending == 0)
+    for _, complete in ipairs(f.delayed) do complete() end
+    assert(f.app.webhookState.pending == 0 and not f.app.config.webhook.enabled)
+    f.hooks.pollWebhook()
+    assert(#f.posts == 0)
+end)
+
+test("Reloading a different profile reschedules reporting and unload prevents future sends", function()
+    local f = fixture()
+    setupWebhook(f)
+    f.hooks.setWebhookSetting("enabled", true)
+    f.hooks.pollWebhook()
+    local oldGeneration = f.app.webhookState.generation
+    f.app.config = f.hooks.Core.defaults()
+    f.hooks.resetWebhookSchedule()
+    assert(f.app.webhookState.generation > oldGeneration and not f.app.config.webhook.enabled)
+    task.wait(300)
+    f.hooks.pollWebhook()
+    assert(#f.posts == 1)
+    f.app:destroy()
+    assert(not f.hooks.sendWebhook(true))
+    f.hooks.pollWebhook()
+    assert(#f.posts == 1)
+end)
+
+test("Discord reporting supports the http_request executor fallback", function()
+    local f = fixture()
+    setupWebhook(f)
+    http_request, f.env.request = f.env.request, nil
+    assert(f.hooks.sendWebhook(true) and #f.posts == 1)
 end)
 
 return string.format("%d actual-script runtime tests passed (mock services/server)", passed)

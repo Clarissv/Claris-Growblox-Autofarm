@@ -163,4 +163,55 @@ test("Invalid anti-AFK or world-recovery values are rejected", function()
     rejects(function() Core.validate(config) end, "autoRejoin")
 end)
 
+test("Older profiles default to disabled Discord reports without losing saved places", function()
+    local config = setup()
+    config.webhook = nil
+    local saved = Core.validate(config)
+    assert(saved.webhook.url == "" and not saved.webhook.enabled and saved.webhook.includeBoxes)
+    assert(saved.webhook.intervalMinutes == 5 and saved.points.pnb.x == 10)
+end)
+
+test("Profiles preserve independent webhook URLs, toggles, and minutes", function()
+    local config = setup()
+    config.webhook = {url = " https://discord.com/api/webhooks/123/test_token ", enabled = true,
+        intervalMinutes = 2.5, includeBoxes = false}
+    local saved = Core.validate(config)
+    assert(saved.webhook.url == "https://discord.com/api/webhooks/123/test_token")
+    assert(saved.webhook.enabled and not saved.webhook.includeBoxes and saved.webhook.intervalMinutes == 2.5)
+    saved.webhook.intervalMinutes = 30
+    assert(config.webhook.intervalMinutes == 2.5)
+end)
+
+test("Webhook URLs require the real Discord host and a webhook endpoint", function()
+    assert(Core.webhookURL("https://discord.com/api/v10/webhooks/123/test_token/")
+        == "https://discord.com/api/v10/webhooks/123/test_token")
+    assert(Core.webhookURL("https://discordapp.com/api/webhooks/123/test-token"))
+    for _, url in ipairs({"http://discord.com/api/webhooks/123/test", "https://example.com/api/webhooks/123/test",
+        "https://discord.com.evil.test/api/webhooks/123/test", "https://discord.com/api/users/123/test",
+        "https://discord.com/api/webhooks/123/test?redirect=elsewhere", "https://discord.com@evil.test/api/webhooks/123/test"}) do
+        rejects(function() Core.webhookURL(url) end)
+    end
+end)
+
+test("Invalid intervals and incomplete webhook settings are rejected", function()
+    for _, value in ipairs({0, 0.5, 1441, math.huge, "5", 0/0}) do
+        local config = setup()
+        config.webhook.intervalMinutes = value
+        rejects(function() Core.validate(config) end, "interval")
+    end
+    local config = setup()
+    config.webhook.enabled = true
+    rejects(function() Core.validate(config) end, "URL")
+    config.webhook.enabled, config.webhook.includeBoxes = false, "yes"
+    rejects(function() Core.validate(config) end, "toggles")
+end)
+
+test("Reporting counts matching stacks in mixed boxes and rejects damaged contents", function()
+    local rows = {{954, 10}, {955, 50}, {954, 20}}
+    assert(Core.itemCount(rows, 954) == 30 and Core.itemCount(rows, 955) == 50)
+    assert(#rows == 3 and rows[1][2] == 10 and Core.itemCount({}, 954) == 0)
+    rejects(function() Core.itemCount(nil, 954) end, "unavailable")
+    rejects(function() Core.itemCount({{954, -1}}, 954) end, "Invalid")
+end)
+
 return string.format("%d configuration/layout/storage tests passed", passed)

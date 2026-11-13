@@ -15,6 +15,7 @@ function Core.defaults()
         version = Core.VERSION, blockId = 0, points = {},
         options = { placeDelay = 0.2, punchDelay = 0.24, collectDelay = 0.1,
             actionTimeout = 10, moveTimeout = 30, seedThreshold = 200, antiAFK = true, autoRejoin = true },
+        webhook = { url = "", enabled = false, intervalMinutes = 5, includeBoxes = true },
     }
 end
 
@@ -34,11 +35,37 @@ function Core.profileName(value)
     return name
 end
 
+function Core.webhookURL(value)
+    assert(type(value) == "string", "Enter a Discord webhook URL.")
+    local url = value:match("^%s*(.-)%s*$")
+    if url == "" then return url end
+    local host, path = url:match("^https://([^/]+)/api/(.+)$")
+    assert(host and (host == "discord.com" or host == "discordapp.com"
+        or host == "canary.discord.com" or host == "ptb.discord.com"), "Use an HTTPS Discord webhook URL.")
+    path = path:gsub("^v%d+/", ""):gsub("/$", "")
+    assert(#url <= 300 and path:match("^webhooks/%d+/[%w_%-]+$"), "Use a valid Discord webhook URL.")
+    return url:gsub("/$", "")
+end
+
+function Core.validateWebhook(input)
+    local out = Core.defaults().webhook
+    if input == nil then return out end
+    assert(type(input) == "table", "Invalid webhook settings.")
+    out.url = Core.webhookURL(input.url)
+    assert(type(input.enabled) == "boolean" and type(input.includeBoxes) == "boolean", "Invalid webhook toggles.")
+    assert(finite(input.intervalMinutes) and input.intervalMinutes >= 1 and input.intervalMinutes <= 1440,
+        "Webhook interval must be between 1 and 1440 minutes.")
+    assert(not input.enabled or out.url ~= "", "Set the Discord webhook URL before enabling reports.")
+    out.enabled, out.includeBoxes, out.intervalMinutes = input.enabled, input.includeBoxes, input.intervalMinutes
+    return out
+end
+
 function Core.validate(input)
     assert(type(input) == "table" and input.version == Core.VERSION, "Unsupported or damaged profile.")
     assert(integer(input.blockId, 0, 65535), "Invalid block ID in profile.")
     assert(type(input.points) == "table" and type(input.options) == "table", "Incomplete profile.")
     local out = Core.defaults()
+    out.webhook = Core.validateWebhook(input.webhook)
     out.blockId = input.blockId
     for key, limits in pairs(Core.LIMITS) do
         local value = input.options[key]
@@ -104,6 +131,18 @@ function Core.storageCount(rows, itemId)
         count = count + row[2]
     end
     return count
+end
+
+-- Reporting can count the selected item in mixed boxes without changing them.
+function Core.itemCount(rows, itemId)
+    assert(type(rows) == "table", "Display contents are unavailable.")
+    local total = 0
+    for _, row in pairs(rows) do
+        assert(type(row) == "table" and integer(row[1], 0, 65535)
+            and integer(row[2], 0, 4294967295), "Invalid display contents.")
+        if row[1] == itemId then total = total + row[2] end
+    end
+    return total
 end
 
 function Core.checkSetup(config, mode, items)

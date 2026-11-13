@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.6.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.7.
+
+Version 0.1.7 adds a Discord Webhook tab with Send stats now, an automatic reporting toggle, an interval input in minutes, and optional saved Display Box counts. Reports include player level and gem balance, world/profile, farm status, backpack blocks/seeds, and session totals. Webhook settings are saved per profile; older profiles default to reports Off.
 
 Version 0.1.6 fixes a false movement timeout during storage refill or the return to PNB. Waypoints and the final destination now use the same arrival checks, so an avatar slightly off-center on the saved tile finishes moving and resumes farming.
 
@@ -19,6 +21,7 @@ Version 0.1.1 fixes startup when Delta's `shared` table differs from the game's 
 - **Place & Break:** choose a block from your inventory, place one directly above your saved PNB position, break it, collect nearby loose gems, seeds, and returned blocks, and repeat. Refill from the right Display Box when the backpack runs out. Put seeds in the left Display Box at the configured count, which defaults to 200. Stop when both backpack and block storage are empty.
 - **Moving Drops:** take the selected blocks from a dedicated farm Display Box, use the linked door to the breaking world, deposit the trip's blocks in the PNB storage box, and return through the other linked door. Continue until stopped or the farm box is empty. Harvesting remains manual.
 - **Named configurations:** Save, Load, New, and Delete multiple profiles containing the chosen block, every saved world and tile, the position from which to access each box/door, and timing settings.
+- **Discord reports:** send stats manually or automatically every 1-1440 minutes, defaulting to five. Include selected block/seed counts from the saved storage boxes in the current world. Reporting runs independently of farming and respects Discord cooldowns.
 - **Anti-AFK:** responds to Roblox's idle event while the script is loaded. Disable it in Settings or unload the script to stop it. The setting is saved per profile.
 - **World and position recovery:** PNB automatically rejoins its saved world when Growblox sends the avatar to the world picker. It waits for loading/respawn and returns to the breaking spot through reachable floors and platforms. Stop cancels recovery. Rejoin is saved per profile and defaults to On, including profiles from earlier versions.
 - **Control and recovery:** one task runs at a time. Turn its toggle Off to restore the game controls. The toggle also turns Off when the task completes or encounters an error. Server confirmations, request timeouts, and transfer checkpoints prevent an unsuccessful action from silently advancing the loop.
@@ -57,7 +60,7 @@ For an existing checkout with the GitHub remote configured, upload this rebuilt 
 ```powershell
 Set-Location -LiteralPath 'F:\VSCode\Luau\Claris Growblox Autofarm\logic'
 git add .
-git commit -m "Fix PNB movement after storage refill"
+git commit -m "Add Discord stats reports with configurable minutes"
 git push
 ```
 
@@ -93,6 +96,21 @@ When a linked door changes Roblox servers, Delta's teleport queue reloads the Gi
 
 An interrupted storage request leaves a `pickupPending` or `depositPending` checkpoint. Check the backpack and both boxes before pressing **Clear saved transfer** and starting again. This avoids repeating a storage action whose result was lost. Normal Stop clears the automatic resume checkpoint; restarting starts a fresh task.
 
+## Set up Discord reports
+
+1. In Discord, open the destination channel's settings, choose **Integrations → Webhooks**, create a webhook, and copy its URL.
+2. In the script's **Discord Webhook** tab, paste the URL into **Discord webhook URL**.
+3. Enter your interval in **Send every (minutes)**, for example `1`, `5`, or `30`. Values from 1 to 1440 are accepted, including decimals such as `1.5`.
+4. Leave **Include Display Box counts** On to report the saved block box, seed box, and farm box. Select the block and save these boxes using the existing setup controls. Reports count only the selected block or its seed, including matching stacks in a mixed box. Farming still requires dedicated storage.
+5. Press **Send stats now** to check delivery, then turn **Automatic webhook reports** On. Enabling sends a report and starts the interval. Editing the interval schedules the next report from that change; manual sends also restart the interval. Discord's retry delay can postpone a report.
+6. Use **Configurations → Save profile / Save as** to keep the URL, interval, and toggles. Webhook controls can be changed while farming; saving a profile retains the existing requirement to stop the farm first.
+
+Reports include Roblox player name, Growblox level and gem balance, current world/profile, farm status, selected block, backpack blocks/seeds, and blocks broken, gems collected, trips, and blocks moved during this script session. Session totals reset when reloading the script. Level and gem balance use the game's read-only APIs; failed or slow queries show **Unavailable**. Backpack and box counts come from the client's current data without moving the avatar or taking anything from storage. Boxes in another world, missing saved locations, or invalid saved tiles are marked explicitly; the reporter does not enter another world to read them.
+
+Automatic reporting continues while the script is loaded, including when the farm is Off or recovering. Turn its reporting toggle Off or unload the script to end future reports. A request already sent can still finish. **Webhook status** shows delivery results, last successful send, and the next interval. HTTP errors and Discord rate limits do not stop farming. Reports wait for unsettled requests before sending again. Delta must expose `request`, `http_request`, or a supported equivalent for Discord delivery.
+
+The webhook URL is saved in the local profile and farm recovery files. Keep those files and the URL private. The URL is excluded from reports and copied diagnostics; the project's gitignore excludes the local `ClarisGrowblox` data folder.
+
 ## Configuration files
 
 Profiles are saved in Delta's local `ClarisGrowblox/profiles/<name>.json` files. Saving again under a different name creates another profile. Loading a profile changes the script's selected block, saved locations, and settings; it does not move the player.
@@ -113,7 +131,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.6 passes 77 offline checks: 14 configuration/layout/storage tests, 61 tests executing the generated runtime against mock services and a mock server, and two release checks. New regression cases verify centering from either side of the destination tile and a complete storage refill, return to the dirt, placement, and break. Existing checks cover a simulated climb through a side entrance, inaccessible/harmful supports, navigation/rejoin cancellation, picker and respawn recovery, anti-AFK settings and cleanup, PNB recovery checkpoints, drops, inventory, and toggles. Live server acceptance, actual navigation, and Delta's teleport queue still need in-game verification.
+Version 0.1.7 passes 97 offline checks: 19 configuration/layout/storage tests, 76 tests executing the generated runtime against mock services and a mock server, and two release checks. New webhook checks cover backward-compatible profiles, URL and interval validation, mixed/empty/unavailable box counts, actual POST options and payload, minutes-to-seconds scheduling, settings changes during farming, manual cooldowns, Discord rate limits, token-safe errors, executor fallback, and cancellation/late responses. Existing navigation, refill, drop, inventory, recovery, anti-AFK, and toggle checks remain. Live game/server behavior, Delta's teleport queue, and real Discord delivery still need in-game verification.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 
