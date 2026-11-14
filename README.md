@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.16.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.17.
+
+Version 0.1.17 speeds up Moving Drops attachment after script reloads and server changes. Startup attaches movement, storage, and the live backpack first; punching and planting hooks are discovered when their tasks start. The loader caches verified release files locally and starts both downloads together when a release is new. Transfer trips use four inventory reads rather than six, preserving before/after confirmation for each storage action. Door entry and resumed transfers wait for the destination avatar to be ready instead of imposing the old half-second door wait and three-second teleport startup delay. Diagnostics show attachment time, cached/downloaded files, and the last door's readiness wait.
 
 Version 0.1.16 fixes Harvest Drops stopping for upper-row blocks while walking on the row below. After the server rejects distant pickup, navigation and collection stops require the native horizontal distance and vertical body overlap. A refusal during a row pass releases that stack for a precise approach instead of consuming all retries while holding off-center. Diagnostics include the rejected pickup's avatar position, distance to the drop, and overlap result. Session restore warnings now distinguish account mismatch from unsupported save schema and appear separately from save failures.
 
@@ -80,7 +82,7 @@ For an existing checkout with the GitHub remote configured, upload this rebuilt 
 ```powershell
 Set-Location -LiteralPath 'F:\VSCode\Luau\Claris Growblox Autofarm\logic'
 git add .
-git commit -m "Fix harvest pickup reach and refusal recovery"
+git commit -m "Speed up Moving Drops reloads and transfers"
 git push
 ```
 
@@ -127,6 +129,8 @@ Pickup routes and walking returns to storage search the full world, including di
 The script records only the newly withdrawn blocks as each trip's cargo. Blocks already in the backpack are retained. If the backpack has no room, free up space before starting.
 
 When a linked door changes Roblox servers, Delta's teleport queue reloads the GitHub loader and resumes the saved transfer when that executor function is available. If Delta does not expose a teleport queue, execute the loader again after arrival and press **Configurations → Resume saved transfer**.
+
+After a release's first load, the loader reuses its validated main script and WindUI files from `ClarisGrowblox/cache/<revision>` across server changes. A new release downloads its own files; damaged cache files are fetched again. If Delta's file functions are unavailable or cache writes fail, loading continues with ordinary downloads. The small GitHub loader is still fetched to select the current release. Startup skips the full punching/planting function scan for Moving Drops and Harvest Drops. Place & Break and Planting perform that scan when selected. Transfers proceed as soon as the destination world and avatar are ready, with request timeouts and cargo checkpoints retained.
 
 An interrupted storage request leaves a `pickupPending` or `depositPending` checkpoint. Check the backpack and both boxes before pressing **Clear saved transfer** and starting again. This avoids repeating a storage action whose result was lost. Normal Stop clears the automatic resume checkpoint; restarting starts a fresh task.
 
@@ -183,7 +187,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.15 passes 190 offline checks: 28 configuration/layout/storage tests, 160 tests executing the generated runtime against mock services and a mock server, and two release checks. New regression checks ensure the player does not pass a partially collected stack with delayed replies, waits for pending/readiness delays, clears twelve nearby UIDs across multiple batches, and honors Stop while a stack is pending. Long pickup waits do not trigger a walking-route replan. Existing startup, attachment, planting, PNB, harvest, navigation, respawn, webhook, recovery, anti-AFK, and storage checks remain. These mocks do not establish live speed gains, Delta frame times, planting reach, route geometry, world permissions, teleport queue behavior, or Discord delivery.
+Version 0.1.17 passes 204 offline checks: 28 configuration/layout/storage tests, 168 tests executing the generated runtime against mock services and a mock server, six generated-loader cache/download tests, and two release checks. Added checks cover exact transfer cargo and four inventory reads per trip, immediate and delayed door readiness, resumed avatar loading and Stop, deferred punching-hook discovery with 5,000 unrelated functions, concurrent downloads, cache reuse in a new server environment, cache corruption, unavailable file functions, and rejected downloads. Existing startup, attachment, planting, PNB, harvest, navigation, respawn, webhook, recovery, anti-AFK, and storage checks remain. These mocks do not establish live speed gains, Delta frame times, planting reach, route geometry, world permissions, teleport queue behavior, or Discord delivery.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 

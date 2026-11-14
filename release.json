@@ -1,9 +1,9 @@
 {
-  "version": "0.1.16",
-  "revision": "384442ebf1ca789a0086",
-  "base": "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/releases/384442ebf1ca789a0086/",
+  "version": "0.1.17",
+  "revision": "4774bf142d2e2b766355",
+  "base": "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/releases/4774bf142d2e2b766355/",
   "files": {
-    "main.lua": "662f318295faf0ee13fd72d72146bbc4d028ca7a9494b91a924ec1421355e512",
+    "main.lua": "88207cb3473bfe66f114ab00e0f9759766573ba8ecd621e5e067ec26a0a3a851",
     "vendor/WindUI.lua": "e29ebad6907d6293731d1de042d6aec4a9428fcddbed8a8f19ef5f4ce05c6d05",
     "vendor/WindUI.LICENSE": "44d844d76e61f8a2ce40cba22d1962d65153c8f140d94d52eb2cbad3c25f6020"
   }

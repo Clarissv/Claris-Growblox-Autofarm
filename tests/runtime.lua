@@ -811,6 +811,85 @@ test("Delivery transfers exact tracked cargo and preserves existing inventory", 
     assert(f.app.stats.trips == 1 and f.app.stats.moved == 50)
     assert(f.app.resume.phase == "return" and f.app.resume.cargo == 0)
 end)
+
+test("Moving Drops uses four inventory reads per trip and preserves existing blocks", function()
+    local f = fixture()
+    f.world.name = "FARM"
+    f.world.fg[8][21] = 12
+    f.inventory:add(954, 20)
+    local held, reads, doors = 20, 0, 0
+    local boxes = {FARM = {[20] = {{954, 300}}}, BREAK = {[12] = {}}}
+    f.world.displays.get = function(x) return boxes[f.world.name][x] or {} end
+    f.world.enter = function(name) f.world.name = name; return true end
+    f.server = function(name, x, y, id, _, _, n)
+        if name == "GetInventory" then
+            reads = reads + 1
+            return {slots = {{954, held}}, capacity = 54}
+        end
+        if name == "UseDoor" then
+            doors = doors + 1
+            return true, {enter = f.world.name == "FARM" and "BREAK" or "FARM"}
+        end
+        assert(name == "DisplayItem")
+        local storage = boxes[f.world.name]
+        local before = f.hooks.Core.storageCount(storage[x], 954)
+        if not id then
+            assert(f.app.resume.phase == "pickupPending")
+            local taken = math.min(before, 200 - held)
+            storage[x], held = {{954, before - taken}}, held + taken
+            return true, {taken = {{954, taken}}}
+        end
+        assert(n <= held and f.app.resume.phase == "depositPending")
+        storage[x], held = {{954, before + n}}, held - n
+        return true
+    end
+    f.hooks.takeControls()
+    f.hooks.runTransfer(1)
+    assert(f.app.stats.trips == 2 and f.app.stats.moved == 300 and doors == 4)
+    assert(held == 20 and f.inventory:count(954) == 20)
+    assert(reads == 8, "Each withdrawal and deposit needs one before/after inventory pair, without outer repeats")
+    assert(os.clock() < 0.1, "Already-ready local door entries must not impose a fixed half-second wait")
+end)
+
+test("Door entry waits for destination readiness instead of a fixed delay", function()
+    local f = fixture()
+    f.server = function(name) assert(name == "UseDoor"); return true, {enter = "FARM"} end
+    f.world.enter = function() f.world.name, f.avatar.active = "FARM", false; return true end
+    f.onWait = function() if os.clock() >= 0.2 then f.avatar.active = true end end
+    f.hooks.enterDoor(f.app.config.points.breakDoor, f.app.config.points.farmBox, "return", 0, 1)
+    assert(os.clock() >= 0.2 and os.clock() < 0.3 and f.avatar.active)
+end)
+
+test("A transfer resumed during avatar loading waits before touching storage", function()
+    local f = fixture()
+    f.avatar.active = false
+    f.inventory:add(954, 50)
+    local held, deposits = 50, 0
+    f.onWait = function() if os.clock() >= 0.15 then f.avatar.active = true end end
+    f.server = function(name, x, y, id, _, _, n)
+        assert(f.avatar.active and os.clock() >= 0.15, "No request should run before the arriving avatar is ready")
+        if name == "GetInventory" then return {slots = {{954, held}}, capacity = 54} end
+        if name == "DisplayItem" then
+            assert(n == 50 and f.app.resume.phase == "depositPending")
+            held, deposits = held - n, deposits + 1
+            return true
+        end
+        assert(name == "UseDoor")
+        return false, "End after resumed delivery"
+    end
+    rejects(function() f.hooks.runTransfer(1, {phase = "deliver", cargo = 50}) end, "End after resumed delivery")
+    assert(deposits == 1 and f.app.stats.moved == 50 and held == 0)
+end)
+
+test("Stop during resumed-world loading preserves cargo without issuing requests", function()
+    local f = fixture()
+    f.avatar.active = false
+    f.inventory:add(954, 50)
+    f.server = function() error("No requests are allowed while the avatar is loading") end
+    f.onWait = function() f.app.token = f.app.token + 1 end
+    rejects(function() f.hooks.runTransfer(1, {phase = "deliver", cargo = 50}) end, "Stopped")
+    assert(f.inventory:count(954) == 50 and f.app.stats.moved == 0 and f.app.pending == 0)
+end)
 test("Mixed farm storage is rejected before a mutating withdrawal", function()
     local f = fixture()
     f.world.name = "FARM"
@@ -2822,6 +2901,43 @@ test("A large discovery snapshot yields and reads each function's upvalues at mo
     local r = f.hooks.connectGame()
     assert(r.ready and f.app.discoveryPerformance.yields > 0)
     for _, n in pairs(reads) do assert(n == 1, "A function's upvalues were repeatedly scanned") end
+end)
+
+test("Transfer attachment skips unrelated function upvalues and defers punching hooks", function()
+    local f = fixture()
+    local items = f.app.runtime.items
+    prepareDiscovery(f, true)
+    attachWorldHandlers(f, items)
+    f.world.definitions = function() return items end
+    local noise = {}
+    for n = 1, 5000 do
+        local value = n
+        local fn = function() return value end
+        noise[fn] = true
+        table.insert(f.discoveryObjects, fn)
+    end
+    local reads = 0
+    getupvalues = function(fn)
+        assert(not noise[fn], "Moving Drops must not inspect unrelated function upvalues")
+        reads = reads + 1
+        local values = {}
+        for index = 1, 100 do
+            local name, value = debug.getupvalue(fn, index)
+            if not name then break end
+            if value ~= nil then values[index] = value end
+        end
+        return values
+    end
+    local r = f.hooks.connectGame({transferOnly = true})
+    assert(r.ready and r.farmingDeferred and r.items == items and r.inventory == f.inventory)
+    assert(reads < 30, "Transfer attachment must read only the necessary world/controller methods")
+    -- PNB can still discover its handlers when selected later.
+    getupvalues = nil
+    f.app.job, f.boxes[12] = nil, {}
+    f.avatar.x, f.app.config.points.blockBox.standX = 10.5, 10
+    f.server = function(name) assert(name == "GetInventory"); return {slots = {}, capacity = 54} end
+    f.hooks.start("pnb")
+    assert(not f.app.runtime.farmingDeferred and f.app.runtime.handlers.hit and not f.app.lastError)
 end)
 
 test("Discovery stops at its next frame boundary when the app is unloaded", function()

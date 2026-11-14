@@ -63,6 +63,16 @@ try {
         $runtimeSource = [IO.File]::ReadAllText((Join-Path $projectPath 'main.lua'))
         $runtimeFixture = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'runtime.lua')).Replace('-- CLARIS_RUNTIME_SOURCE', $runtimeSource)
         Invoke-Lua $runtimeFixture 'actual script offline runtime tests' $true
+        function ConvertTo-LuaLiteral([string]$Source) {
+            $delimiter = '='
+            while ($Source.Contains(']' + $delimiter + ']')) { $delimiter += '=' }
+            return '[' + $delimiter + '[' + $Source + ']' + $delimiter + ']'
+        }
+        $loaderFixture = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'loader.lua'))
+        $loaderFixture = $loaderFixture.Replace('-- CLARIS_MAIN_ASSET', (ConvertTo-LuaLiteral $runtimeSource))
+        $loaderFixture = $loaderFixture.Replace('-- CLARIS_WIND_ASSET', (ConvertTo-LuaLiteral ([IO.File]::ReadAllText((Join-Path $projectPath 'vendor\WindUI.lua')))))
+        $loaderFixture = $loaderFixture.Replace('-- CLARIS_LOADER_SOURCE', [IO.File]::ReadAllText((Join-Path $projectPath 'loader.lua')))
+        Invoke-Lua $loaderFixture 'actual loader offline tests' $true
     }
 } finally {
     [ClarisGrowbloxLuaNative]::lua_close($state)

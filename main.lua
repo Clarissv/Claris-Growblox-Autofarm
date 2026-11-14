@@ -461,7 +461,7 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.16"
+local VERSION = "0.1.17"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -825,6 +825,9 @@ local function resolveItems(world, objects, registry, scan)
         scanStep(scan, "Finding item definitions")
         if type(value) == "function" then inspect(value) end
     end
+    -- Transfer attachment normally gets definitions from the world's public
+    -- methods. If they are hidden, retain the full ownership-based fallback.
+    if scan.transferOnly and #found == 0 then scan.owned = nil end
     for _, object in pairs(scan.owned or objects) do
         scanStep(scan, "Finding item definitions")
         if type(object) == "function" and (scan.owned or owns(object, world, scan)) then inspect(object) end
@@ -868,9 +871,11 @@ local function inventoryObject(candidate)
         and type(readField(candidate, "remove")) == "function"
 end
 
-local function discover()
+local function discover(options)
     assert(type(getgc) == "function", "Delta must expose getgc(true) to read Growblox's 2D client.")
     local scan = newScan()
+    scan.transferOnly = options and options.transferOnly == true
+    local startedAt = os.clock()
     App.startupStage = "Reading game objects"
     task.wait() -- Let the window render before taking the executor's GC snapshot.
     assert(App.alive, "This script was unloaded during discovery.")
@@ -979,46 +984,51 @@ local function discover()
     end
     local handlers, ambiguousHandlers = {}, {}
     scan.owned = {}
-    for _, object in pairs(objects) do
-        scanStep(scan, "Finding game handlers")
-        if type(object) == "function" and owns(object, world, scan) then
-            table.insert(scan.owned, object)
-            local name = functionName(object, scan)
-            if name == "setTile" or name == "hit" or name == "canPlace" or name == "plantSeed" then
-                if handlers[name] or ambiguousHandlers[name] then
-                    handlers[name], ambiguousHandlers[name] = nil, true
-                    if name ~= "plantSeed" then table.insert(issues, "Multiple " .. name .. " handlers match the world.") end
-                else
-                    handlers[name] = object
+    if not scan.transferOnly then
+        for _, object in pairs(objects) do
+            scanStep(scan, "Finding game handlers")
+            if type(object) == "function" and owns(object, world, scan) then
+                table.insert(scan.owned, object)
+                local name = functionName(object, scan)
+                if name == "setTile" or name == "hit" or name == "canPlace" or name == "plantSeed" then
+                    if handlers[name] or ambiguousHandlers[name] then
+                        handlers[name], ambiguousHandlers[name] = nil, true
+                        if name ~= "plantSeed" then table.insert(issues, "Multiple " .. name .. " handlers match the world.") end
+                    else
+                        handlers[name] = object
+                    end
                 end
             end
         end
-    end
-    for _, name in ipairs({ "setTile", "hit", "canPlace" }) do
-        if not handlers[name] then table.insert(issues, "Missing farming handler: " .. name) end
+        for _, name in ipairs({ "setTile", "hit", "canPlace" }) do
+            if not handlers[name] then table.insert(issues, "Missing farming handler: " .. name) end
+        end
     end
     local items, itemSource = resolveItems(world, objects, registry, scan)
     table.insert(App.discoveryReport, "Item definitions: " .. itemSource)
     local runtime = { world = world, body = body, controls = controls[1], inventory = inventory,
         items = items, handlers = handlers, issues = issues,
         readInventoryView = readInventoryView, ready = #issues == 0, gemHud = gemHud,
-        picker = findWorldPicker(world, objects, scan) }
+        picker = findWorldPicker(world, objects, scan), farmingDeferred = scan.transferOnly }
     table.insert(App.discoveryReport, "Inventory: " .. (readInventoryView and "readable snapshot" or "live backpack"))
-    table.insert(App.discoveryReport, "Farming hooks: " .. (#issues == 0 and "ready" or table.concat(issues, " ")))
+    table.insert(App.discoveryReport, "Farming hooks: " .. (scan.transferOnly and "deferred until PNB or Planting starts"
+        or #issues == 0 and "ready" or table.concat(issues, " ")))
+    table.insert(App.discoveryReport, "Movement and storage: " .. (#issues == 0 and "ready" or table.concat(issues, " ")))
     table.insert(App.discoveryReport, "World picker: " .. (runtime.picker and "UI cleanup ready" or "UI hook unavailable"))
     table.insert(App.discoveryReport, "Planting hook: " .. (ambiguousHandlers.plantSeed and "ambiguous"
         or handlers.plantSeed and "ready" or "unavailable"))
     App.startupStage = "Attached"
-    App.discoveryPerformance = {yields = scan.yields, upvalueReads = scan.reads}
-    table.insert(App.discoveryReport, "Discovery: " .. scan.yields .. " frame yields; " .. scan.reads .. " function upvalue reads")
+    App.discoveryPerformance = {yields = scan.yields, upvalueReads = scan.reads, seconds = os.clock() - startedAt}
+    table.insert(App.discoveryReport, "Discovery: " .. scan.yields .. " frame yields; " .. scan.reads
+        .. " function upvalue reads; " .. string.format("%.2fs", App.discoveryPerformance.seconds))
     -- The game already owns tileChanged handling. Own actions are optimistic and
     -- need not receive an echo; do not add a listener or require an acknowledgment.
     return runtime
 end
 
-local function connectGame()
+local function connectGame(options)
     App.discoveryReport = {}
-    local ok, result = pcall(discover)
+    local ok, result = pcall(discover, options)
     if not ok then
         App.connectionError = tostring(result)
         error(App.connectionError, 0)
@@ -1306,11 +1316,12 @@ local function withdraw(point, id, token)
     assert(taken > 0 and count(id) >= before + taken, "The server did not confirm blocks in your backpack.")
     return taken
 end
-local function deposit(point, id, amount, token)
+local function deposit(point, id, amount, token, onReady)
     worldCheck(point.world, token)
     moveToPoint(point, token)
     storageCount(point, id)
     refreshInventory(token)
+    if onReady then onReady(count(id)) end
     amount = math.min(math.floor(amount), count(id))
     assert(amount > 0, "No items are available to deposit.")
     local before = count(id)
@@ -1375,7 +1386,7 @@ local function queueResume()
         return false
     end
     if not App.queued then
-        local code = "task.wait(3); getgenv().ClarisGrowbloxAutoResume = true; "
+        local code = "getgenv().ClarisGrowbloxAutoResume = true; "
             .. "loadstring(game:HttpGet(" .. string.format("%q", loader) .. "))()"
         queue(code)
         App.queued = true
@@ -1412,8 +1423,24 @@ local function enterDoor(door, destination, nextPhase, cargo, token)
         end
         assert(entered, tostring(message or "Could not enter the destination world."))
     end
-    pause(0.5, token)
-    worldCheck(destination.world, token)
+    local deadline = os.clock() + App.config.options.actionTimeout + 15
+    local readyAt = os.clock()
+    while true do
+        checkpoint(token)
+        assert(r.world.name == door.world or r.world.name == destination.world or r.world.name == "" or r.world.name == nil,
+            "The door arrived in an unexpected world. Check its saved destination.")
+        if r.world.name == destination.world then
+            if pickerOpen(r) then r.picker.complete() end
+            local state = r.body and r.body.state()
+            if state and state.active and not state.dead and not player:GetAttribute("Frozen") then
+                worldCheck(destination.world, token)
+                App.doorReadyDebug = destination.world .. " ready after " .. string.format("%.2fs", os.clock() - readyAt)
+                return
+            end
+        end
+        assert(os.clock() < deadline, "The destination world or avatar did not become ready after the door.")
+        pause(0.05, token)
+    end
 end
 
 local function settleTile(x, y, id, seconds, worldName, token)
@@ -2066,13 +2093,29 @@ local function runTransfer(token, saved)
     local phase = saved and saved.phase or "pickup"
     local cargo = saved and saved.cargo or 0
     assert(phase == "pickup" or phase == "deliver" or phase == "return", "Invalid transfer resume phase.")
-    if not saved then worldCheck(p.farmBox.world, token) end
+    if saved then
+        local expected = {[p.farmBox.world] = true}
+        if phase ~= "pickup" then expected[p.blockBox.world] = true end
+        local deadline = os.clock() + App.config.options.actionTimeout + 15
+        setStatus("Waiting for the transfer world and avatar...")
+        while true do
+            checkpoint(token)
+            local r = runtime()
+            assert(r.world.name == nil or r.world.name == "" or expected[r.world.name],
+                "The saved transfer arrived in an unexpected world. Check its doors and destination.")
+            if expected[r.world.name] then
+                if pickerOpen(r) then r.picker.complete() end
+                local state = r.body and r.body.state()
+                if state and state.active and not state.dead and not player:GetAttribute("Frozen") then break end
+            end
+            assert(os.clock() < deadline, "The transfer world or avatar did not become ready after loading.")
+            pause(0.05, token)
+        end
+    else worldCheck(p.farmBox.world, token) end
     while true do
         checkpoint(token)
         if phase == "pickup" then
             worldCheck(p.farmBox.world, token)
-            moveToPoint(p.farmBox, token)
-            refreshInventory(token)
             if storageCount(p.farmBox, id) == 0 then
                 clearResume()
                 setStatus("Finished: the farm storage box is empty.")
@@ -2093,12 +2136,12 @@ local function runTransfer(token, saved)
             end
             worldCheck(p.blockBox.world, token)
             setStatus("Putting the transported blocks into PNB storage...")
-            refreshInventory(token)
-            assert(count(id) >= cargo, "Some saved cargo is missing. Check your backpack before resuming.")
             -- Save the count before issuing a mutating request. An interrupted deposit is
             -- ambiguous; resume refuses to repeat it until the player checks the inventory.
-            saveResume("depositPending", cargo)
-            local moved = deposit(p.blockBox, id, cargo, token)
+            local moved = deposit(p.blockBox, id, cargo, token, function(available)
+                assert(available >= cargo, "Some saved cargo is missing. Check your backpack before resuming.")
+                saveResume("depositPending", cargo)
+            end)
             App.stats.trips = App.stats.trips + 1
             App.stats.moved = App.stats.moved + moved
             cargo = 0
@@ -2326,6 +2369,15 @@ end
 local function start(mode, saved)
     idle()
     local r = runtime()
+    if r.farmingDeferred and (mode == "pnb" or mode == "plant") then
+        setStatus("Connecting " .. (mode == "pnb" and "Place & Break" or "Planting") .. " hooks...")
+        releaseControls()
+        App.configuring = true
+        local ok, result = pcall(connectGame)
+        App.configuring = false
+        if not ok then error(result, 0) end
+        r = result
+    end
     if mode == "harvest" or mode == "plant" then
         assert(r.body and r.controls and type(r.inventory.room) == "function" and type(r.inventory.add) == "function"
             and type(r.inventory.remove) == "function", "Collection and planting need the live backpack and movement hooks.")
@@ -3185,7 +3237,7 @@ end
 ui.diagnostics = settingsTab:Paragraph({ Title = "Game connection", Desc = "Connecting..." })
 local function reconnect()
     releaseControls()
-    App.runtime = connectGame()
+    App.runtime = connectGame({transferOnly = true})
     App.syncingUI = true
     refreshBlocks()
     refreshSeeds()
@@ -3202,6 +3254,8 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nProfile: " .. App.profile .. "\nStatus: " .. App.status
         .. "\nPending requests: " .. App.pending .. "\n" .. table.concat(App.logs, "\n")
         .. "\nConnection error: " .. (App.connectionError or "none")
+        .. "\nLoader: " .. (env.ClarisGrowbloxLoaderDebug or "direct script")
+        .. "\nLast door: " .. (App.doorReadyDebug or "not used")
         .. "\nAnti-AFK: " .. (App.antiAFKError or "ready")
         .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
         .. "\nLast refused harvest pickup: " .. (App.lastHarvestRefusal or "none")
