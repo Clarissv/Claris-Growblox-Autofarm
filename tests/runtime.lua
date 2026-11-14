@@ -2365,7 +2365,7 @@ test("Harvest follows top-left zigzag rows and lands at both platform edges", fu
     end
     f.harvest()
     assert(table.concat(f.accepted, ",") == "11,12,13,23,22,21,31,32,33", table.concat(f.accepted, ","))
-    for _, tile in ipairs({"1:2", "14:2", "14:4", "1:4", "1:6", "14:6"}) do
+    for _, tile in ipairs({"1:2", "14:2", "14:4", "1:4", "1:6"}) do
         assert(f.visited[tile], "The zigzag must visit " .. tile)
     end
     assert(#f.drops == 0 and f.app.stats.stashed == 45 and f.respawns == 1)
@@ -2384,13 +2384,104 @@ test("A full harvest backpack returns to its current row after respawn without s
     assert(f.deposits[1] == 200 and f.deposits[2] == 90 and f.app.pending == 0)
 end)
 
-test("An empty upper harvest row retains the next row's right-to-left direction", function()
+test("Harvest skips an empty upper row and retains the next row's right-to-left direction", function()
     local f = zigzagHarvestFixture()
     f.addDrop(21, 954, 10, 2.5, 4.5)
     f.addDrop(23, 954, 10, 13.5, 4.5)
     f.harvest()
     assert(table.concat(f.accepted, ",") == "23,21")
-    assert(f.visited["1:2"] and f.visited["14:2"] and f.visited["14:4"])
+    assert(not f.visited["1:2"] and not f.visited["14:2"] and f.visited["14:4"])
+    assert(not table.concat(f.app.logs, "\n"):find("Collecting farm row 1/", 1, true))
+end)
+
+test("Harvest with no selected loose or held blocks completes without walking or respawning", function()
+    for _, otherDrops in ipairs({false, true}) do
+        local f = zigzagHarvestFixture()
+        f.avatar.x, f.avatar.y = 3.5, 6.999
+        if otherDrops then
+            f.addDrop(1, 955, 10, 2.5, 2.5)
+            f.addDrop(2, 112, 10, 13.5, 4.5)
+            local display = f.addDrop(3, 954, 10, 7.5, 2.5)
+            display.display = true
+        end
+        local physics = f.onWait
+        f.onWait = function(dt)
+            assert(f.controls.dir() == 0 and not f.controls.jumping(), "Empty harvest must not request movement")
+            physics(dt)
+        end
+        f.harvest()
+        assert(f.avatar.x == 3.5 and math.abs(f.avatar.y - 6.999) < 0.001)
+        assert(#f.requests == 0 and #f.deposits == 0 and f.respawns == 0)
+        assert(f.app.status:find("Finished collecting harvest", 1, true))
+    end
+end)
+
+test("Harvest skips an empty middle row without reversing the lower row", function()
+    local f = zigzagHarvestFixture()
+    f.addDrop(11, 954, 10, 2.5, 2.5)
+    f.addDrop(13, 954, 10, 13.5, 2.5)
+    f.addDrop(31, 954, 10, 2.5, 6.5)
+    f.addDrop(33, 954, 10, 13.5, 6.5)
+    f.addDrop(21, 955, 10, 7.5, 4.5)
+    f.harvest()
+    assert(table.concat(f.accepted, ",") == "11,13,31,33")
+    assert(not table.concat(f.app.logs, "\n"):find("Collecting farm row 2/", 1, true))
+    assert(#f.drops == 1 and f.drops[1].id == 955 and f.app.stats.stashed == 40)
+end)
+
+test("Harvest stops crossing the last occupied row as soon as its only stack is gone", function()
+    local f = zigzagHarvestFixture()
+    f.addDrop(11, 954, 10, 7.5, 2.5)
+    local respawn = f.app.runtime.respawn
+    f.app.runtime.respawn = function()
+        assert(math.abs(f.avatar.x - 7.5) < 0.6, "The cleared row must not be crossed to its empty far edge")
+        return respawn()
+    end
+    f.harvest()
+    assert(f.respawns == 1 and f.app.stats.stashed == 10 and #f.drops == 0)
+    assert(not f.visited["14:2"])
+end)
+
+test("Harvest cancels positioning when its destination row loses its last floating block", function()
+    local f = zigzagHarvestFixture()
+    f.addDrop(11, 954, 10, 7.5, 2.5)
+    local physics, cleared = f.onWait, false
+    f.onWait = function(dt)
+        physics(dt)
+        if not cleared and f.avatar.y < 7.5 then
+            cleared = true
+            for index = #f.drops, 1, -1 do table.remove(f.drops, index) end
+        end
+    end
+    f.harvest()
+    assert(cleared and not f.visited["1:2"] and not f.visited["14:2"])
+    assert(#f.requests == 0 and #f.deposits == 0 and f.respawns == 0)
+end)
+
+test("An empty harvest still stores selected blocks already held without inspecting farm rows", function()
+    local f = zigzagHarvestFixture()
+    f.avatar.x, f.avatar.y = 3.5, 6.999
+    f.inventory:add(954, 20)
+    f.serverItems[954] = 20
+    f.harvest()
+    assert(#f.requests == 0 and #f.deposits == 1 and f.deposits[1] == 20 and f.respawns == 1)
+    assert(not f.visited["1:2"] and not f.visited["14:2"] and f.app.stats.stashed == 20)
+end)
+
+test("Harvest stashes a backpack filled by the last stack before travelling to another row", function()
+    local f = zigzagHarvestFixture()
+    f.addDrop(11, 954, 200, 7.5, 2.5)
+    f.addDrop(21, 954, 20, 2.5, 4.5)
+    local respawn = f.app.runtime.respawn
+    f.app.runtime.respawn = function()
+        if f.respawns == 0 then
+            assert(math.abs(f.avatar.y - 3) < 0.22 and math.abs(f.avatar.x - 7.5) < 0.6,
+                "A full backpack must be stored before travelling to the next row")
+        end
+        return respawn()
+    end
+    f.harvest()
+    assert(f.app.stats.stashed == 220 and f.deposits[1] == 200 and f.deposits[2] == 20 and f.respawns == 2)
 end)
 
 test("A route pickup refusal lets harvest recenter before retrying the stack", function()
