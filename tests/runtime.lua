@@ -3961,4 +3961,232 @@ test("Import backs up an existing named profile and accepts a saved profile file
     assert(f.app.config.options.collectDelay == 0.9 and f.app.config.rotation.farms.FARM.x == 20)
 end)
 
+test("Work reports describe Full Rotation progress and all harvest counters without pinging", function()
+    local f=rotationFixture()
+    f.app.job="rotation"
+    f.app.rotationState={phase="harvest",worldIndex=2,cycle=3}
+    f.app.stats.trees,f.app.stats.harvestSeeds,f.app.stats.stashedSeeds,f.app.stats.cycles=20,8,7,2
+    f.hooks.setWebhookSetting("discordId","123456789012345678")
+    local payload=f.hooks.webhookPayload(f.app.config,f.app.profile)
+    assert(reportField(payload,"Farm status"):find("Full Rotation",1,true))
+    assert(reportField(payload,"Rotation progress"):find("Cycle: 3",1,true))
+    assert(reportField(payload,"Rotation progress"):find("2/2 (FARM2)",1,true))
+    local totals=reportField(payload,"This script session")
+    assert(totals:find("Trees harvested: 20",1,true) and totals:find("Harvest seeds collected: 8",1,true))
+    assert(totals:find("Harvest seeds stored: 7",1,true) and totals:find("Rotations completed: 2",1,true))
+    assert(payload.content == nil and payload.allowed_mentions.users == nil and #payload.allowed_mentions.parse == 0)
+end)
+
+test("Failure payloads ping exactly the configured Discord user and suppress all other mentions", function()
+    local f=fixture()
+    f.hooks.setWebhookSetting("discordId","<@123456789012345678>")
+    local payload=f.hooks.webhookPayload(f.app.config,"Fault",{}, {kind="failure",mode="harvest",message="Pickup refused @everyone <@&999999999999999999>"})
+    assert(payload.content == "<@123456789012345678> Growblox task failed.")
+    assert(#payload.allowed_mentions.users == 1 and payload.allowed_mentions.users[1] == "123456789012345678")
+    assert(#payload.allowed_mentions.parse == 0 and payload.allowed_mentions.roles == nil)
+    assert(payload.embeds[1].title == "Growblox task failed" and payload.embeds[1].color == 0xE74C3C)
+    assert(reportField(payload,"Failure"):find("Pickup refused",1,true))
+    f.hooks.setWebhookSetting("discordId","")
+    payload=f.hooks.webhookPayload(f.app.config,"Fault",{}, {kind="failure",mode="pnb",message="Failed"})
+    assert(payload.content == "Growblox task failed." and payload.allowed_mentions.users == nil)
+end)
+
+test("A task failure queues one immediate ping even when periodic reporting is Off", function()
+    local f=harvestFixture()
+    f.app.job=nil
+    f.serverItems[954]=200; f.inventory:add(954,200)
+    local server=f.server
+    setupWebhook(f)
+    f.hooks.setWebhookSetting("discordId","123456789012345678")
+    f.server=function(name,...)
+        if name == "DisplayItem" then return false,"Farm box access denied" end
+        assert(name ~= "GetGems" and name ~= "GetLevel","Failure alerts must not wait for failed game queries")
+        return server(name,...)
+    end
+    f.hooks.start("harvest")
+    assert(f.app.lastError and f.app.job == nil and not f.app.config.webhook.enabled)
+    assert(#f.app.webhookState.events == 1 and f.app.webhookState.events[1].kind == "failure")
+    f.hooks.pollWebhook()
+    assert(#f.posts == 1 and #f.app.webhookState.events == 0 and f.app.webhookState.status == "Failure alert sent.")
+    local payload=f.encoded[f.posts[1].Body]
+    assert(reportField(payload,"Failure"):find("Farm box access denied",1,true))
+    assert(reportField(payload,"Farm status"):find("Harvesting",1,true))
+    task.wait(60); f.hooks.pollWebhook()
+    assert(#f.posts == 1 and f.app.pending == 0 and f.serverItems[954] == 200)
+end)
+
+test("Failure alerts can be switched Off and Stop never creates a failure ping", function()
+    local f=fixture()
+    setupWebhook(f)
+    f.hooks.setWebhookSetting("failureAlerts",false)
+    assert(not f.hooks.queueWebhookEvent("failure","Error","pnb"))
+    f.hooks.setWebhookSetting("failureAlerts",true)
+    f.app.job,f.app.jobToken=nil,nil
+    f.spawn=function(fn) f.spawn=nil; task.defer(fn) end
+    f.hooks.start("pnb")
+    f.app:stop(); task.wait(0.01); f.hooks.pollWebhook()
+    assert(#f.posts == 0 and #f.app.webhookState.events == 0 and not f.app.lastError)
+end)
+
+test("A completed PNB task sends a work report without pinging the failure user", function()
+    local f=fixture()
+    setupWebhook(f)
+    f.app.job,f.app.jobToken=nil,nil
+    f.avatar.x=10.5
+    f.app.config.points.blockBox.standX=10
+    f.boxes[12]={}
+    f.server=function(name) assert(name == "GetInventory"); return {slots={},capacity=54} end
+    f.hooks.setWebhookSetting("discordId","123456789012345678")
+    f.hooks.setWebhookSetting("enabled",true)
+    f.hooks.start("pnb")
+    assert(not f.app.lastError and #f.app.webhookState.events == 1)
+    f.hooks.pollWebhook()
+    local payload=f.encoded[f.posts[1].Body]
+    assert(payload.embeds[1].title == "Growblox work report" and payload.content == nil)
+    assert(reportField(payload,"Farm status"):find("Place & Break",1,true))
+    assert(payload.allowed_mentions.users == nil and f.app.webhookState.status == "Work report sent.")
+end)
+
+test("Failure reports preserve fault-time progress while waiting behind another request", function()
+    local f=rotationFixture()
+    setupWebhook(f)
+    f.hooks.setWebhookSetting("discordId","123456789012345678")
+    f.app.job="rotation"
+    f.app.rotationState={phase="transfer",worldIndex=2,cycle=4}
+    f.app.stats.trees=12
+    f.app.webhookState.inFlight=true
+    assert(f.hooks.queueWebhookEvent("failure","Lost crop cargo","rotation"))
+    f.hooks.pollWebhook(); assert(#f.posts == 0)
+    f.app.stats.trees=99
+    f.app.rotationState={phase="plant",worldIndex=1,cycle=5}
+    f.app.webhookState.inFlight=false
+    f.hooks.pollWebhook()
+    local payload=f.encoded[f.posts[1].Body]
+    assert(reportField(payload,"Rotation progress"):find("Cycle: 4",1,true))
+    assert(reportField(payload,"Rotation progress"):find("Phase: transfer",1,true))
+    assert(reportField(payload,"This script session"):find("Trees harvested: 12",1,true))
+end)
+
+test("Late successful failure delivery is acknowledged without posting a duplicate ping", function()
+    local f=fixture()
+    setupWebhook(f)
+    f.hooks.queueWebhookEvent("failure","Failed while offline","pnb")
+    deferReportRequests(f,2)
+    f.hooks.pollWebhook()
+    assert(f.app.webhookState.pending == 1 and #f.posts == 0 and #f.app.webhookState.events == 1)
+    f.hooks.pollWebhook(); assert(#f.delayed == 1)
+    f.delayed[1](); f.spawn=nil
+    f.hooks.pollWebhook()
+    assert(#f.posts == 1 and #f.app.webhookState.events == 0 and f.app.webhookState.pending == 0)
+    task.wait(60); f.hooks.pollWebhook(); assert(#f.posts == 1)
+end)
+
+test("Failure delivery retries are bounded and never expose webhook tokens", function()
+    local f=fixture()
+    setupWebhook(f)
+    f.env.request=function(options)
+        f.posts[#f.posts+1]=options
+        error("Network error with test_token")
+    end
+    f.hooks.queueWebhookEvent("failure","Task failed","transfer")
+    f.hooks.pollWebhook(); assert(#f.posts == 1)
+    task.wait(9); f.hooks.pollWebhook(); assert(#f.posts == 1)
+    task.wait(1); f.hooks.pollWebhook(); assert(#f.posts == 2)
+    task.wait(20); f.hooks.pollWebhook(); assert(#f.posts == 3)
+    assert(#f.app.webhookState.events == 0 and f.app.webhookState.status:find("three attempts",1,true))
+    assert(not f.app.webhookState.status:find("test_token",1,true))
+    task.wait(60); f.hooks.pollWebhook(); assert(#f.posts == 3)
+end)
+
+test("Discord rate limits retain the failure alert until the permitted retry", function()
+    local f=fixture()
+    setupWebhook(f)
+    local attempts=0
+    f.env.request=function(options)
+        attempts=attempts+1
+        f.posts[#f.posts+1]=options
+        if attempts == 1 then return {StatusCode=429,Body=f.services.HttpService:JSONEncode({retry_after=30})} end
+        return {StatusCode=204}
+    end
+    f.hooks.queueWebhookEvent("failure","Access refused","harvest")
+    f.hooks.pollWebhook()
+    assert(attempts == 1 and #f.app.webhookState.events == 1)
+    task.wait(29); f.hooks.pollWebhook(); assert(attempts == 1)
+    task.wait(1); f.hooks.pollWebhook()
+    assert(attempts == 2 and #f.app.webhookState.events == 0 and f.app.webhookState.status == "Failure alert sent.")
+end)
+
+test("Failure notifications work without an attached game and profile changes discard old queued alerts", function()
+    local f=fixture()
+    setupWebhook(f)
+    f.app.runtime=nil
+    assert(f.hooks.queueWebhookEvent("failure","Could not attach game","connection"))
+    f.hooks.pollWebhook()
+    assert(#f.posts == 1 and reportField(f.encoded[f.posts[1].Body],"World") == "World picker / unconnected")
+    assert(f.hooks.queueWebhookEvent("failure","Old failure","pnb"))
+    f.app.config=f.hooks.Core.defaults()
+    f.hooks.resetWebhookSchedule()
+    task.wait(60); f.hooks.pollWebhook()
+    assert(#f.posts == 1 and #f.app.webhookState.events == 0)
+end)
+
+test("Failure Discord IDs and toggles survive session reload and invalid IDs preserve the previous value", function()
+    local f=fixture()
+    f.hooks.setWebhookSetting("discordId","123456789012345678")
+    rejects(function() f.hooks.setWebhookSetting("discordId","@everyone") end,"Discord user ID")
+    assert(f.app.config.webhook.discordId == "123456789012345678")
+    f.hooks.setWebhookSetting("failureAlerts",false)
+    f.hooks.saveSession()
+    local next=f.reload()
+    assert(next.App.config.webhook.discordId == "123456789012345678" and not next.App.config.webhook.failureAlerts)
+end)
+
+test("Completed rotation cycles send their work snapshot after Stop without a failure ping", function()
+    local f=rotationFixture()
+    local server=f.server
+    setupWebhook(f)
+    f.server=server
+    f.hooks.setWebhookSetting("discordId","123456789012345678")
+    f.hooks.setWebhookSetting("enabled",true)
+    f.afterWait=function() if f.app.stats.cycles == 1 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError and f.app.stats.cycles == 1 and #f.app.webhookState.events == 1)
+    f.hooks.pollWebhook()
+    local payload=f.encoded[f.posts[1].Body]
+    assert(payload.embeds[1].title == "Growblox work report" and payload.content == nil)
+    assert(reportField(payload,"Rotation progress"):find("Cycle: 1",1,true))
+    assert(reportField(payload,"Farm status"):find("Completed rotation cycle 1",1,true))
+    assert(reportField(payload,"This script session"):find("Trees harvested: 10",1,true))
+end)
+
+test("A task setup failure sends a failure alert instead of silently refusing the start", function()
+    local f=fixture()
+    setupWebhook(f)
+    f.app.job,f.app.jobToken=nil,nil
+    f.app.config.points.pnb=nil
+    local started=f.hooks.setRunningEnabled("pnb",true)
+    assert(not started and f.app.job == nil and #f.app.webhookState.events == 1)
+    f.hooks.pollWebhook()
+    assert(#f.posts == 1 and reportField(f.encoded[f.posts[1].Body],"Failure"):find("Could not start task",1,true))
+end)
+
+test("A failure preempts periodic stat queries and can post while those read-only queries remain stuck", function()
+    local f=fixture()
+    setupWebhook(f)
+    deferReportRequests(f,2)
+    f.onWait=function()
+        f.onWait=nil
+        f.hooks.queueWebhookEvent("failure","Disconnected during work","pnb")
+    end
+    f.hooks.sendWebhook(true)
+    assert(#f.delayed == 2 and f.app.webhookState.pending == 2 and f.app.webhookState.httpPending == 0)
+    assert(#f.posts == 0 and #f.app.webhookState.events == 1)
+    f.spawn=nil
+    f.hooks.pollWebhook()
+    assert(#f.posts == 1 and f.app.webhookState.pending == 2 and f.app.webhookState.httpPending == 0)
+    assert(f.encoded[f.posts[1].Body].embeds[1].title == "Growblox task failed")
+    for _,complete in ipairs(f.delayed) do complete() end
+    assert(f.app.webhookState.pending == 0 and #f.app.webhookState.events == 0 and f.app.pending == 0)
+end)
+
 return string.format("%d actual-script runtime tests passed (mock services/server)", passed)

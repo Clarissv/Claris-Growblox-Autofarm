@@ -16,7 +16,8 @@ function Core.defaults()
         options = { placeDelay = 0.2, punchDelay = 0.24, collectDelay = 0.1,
             actionTimeout = 10, moveTimeout = 30, seedThreshold = 200, antiAFK = true, autoRejoin = true,
             moveAfterHarvest = false, harvestRespawn = true },
-        webhook = { url = "", enabled = false, intervalMinutes = 5, includeBoxes = true },
+        webhook = { url = "", enabled = false, intervalMinutes = 5, includeBoxes = true,
+            discordId = "", failureAlerts = true },
         planting = {seedId = 0, storageWorld = "", worlds = {}},
         harvesting = {method = "fist"},
         rotation = {farms = {}},
@@ -61,7 +62,23 @@ function Core.validateWebhook(input)
         "Webhook interval must be between 1 and 1440 minutes.")
     assert(not input.enabled or out.url ~= "", "Set the Discord webhook URL before enabling reports.")
     out.enabled, out.includeBoxes, out.intervalMinutes = input.enabled, input.includeBoxes, input.intervalMinutes
+    out.discordId = Core.discordUserId(input.discordId)
+    if input.failureAlerts ~= nil then
+        assert(type(input.failureAlerts) == "boolean", "Invalid failure alert toggle.")
+        out.failureAlerts = input.failureAlerts
+    end
     return out
+end
+
+function Core.discordUserId(value)
+    if value == nil then return "" end
+    assert(type(value) == "string", "Enter your Discord user ID as digits.")
+    local id = value:match("^%s*(.-)%s*$")
+    if id == "" then return id end
+    id = id:match("^<@!?(%d+)>$") or id
+    assert(#id >= 17 and #id <= 20 and id:match("^[1-9]%d+$"),
+        "Use a 17-20 digit Discord user ID. Enable Discord Developer Mode, then Copy User ID.")
+    return id
 end
 
 function Core.worldName(value)

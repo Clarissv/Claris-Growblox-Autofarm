@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.22"
+local VERSION = "0.1.23"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -16,6 +16,7 @@ local SESSION_FILE = ROOT .. "/session.json"
 local PLANT_RESUME_FILE = ROOT .. "/plant-resume.json"
 local ROTATION_RESUME_FILE = ROOT .. "/rotation-resume.json"
 local saveRotationResume
+local queueWebhookEvent
 local previousSession = env.ClarisGrowbloxApp
 
 if env.ClarisGrowbloxApp then
@@ -70,7 +71,7 @@ local App = {
     connectionError = nil, discoveryReport = {},
     stats = { broken = 0, trips = 0, moved = 0, gems = 0, harvested = 0, stashed = 0, planted = 0, trees = 0,
         harvestSeeds = 0, stashedSeeds = 0, cycles = 0 }, runToggles = {},
-    webhookState = { pending = 0, generation = 0, status = "Automatic reports are Off." },
+    webhookState = { pending = 0, httpPending = 0, generation = 0, events = {}, status = "Automatic reports are Off." },
     loadedAt = os.clock(),
 }
 env.ClarisGrowbloxApp = App
@@ -2529,6 +2530,7 @@ local function runRotation(token, saved)
                 elseif state.phase == "finish" then
                     assert(state.work > 0, "Rotation found no harvest or stored crop in the farm list. Check seed stock, supported rows, and access.")
                     App.stats.cycles = App.stats.cycles + 1
+                    if queueWebhookEvent then queueWebhookEvent("work", "Completed rotation cycle " .. state.cycle .. ".", "rotation") end
                     state.cycle, state.worldIndex, state.work = state.cycle + 1, 1, 0
                     setStatus("Rotation complete. Starting planting cycle " .. state.cycle .. "...")
                     transition("plant")
@@ -2673,6 +2675,7 @@ local function start(mode, saved)
                 end
             else harvestEquipmentScope(function() suspendHarvestVehicle(token); runTransfer(token, saved) end) end
         end, function(err) return tostring(err) end)
+        local endedMode = App.job or mode
         releaseControls()
         App.job = nil
         App.jobToken = nil
@@ -2682,6 +2685,10 @@ local function start(mode, saved)
             App.lastError = message
             setStatus("Paused: " .. message)
             notify(message)
+            if queueWebhookEvent then queueWebhookEvent("failure", message, endedMode) end
+        end
+        if ok and token == App.token and App.alive and mode ~= "rotation" and queueWebhookEvent then
+            queueWebhookEvent("work", App.status, endedMode)
         end
         if transferRan and ok then clearResume() end
         if mode == "pnb" and (ok or not App.teleporting) then clearPNBResume() end
@@ -2690,6 +2697,7 @@ end
 
 local function setRunningEnabled(mode, enabled)
     if App.syncingRunToggles then return true end
+    local starting = enabled and not App.job and not App.configuring and App.pending == 0
     local ok, message = pcall(function()
         if enabled then
             if App.job == mode and App.jobToken == App.token then return end
@@ -2699,7 +2707,10 @@ local function setRunningEnabled(mode, enabled)
         end
     end)
     syncRunToggles()
-    if not ok then notify(tostring(message)) end
+    if not ok then
+        notify(tostring(message))
+        if starting and queueWebhookEvent then queueWebhookEvent("failure", "Could not start task: " .. tostring(message), mode) end
+    end
     return ok, message
 end
 
@@ -2727,12 +2738,14 @@ end
 local function resetWebhookSchedule()
     local state = App.webhookState
     state.generation = state.generation + 1
+    state.events = {}
     state.nextAt = os.clock() + App.config.webhook.intervalMinutes * 60
     state.status = App.config.webhook.enabled and "Automatic reports are On." or "Automatic reports are Off."
 end
 local function setWebhookSetting(key, value)
     assert(App.alive, "Script unloaded.")
-    assert(key == "url" or key == "enabled" or key == "intervalMinutes" or key == "includeBoxes", "Unknown webhook setting.")
+    assert(key == "url" or key == "enabled" or key == "intervalMinutes" or key == "includeBoxes"
+        or key == "discordId" or key == "failureAlerts", "Unknown webhook setting.")
     local nextSettings = {}
     for name, current in pairs(App.config.webhook) do nextSettings[name] = current end
     nextSettings[key] = value
@@ -2754,7 +2767,7 @@ local function reportBox(point, itemId)
     if not ok then return "Unavailable (check the saved Display Box)" end
     return tostring(total) .. " in " .. reportText(point.world, 100) .. " at " .. point.x .. ", " .. point.y
 end
-local function webhookPayload(config, profile, metrics)
+local function webhookPayload(config, profile, metrics, event)
     metrics = metrics or {}
     local r, fields = App.runtime, {}
     local function field(name, value, inline)
@@ -2780,9 +2793,18 @@ local function webhookPayload(config, profile, metrics)
     field("Profile", reportText(profile, 48), true)
     field("Level", metrics.level or "Unavailable", true)
     field("Gems", metrics.gems or "Unavailable", true)
-    local mode = App.job == "pnb" and "Place & Break" or App.job == "transfer" and "Moving Drops"
-        or App.job == "harvest" and "Collect harvest" or App.job == "plant" and "Planting" or "Off"
-    field("Farm status", mode .. (App.recovering and " (recovering)" or "") .. "\n" .. reportText(App.status, 600))
+    local job = event and event.mode or App.job
+    local mode = job == "pnb" and "Place & Break" or job == "transfer" and "Moving Drops"
+        or job == "harvest" and "Harvesting" or job == "plant" and "Planting" or job == "rotation" and "Full Rotation"
+        or job == "connection" and "Game connection" or job == "resume" and "Resume saved task" or "Off"
+    field("Farm status", mode .. (App.recovering and " (recovering)" or "") .. "\n" .. reportText(event and event.message or App.status, 600))
+    field("Harvest method", config.harvesting.method == "tractor" and "Dear John Tractor" or "Fist", true)
+    if job == "rotation" and App.rotationState then
+        local progress = App.rotationState
+        field("Rotation progress", "Cycle: " .. progress.cycle .. "\nPhase: " .. progress.phase
+            .. "\nFarm: " .. progress.worldIndex .. "/" .. #config.planting.worlds
+            .. " (" .. (config.planting.worlds[progress.worldIndex] or "Unavailable") .. ")")
+    end
     local item = r and blockId and r.items[blockId]
     field("Selected block", item and (reportText(item.name or blockId, 100) .. " [" .. blockId .. "]") or "Not selected", true)
     field("Backpack", "Blocks: " .. backpack(blockId) .. "\nSeeds: " .. backpack(seedId), true)
@@ -2790,8 +2812,10 @@ local function webhookPayload(config, profile, metrics)
     field("This script session", "Time loaded: " .. minutes .. " min\nBlocks broken: " .. App.stats.broken
         .. "\nGems collected: " .. App.stats.gems .. "\nBlocks moved: " .. App.stats.moved .. "\nTrips: " .. App.stats.trips
         .. "\nHarvest blocks collected: " .. App.stats.harvested .. "\nBlocks stashed in Farm storage: " .. App.stats.stashed
-        .. "\nSeeds planted: " .. App.stats.planted)
-    if App.job == "plant" then
+        .. "\nSeeds planted: " .. App.stats.planted .. "\nTrees harvested: " .. App.stats.trees
+        .. "\nHarvest seeds collected: " .. App.stats.harvestSeeds .. "\nHarvest seeds stored: " .. App.stats.stashedSeeds
+        .. "\nRotations completed: " .. App.stats.cycles)
+    if job == "plant" or job == "rotation" then
         field("Planting seed", r and r.items[config.planting.seedId] and r.items[config.planting.seedId].name or "Not selected", true)
         field("Planting seeds in backpack", backpack(config.planting.seedId), true)
         if config.webhook.includeBoxes then field("Planting seed Display Box", reportBox(config.points.plantBox, config.planting.seedId), true) end
@@ -2802,10 +2826,19 @@ local function webhookPayload(config, profile, metrics)
         field("Farm Display Box", reportBox(config.points.farmBox, blockId), true)
         field("Farm seeds", reportBox(config.points.farmBox, seedId), true)
     end
-    return { username = "Claris Growblox", allowed_mentions = {parse = {}}, embeds = {{
-        title = "Growblox player stats", color = 0x65C18C, fields = fields,
+    local failure = event and event.kind == "failure"
+    if failure then field("Failure", event.message) end
+    local payload = { username = "Claris Growblox", allowed_mentions = {parse = {}}, embeds = {{
+        title = failure and "Growblox task failed" or event and "Growblox work report" or "Growblox player stats",
+        color = failure and 0xE74C3C or 0x65C18C, fields = fields,
         footer = {text = "Claris Growblox v" .. VERSION .. " | " .. os.date("!%Y-%m-%d %H:%M:%S UTC")},
     }} }
+    if failure then
+        local id = Core.discordUserId(config.webhook.discordId)
+        payload.content = (id ~= "" and ("<@" .. id .. "> ") or "") .. "Growblox task failed."
+        if id ~= "" then payload.allowed_mentions.users = {id} end
+    end
+    return payload
 end
 local function webhookTransport()
     local candidates = {request, http_request, env.request, env.http_request,
@@ -2832,7 +2865,8 @@ local function webhookMetrics()
     local gems = beginWebhookRequest(r.world.call, "GetGems")
     local level = beginWebhookRequest(r.world.call, "GetLevel")
     local deadline = os.clock() + 8
-    while App.alive and not (gems.done and level.done) and os.clock() < deadline do task.wait(0.05) end
+    while App.alive and not (gems.done and level.done) and os.clock() < deadline
+        and not (App.webhookState.events[1] and App.webhookState.events[1].kind == "failure") do task.wait(0.05) end
     local function number(result)
         local values = result.done and result.values
         local value = values and values[1] and values[2]
@@ -2853,16 +2887,24 @@ local function discordRetry(response)
     if not retry or retry ~= retry or retry == math.huge then retry = 60 end
     return math.max(1, math.min(retry, 86400))
 end
-local function sendWebhook(manual)
+local function sendWebhook(manual, event)
     local state, now = App.webhookState, os.clock()
+    event = event or state.events[1]
     if not App.alive then return false, "Script unloaded." end
-    if state.inFlight or state.pending > 0 then return false, "Waiting for the previous report request to finish." end
+    if state.inFlight or (event and state.httpPending or state.pending) > 0 then
+        return false, "Waiting for the previous report request to finish."
+    end
     if now < (state.retryAt or 0) then return false, "Discord requested a cooldown. Try again later." end
     if state.lastAttempt and now - state.lastAttempt < 5 then return false, "Wait five seconds between reports." end
+    if event and now < (event.retryAt or 0) then return false, "Waiting to retry the queued report." end
     local valid, settings = pcall(Core.validateWebhook, App.config.webhook)
     if not valid then return false, tostring(settings) end
     if settings.url == "" then return false, "Set the Discord webhook URL first." end
-    if not manual and not settings.enabled then return false, "Automatic reports are Off." end
+    if event then
+        if event.kind == "failure" and not settings.failureAlerts or event.kind == "work" and not settings.enabled then
+            return false, "This report type is switched Off."
+        end
+    elseif not manual and not settings.enabled then return false, "Automatic reports are Off." end
     local transport = webhookTransport()
     if not transport then
         state.status = "Delta HTTP request function is unavailable."
@@ -2870,14 +2912,38 @@ local function sendWebhook(manual)
         return false, state.status
     end
     local generation, config, profile = state.generation, App.config, App.profile
+    if event then event.attempts, event.rateLimited = (event.attempts or 0) + 1, false end
     state.inFlight, state.lastAttempt = true, now
-    state.nextAt, state.status = now + settings.intervalMinutes * 60, "Sending player stats..."
+    state.nextAt, state.status = now + settings.intervalMinutes * 60,
+        event and (event.kind == "failure" and "Sending failure alert..." or "Sending work report...") or "Sending player stats..."
     task.spawn(function()
         local ok, message = pcall(function()
-            local metrics = webhookMetrics()
+            local metrics = event and {} or webhookMetrics()
             if not App.alive or state.generation ~= generation then return end
-            local payload = webhookPayload(config, profile, metrics)
-            local response = beginWebhookRequest(transport, {
+            if not event and state.events[1] and state.events[1].kind == "failure" then
+                state.lastAttempt = nil -- No HTTP post was made; let the failure alert proceed.
+                return
+            end
+            local payload = event and event.payload or webhookPayload(config, profile, metrics)
+            state.httpPending = state.httpPending + 1
+            local response = beginWebhookRequest(function(options)
+                local received, result = pcall(transport, options)
+                state.httpPending = state.httpPending - 1
+                assert(received, tostring(result))
+                if event and App.alive and state.generation == generation and type(result) == "table" then
+                    local status = tonumber(result.StatusCode or result.Status)
+                    if status and status >= 200 and status < 300 and result.Success ~= false then
+                        -- A late successful HTTP reply also acknowledges the event.
+                        -- Its next poll must not post the same failure a second time.
+                        event.delivered = true
+                    elseif status == 429 then
+                        state.retryAt = os.clock() + discordRetry(result)
+                        event.rateLimited, event.retryAt = true, nil
+                        event.attempts = event.attempts - 1
+                    end
+                end
+                return result
+            end, {
                 Url = settings.url .. "?wait=true", Method = "POST",
                 Headers = {["Content-Type"] = "application/json"}, Body = encode(payload),
             })
@@ -2897,17 +2963,54 @@ local function sendWebhook(manual)
             end
             assert(status and status >= 200 and status < 300 and result.Success ~= false,
                 "Discord rejected the report (HTTP " .. tostring(status or "unknown") .. "). Check your webhook URL.")
-            state.lastSent, state.status = os.date("%H:%M:%S"), "Report sent."
+            state.lastSent, state.status = os.date("%H:%M:%S"),
+                event and (event.kind == "failure" and "Failure alert sent." or "Work report sent.") or "Report sent."
         end)
         state.inFlight = false
-        if not ok and App.alive and state.generation == generation then state.status = tostring(message) end
+        if App.alive and state.generation == generation then
+            if not ok then state.status = tostring(message) end
+            if event and (event.delivered or event.attempts >= 3 and not event.rateLimited) then
+                for index, queued in ipairs(state.events) do
+                    if queued == event then table.remove(state.events, index); break end
+                end
+                if not event.delivered then state.status = "Queued report failed after three attempts: " .. tostring(message) end
+            elseif event and not ok and not event.rateLimited then
+                event.retryAt = os.clock() + math.max(5, event.attempts * 10)
+            end
+        end
     end)
+    return true
+end
+queueWebhookEvent = function(kind, message, mode)
+    if not App.alive then return false end
+    local valid, config = pcall(Core.validate, App.config)
+    if not valid or config.webhook.url == "" then return false end
+    if kind == "failure" then
+        if not config.webhook.failureAlerts then return false end
+    elseif kind == "work" then
+        if not config.webhook.enabled then return false end
+    else return false end
+    local event = {kind = kind, message = tostring(message), mode = mode, attempts = 0}
+    local built, payload = pcall(webhookPayload, config, App.profile, {}, event)
+    if not built then return false end
+    event.payload = payload
+    local state = App.webhookState
+    if #state.events >= 10 then table.remove(state.events, #state.events) end
+    if kind == "failure" then table.insert(state.events, 1, event) else table.insert(state.events, event) end
+    state.status = kind == "failure" and "Failure alert queued." or "Work report queued."
     return true
 end
 local function pollWebhook()
     local state = App.webhookState
-    if App.alive and App.config.webhook.enabled and not App.configuring and App.runtime
-        and os.clock() >= (state.nextAt or 0) then
+    if not App.alive or App.configuring then return end
+    for index = #state.events, 1, -1 do
+        if state.events[index].delivered then
+            state.lastSent, state.status = os.date("%H:%M:%S"), "Queued report sent after its delayed reply."
+            table.remove(state.events, index)
+        end
+    end
+    if state.events[1] then sendWebhook(false, state.events[1])
+    elseif App.config.webhook.enabled and App.runtime and os.clock() >= (state.nextAt or 0) then
         sendWebhook(false)
     end
 end
@@ -3026,6 +3129,7 @@ if env.ClarisGrowbloxTest then
         savePNBResume = savePNBResume, readPNBResume = readPNBResume, refreshPNBCheckpoint = refreshPNBCheckpoint,
         webhookPayload = webhookPayload, setWebhookSetting = setWebhookSetting,
         resetWebhookSchedule = resetWebhookSchedule, sendWebhook = sendWebhook, pollWebhook = pollWebhook,
+        queueWebhookEvent = queueWebhookEvent,
         findWorldPicker = findWorldPicker, findRespawn = findRespawn, pickerOpen = pickerOpen, runHarvest = runHarvest,
         runTreeHarvest = runTreeHarvest, treeGrowthHooks = treeGrowthHooks,
         runRotation = runRotation, readRotationResume = readRotationResume, saveRotationResume = saveRotationResume,
@@ -3549,7 +3653,7 @@ profileTab:Button({ Title = "Clear saved transfer", Desc = "Use after checking a
     setStatus("Cleared saved transfer.")
 end) })
 
-webhookTab:Paragraph({ Title = "Discord player reports", Desc = "Send player level and gems, farm status, session totals, backpack blocks/seeds, and saved Display Box counts. Save the profile to keep these settings. Keep your webhook URL private." })
+webhookTab:Paragraph({ Title = "Discord work reports", Desc = "Report task status, rotation farm/phase/cycle, trees harvested, blocks and seeds collected, PNB work, and backpack/storage counts. Timed reports also include player level and gems. Failure alerts can ping your Discord account. Save the profile to keep these settings." })
 local function webhookChanged(key)
     return function(value)
         if App.syncingWebhookUI or App.syncingUI then return end
@@ -3562,12 +3666,18 @@ end
 App.syncingWebhookUI = true
 webhookControls.url = webhookTab:Input({ Title = "Discord webhook URL", Value = App.config.webhook.url,
     Placeholder = "https://discord.com/api/webhooks/...", Callback = webhookChanged("url") })
+webhookControls.discordId = webhookTab:Input({ Title = "Discord user ID to ping on failure", Value = App.config.webhook.discordId,
+    Desc = "Enable Discord Developer Mode, then Copy User ID. Leave blank for an alert without a ping.",
+    Placeholder = "17-20 digit user ID", ClearTextOnFocus = false, Callback = webhookChanged("discordId") })
+webhookControls.failureAlerts = webhookTab:Toggle({ Title = "Failure alerts", Value = App.config.webhook.failureAlerts,
+    Desc = "Send an alert when a task pauses with an error, including when timed reports are Off. Only failures ping the saved Discord ID.",
+    Callback = webhookChanged("failureAlerts") })
 webhookControls.intervalMinutes = webhookTab:Input({ Title = "Send every (minutes)", Value = tostring(App.config.webhook.intervalMinutes),
     Desc = "Enter 1-1440 minutes, for example 1, 5, or 30.", Placeholder = "5", Callback = webhookChanged("intervalMinutes") })
 webhookControls.includeBoxes = webhookTab:Toggle({ Title = "Include Display Box counts", Value = App.config.webhook.includeBoxes,
     Desc = "Count selected blocks/seeds in saved boxes. Boxes in another world show as unavailable.", Callback = webhookChanged("includeBoxes") })
 webhookControls.enabled = webhookTab:Toggle({ Title = "Automatic webhook reports", Value = App.config.webhook.enabled,
-    Desc = "On sends a report, then repeats at your interval while the script is loaded. Off stops future reports.", Callback = webhookChanged("enabled") })
+    Desc = "Send timed progress reports, completed-task reports, and completed rotation cycles. Failure alerts use their own toggle.", Callback = webhookChanged("enabled") })
 App.syncingWebhookUI = false
 webhookTab:Button({ Title = "Send stats now", Callback = function()
     local ok, message = sendWebhook(true)
@@ -3693,6 +3803,7 @@ task.spawn(function()
         paragraphSet(ui.diagnostics, "Game connection", tostring(message))
         setStatus(tostring(message))
         notify(tostring(message))
+        queueWebhookEvent("failure", "Could not connect the script: " .. tostring(message), "connection")
     elseif env.ClarisGrowbloxAutoResume then
         env.ClarisGrowbloxAutoResume = nil
         local resumed, problem = pcall(function()
@@ -3701,7 +3812,10 @@ task.spawn(function()
             elseif readPNBResume() then resumeFarm()
             elseif App.resume then resumeTransfer() end
         end)
-        if not resumed then setStatus(tostring(problem)); notify(tostring(problem)) end
+        if not resumed then
+            setStatus(tostring(problem)); notify(tostring(problem))
+            queueWebhookEvent("failure", "Could not resume the saved task: " .. tostring(problem), "resume")
+        end
     end
 end)
 task.spawn(function()
@@ -3739,6 +3853,8 @@ task.spawn(function()
             local state = App.webhookState
             local details = state.status .. "\nInterval: " .. App.config.webhook.intervalMinutes .. " min"
                 .. "\nLast sent: " .. (state.lastSent or "Never")
+                .. "\nFailure alerts: " .. (App.config.webhook.failureAlerts and "On" or "Off")
+                .. "\nQueued work/failure reports: " .. #state.events
             if App.config.webhook.enabled then
                 local nextAt = math.max(state.nextAt or os.clock(), state.retryAt or 0)
                 details = details .. "\nNext report in: " .. math.ceil(math.max(0, nextAt - os.clock()) / 60) .. " min"

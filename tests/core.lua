@@ -435,4 +435,27 @@ test("Configuration imports reject foreign exports, unsupported versions, recove
     rejects(function() Core.importConfig(record) end,"block ID")
 end)
 
+test("Discord user IDs remain exact strings and accept a copied user mention", function()
+    local id="123456789012345678"
+    assert(Core.discordUserId(" " .. id .. " ") == id)
+    assert(Core.discordUserId("<@" .. id .. ">") == id and Core.discordUserId("<@!" .. id .. ">") == id)
+    assert(Core.discordUserId(nil) == "" and Core.discordUserId("  ") == "")
+    for _,bad in ipairs({123456789012345678,"123","012345678901234567","123456789012345678901","@everyone","<@&123456789012345678>"}) do
+        rejects(function() Core.discordUserId(bad) end)
+    end
+end)
+
+test("Legacy webhook settings default to failure alerts without a ping and preserve new settings in exports", function()
+    local config=setup()
+    config.webhook={url="https://discord.com/api/webhooks/123/test_token",enabled=false,intervalMinutes=5,includeBoxes=true}
+    local saved=Core.validate(config)
+    assert(saved.webhook.failureAlerts and saved.webhook.discordId == "")
+    saved.webhook.discordId="123456789012345678"
+    saved.webhook.failureAlerts=false
+    local imported=Core.importConfig(Core.exportConfig(saved,"Reports","0.1.23"))
+    assert(imported.webhook.discordId == "123456789012345678" and not imported.webhook.failureAlerts)
+    saved.webhook.failureAlerts="yes"
+    rejects(function() Core.validate(saved) end,"failure alert toggle")
+end)
+
 return string.format("%d configuration/layout/storage tests passed", passed)
