@@ -1,6 +1,6 @@
 # Full Rotation guide
 
-For **Claris Growblox 0.1.24**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
+For **Claris Growblox 0.1.25**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
 
 The usual flow is **fill planting space → PNB while trees grow → harvest a ready farm → transfer its blocks and seeds → replant that farm → repeat**. Planting and ready harvests take priority over breaking. A full farm skips planting even when seed storage contains thousands of seeds.
 
@@ -266,6 +266,8 @@ Accounts can use the same webhook and ping the same Discord user; reports identi
 | Missing PNB spot or storage | Resave the middle spot and left/right boxes on Place & Break, all in the same world. |
 | Layout error | Put boxes two tiles left/right of the PNB spot on the same row; clear the tile above the player. |
 | Seed mismatch / use PNB seed storage | Select the correct block, save the left PNB box, and press Use PNB seeds for planting again. |
+| Missing method 'Set' when using PNB seeds or loading config | Update to v0.1.25, push the rebuilt release, rerun the same GitHub loader, then retry. This fixes the dropdown refresh and resets the old UI lock. Check that the farm list and seed settings are displayed correctly. |
+| Planting hook unavailable before starting | Farming hooks are deferred during the initial connection. They attach when Planting or Full Rotation starts. If task startup itself fails, copy diagnostics. |
 | Missing farm box | Visit the exact named farm and save its reachable harvest box. Check every listed world. |
 | Full farm is not planting | Occupied tiles are intentionally skipped. Growing trees lead to PNB; ripe trees lead to harvest. |
 | Some trees are ripe but the farm is still growing | The maturity wait accounts for remaining matching growing trees too. |

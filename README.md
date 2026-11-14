@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.24.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.25.
+
+Version 0.1.25 fixes `attempt to call missing method 'Set' of table` when pressing **Use PNB seeds for planting**, loading/importing a configuration, or restoring the harvest-method selection. WindUI dropdowns use `Select`; the UI now uses that method and releases its settings-update guard even if a refresh fails. The planting hook can appear unavailable before starting a task because farming attachment is deferred until planting/rotation begins.
 
 Version 0.1.24 runs PNB while rotation farms grow. Full farms skip planting even when seed storage is stocked. When a farm is ready, PNB finishes its current block and pickups, stores unused inventory, and yields for harvesting, transfer, and replanting. Farm timers recorded during planting avoid another startup scan; the next expected mature farm gets priority across the list. Empty PNB storage waits in the breaking world. Saved configuration, task phase, replant progress, completed farms, and server-time harvest deadlines survive world-change reloads through the queued loader.
 
@@ -221,7 +223,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.24 passes 293 offline checks: 41 configuration/layout/storage tests, 244 generated-runtime tests against mock services/server, six generated-loader tests, and two release checks. New coverage checks full stocked farms skipping planting, PNB during growth waits, harvest priority with remaining PNB blocks, a later farm maturing first, replanting before more breaking, empty-stock waits without repeated farm travel, PNB seed production resuming planting, a withdrawal crossing the harvest deadline, queued-loader registration after a reset, saved config/schedule restoration, executor-clock resets, replant reconciliation, and invalid/ambiguous checkpoints. Earlier webhook, export/import, harvesting, rotation, transfer, navigation, and recovery checks remain passing. These mocks do not establish live Discord delivery, clipboard behavior, tractor/server acceptance, Delta frame times, planting reach, route geometry, permissions, or teleport queue behavior.
+Version 0.1.25 passes 297 offline checks: 41 configuration/layout/storage tests, 248 generated-runtime tests against mock services/server, six generated-loader tests, and two release checks. New UI coverage uses dropdowns with the same Select/Refresh methods as vendored WindUI and no Set method. It exercises entering farm names then using PNB seeds, subsequent setting edits, profile import/load/reset, rejecting a harvest-method change during a task, and retrying setup after a UI refresh error. Earlier rotation scheduling, world-change recovery, webhook, export/import, harvesting, transfer, and navigation checks remain passing. These mocks do not establish live Discord delivery, clipboard behavior, tractor/server acceptance, Delta frame times, planting reach, route geometry, permissions, or teleport queue behavior.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 

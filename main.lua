@@ -648,7 +648,7 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.24"
+local VERSION = "0.1.25"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -4109,7 +4109,7 @@ settingsControls.harvestMethod = harvestTab:Dropdown({ Title = "Harvest method",
         if App.job or App.configuring or App.pending > 0 then
             notify("Stop the task before changing the harvest method.")
             App.syncingUI = true
-            settingsControls.harvestMethod:Set(App.config.harvesting.method == "tractor" and "Dear John Tractor" or "Fist")
+            settingsControls.harvestMethod:Select(App.config.harvesting.method == "tractor" and "Dear John Tractor" or "Fist")
             App.syncingUI = false
             return
         end
@@ -4231,18 +4231,23 @@ local function syncWebhookControls()
     App.syncingWebhookUI = false
 end
 local function syncUI()
+    local previous = App.syncingUI
     App.syncingUI = true
-    for key, control in pairs(settingsControls) do
-        control:Set(key == "harvestMethod" and (App.config.harvesting.method == "tractor" and "Dear John Tractor" or "Fist")
-            or App.config.options[key])
-    end
-    profileNameInput:Set(App.profile)
-    if App.runtime then refreshBlocks() end
-    refreshSeeds()
-    updatePoints()
-    resetWebhookSchedule()
-    syncWebhookControls()
-    App.syncingUI = false
+    local ok, issue = pcall(function()
+        for key, control in pairs(settingsControls) do
+            if key == "harvestMethod" then
+                control:Select(App.config.harvesting.method == "tractor" and "Dear John Tractor" or "Fist")
+            else control:Set(App.config.options[key]) end
+        end
+        profileNameInput:Set(App.profile)
+        if App.runtime then refreshBlocks() end
+        refreshSeeds()
+        updatePoints()
+        resetWebhookSchedule()
+        syncWebhookControls()
+    end)
+    App.syncingUI = previous
+    if not ok then error(issue, 0) end
 end
 local function profilePath(name)
     return PROFILE_DIR .. "/" .. Core.profileName(name) .. ".json"

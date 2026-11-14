@@ -3339,9 +3339,9 @@ local function largeSeedCatalog(f)
     for n = 1, 10000 do f.app.runtime.items[n + 2000] = {name = string.format("Bulk Seed %05d", n), kind = "seed"} end
 end
 
-test("Actual UI startup limits seed entries, renders once, and supports a bounded catalog search", function()
+local function actualUIFixture(withCatalog)
     local f = fixture()
-    largeSeedCatalog(f)
+    if withCatalog then largeSeedCatalog(f) end
     f.app.job, f.app.jobToken, f.app.config.planting.seedId = nil, nil, 955
     f.inventory:add(955, 5)
     prepareDiscovery(f, true)
@@ -3365,7 +3365,12 @@ test("Actual UI startup limits seed entries, renders once, and supports a bounde
         return c
     end
     for _, kind in ipairs({"Button", "Input", "Toggle", "Slider"}) do tab[kind] = function(_, props) return control(props) end end
-    function tab:Dropdown(props) local c = control(props); c:Refresh(c.Values); return c end
+    function tab:Dropdown(props)
+        local c = control(props)
+        c.Set = nil -- Vendored WindUI dropdowns expose Select/Refresh, not Set.
+        c:Refresh(c.Values)
+        return c
+    end
     function tab:Paragraph(props)
         local c = control(props)
         c.ParagraphFrame = {SetTitle = function() end, SetDesc = function(_, text) c.Desc = text end}
@@ -3381,6 +3386,11 @@ test("Actual UI startup limits seed entries, renders once, and supports a bounde
     local app = f.reload(true) -- Execute the actual UI path, beyond the usual test hooks.
     assert(#workers == 2 and app.window == window)
     workers[1]() -- Run connection/bootstrap; leave the perpetual status loop scheduled.
+    return f, app, controls, workers, firstGCWait
+end
+
+test("Actual UI startup limits seed entries, renders once, and supports a bounded catalog search", function()
+    local f, app, controls, workers, firstGCWait = actualUIFixture(true)
     local seeds = controls["Seed to plant"]
     assert(seeds.maxRows <= 40, "Startup built " .. seeds.maxRows .. " seed rows")
     assert(seeds.refreshes == 2, "Seed list was rebuilt more than once after initial creation")
@@ -3399,6 +3409,72 @@ test("Actual UI startup limits seed entries, renders once, and supports a bounde
     seeds.Value = label
     seeds.Props.Callback(label)
     assert(app.config.planting.seedId == 10001 and app.config.points.farmDoor.world == "FARM")
+end)
+
+test("Use PNB seeds updates the real UI after entering farms with Select-only WindUI dropdowns", function()
+    local f, app, controls, workers = actualUIFixture()
+    assert(controls["Harvest method"].Set == nil)
+    controls["Dirt farm worlds (in order)"].Props.Callback("FARM1, FARM2")
+    controls["Use PNB seeds for planting"].Props.Callback()
+    workers[3]()
+    assert(app.config.planting.seedId == 955 and app.config.planting.storageWorld == "BREAK")
+    assert(app.config.points.plantBox.x == app.config.points.seedBox.x and app.config.points.plantBox.world == "BREAK")
+    assert(controls["Seed to plant"].Value == "Sugar Cane Seed [955]" and controls["Seed storage world"].Value == "BREAK")
+    assert(controls["Dirt farm worlds (in order)"].Value == "FARM1, FARM2" and controls["Harvest method"].Value == "Fist")
+    assert(not app.syncingUI and not app.syncingPlantUI and not app.syncingWebhookUI)
+    controls["Dirt farm worlds (in order)"].Props.Callback("FARM2, FARM3")
+    assert(app.config.planting.worlds[2] == "FARM3", "Seed setup must not leave later settings changes locked")
+    assert(app.runtime.farmingDeferred and app.pending == 0 and f.pickups == 0 and f.displays == 0)
+end)
+
+test("Actual UI imports, loads, and resets profiles with the supported harvest dropdown method", function()
+    local f, app, controls, workers = actualUIFixture()
+    app.config.harvesting.method = "tractor"
+    app.config.planting.worlds = {"FARM1", "FARM2"}
+    local record = f.hooks.Core.exportConfig(app.config, "Portable UI", "0.1.25")
+    controls["Configuration text"].Value = f.services.HttpService:JSONEncode(record)
+    controls["Import config"].Props.Callback()
+    workers[3]()
+    assert(app.profile == "Portable UI" and controls["Harvest method"].Value == "Dear John Tractor" and not app.syncingUI)
+    assert(f.files["ClarisGrowblox/profiles/Portable UI.json"] and app.job == nil)
+    -- The fixture codec stores tables by reference; snapshot the saved JSON as
+    -- real serialization does before changing the live configuration.
+    f.encoded[f.files["ClarisGrowblox/profiles/Portable UI.json"]] = f.hooks.Core.validate(app.config)
+    controls["Harvest method"].Props.Callback("Fist")
+    assert(app.config.harvesting.method == "fist")
+    controls["Saved profiles"].Props.Callback("Portable UI")
+    controls["Load selected profile"].Props.Callback()
+    workers[4]()
+    assert(app.config.harvesting.method == "tractor" and controls["Harvest method"].Value == "Dear John Tractor")
+    assert(controls["Dirt farm worlds (in order)"].Value == "FARM1, FARM2" and not app.syncingUI)
+    controls["New empty configuration"].Props.Callback()
+    workers[5]()
+    assert(app.profile == "New Farm" and controls["Harvest method"].Value == "Fist" and not app.syncingUI)
+end)
+
+test("Changing harvest method during a task restores the dropdown using Select without changing config", function()
+    local _, app, controls = actualUIFixture()
+    app.job = "rotation"
+    controls["Harvest method"].Value = "Dear John Tractor"
+    controls["Harvest method"].Props.Callback("Dear John Tractor")
+    assert(app.config.harvesting.method == "fist" and controls["Harvest method"].Value == "Fist")
+    assert(not app.syncingUI)
+end)
+
+test("A UI refresh error restores the settings guard and allows seed setup to be retried", function()
+    local _, app, controls, workers = actualUIFixture()
+    local input, set = controls["Profile name"], controls["Profile name"].Set
+    input.Set = function() error("UI render failed") end
+    controls["Use PNB seeds for planting"].Props.Callback()
+    workers[3]()
+    assert(app.status:find("UI render failed", 1, true) and not app.syncingUI and not app.configuring)
+    input.Set = set
+    controls["Dirt farm worlds (in order)"].Props.Callback("FARM1, FARM2")
+    assert(app.config.planting.worlds[2] == "FARM2")
+    controls["Use PNB seeds for planting"].Props.Callback()
+    workers[4]()
+    assert(controls["Seed storage world"].Value == "BREAK" and controls["Harvest method"].Value == "Fist")
+    assert(not app.syncingUI and not app.configuring)
 end)
 
 test("Default seed choices use inventory, the saved seed, box contents, and related block seed", function()
