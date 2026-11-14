@@ -5361,7 +5361,127 @@ local function fillGrowingFarms(f, readyIn)
     end
 end
 
-test("Old farm drops and stored crop never override a growing tree's rotation deadline", function()
+test("An empty PNB with a saved future deadline recovers loose and stored crop without harvesting growing trees", function()
+    local f = rotationFixture()
+    fillGrowingFarms(f,{FARM=600,FARM2=600})
+    f.worldBoxes.BREAK[8],f.worldBoxes.BREAK[12] = {},{}
+    f.worldBoxes.FARM[0] = {{954,401},{955,5}}
+    f.addDrop(10000,954,3,2.5,8.5)
+    f.addDrop(10001,955,2,3.5,8.5)
+    f.addDrop(10002,112,7,4.5,8.5)
+    f.app.config.options.harvestPlanting = true
+    f.hooks.saveRotationResume({phase="waitPNB",worldIndex=1,cycle=1,work=0,seedCargo=0,
+        readyAt={FARM=600,FARM2=600},completed={}})
+    f.afterWait = function()
+        if f.pnbBlocks == 2 then
+            local saved = f.hooks.readRotationResume().state
+            assert(not saved.completed.FARM and not saved.collectOnly and saved.readyAt.FARM > os.clock())
+            f.app:stop()
+        end
+    end
+    f.hooks.start("rotation",f.hooks.readRotationResume())
+    assert(not f.app.lastError,f.app.lastError)
+    assert(#f.worldDrops.FARM == 0 and f.hooks.Core.itemCount(f.worldBoxes.FARM[0],954) == 0)
+    assert(#f.harvests == 0 and #f.plants == 0 and f.pnbBlocks == 2)
+    assert(f.app.stats.moved == 404 and f.app.stats.harvested == 3 and f.app.stats.harvestSeeds == 2)
+    assert(f.serverGems == 107 and f.hooks.Core.itemCount(f.worldBoxes.BREAK[8],955) >= 7)
+    assert(f.hooks.Core.itemCount(f.worldBoxes.BREAK[12],954) == 204)
+end)
+
+test("Empty seed/block supply checks the farms once and waits without repeating an empty drain", function()
+    local f = rotationFixture()
+    fillGrowingFarms(f,{FARM=600,FARM2=600})
+    f.worldBoxes.BREAK[8],f.worldBoxes.BREAK[12] = {},{}
+    f.hooks.saveRotationResume({phase="waitPNB",worldIndex=1,cycle=1,work=0,seedCargo=0,
+        readyAt={FARM=600,FARM2=600},completed={}})
+    local waited, final = 0
+    f.afterWait = function(dt)
+        if f.app.status:find("PNB block storage is empty",1,true) then
+            waited = waited+dt
+            if waited >= 15 then
+                final = f.hooks.readRotationResume().state
+                f.app:stop()
+            end
+        end
+    end
+    f.hooks.start("rotation",f.hooks.readRotationResume())
+    assert(not f.app.lastError,f.app.lastError)
+    assert(final.pnbEmpty and final.emptyChecks.FARM and final.emptyChecks.FARM2 and final.phase == "waitPNB")
+    local drains = 0
+    for _,line in ipairs(f.app.logs) do if line:find("Seed supply exhausted",1,true) then drains=drains+1 end end
+    assert(drains == 1 and #f.entries == 5, "Empty supply must not repeat drains or farm changes")
+    assert(#f.harvests == 0 and #f.plants == 0 and f.pnbBlocks == 0 and #f.requests == 0)
+end)
+
+test("A stock-only transfer resumes across script reset before collecting seeds and resuming PNB", function()
+    local f = rotationFixture()
+    fillGrowingFarms(f,{FARM=600,FARM2=600})
+    f.worldBoxes.BREAK[8],f.worldBoxes.BREAK[12] = {},{}
+    f.worldBoxes.FARM[0] = {{954,10},{955,7}}
+    f.addDrop(10000,954,3,2.5,8.5)
+    f.addDrop(10001,112,4,3.5,8.5)
+    f.app.config.options.harvestPlanting = true
+    f.hooks.saveRotationResume({phase="waitPNB",worldIndex=1,cycle=1,work=0,seedCargo=0,
+        readyAt={FARM=600,FARM2=600},completed={}})
+    f.env.ClarisGrowbloxLoaderURL = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/loader.lua"
+    local queued, enter = 0, f.world.enter
+    queue_on_teleport = function() queued=queued+1 end
+    f.world.enter = function(name)
+        enter(name)
+        if name == "BREAK" and f.app.stats.moved == 0 and f.app.rotationState.collectOnly
+            and f.app.rotationState.phase == "transfer" then return true,nil,true end
+        return true
+    end
+    f.afterWait = function() if f.app.teleporting then f.app.alive=false end end
+    f.hooks.start("rotation",f.hooks.readRotationResume())
+    local runtime, saved = f.app.runtime, f.hooks.readRotationResume()
+    assert(queued == 1 and saved.state.collectOnly and saved.state.transfer.phase == "deliver")
+    assert(saved.state.pnbEmpty and #f.harvests == 0 and #f.plants == 0 and #f.worldDrops.FARM == 0)
+    f.hooks = f.reload()
+    f.app = f.hooks.App
+    f.app.runtime, f.app.config, f.app.profile = runtime, saved.config, saved.profile
+    f.world.enter = enter
+    f.afterWait = function() if f.pnbBlocks == 2 then f.app:stop() end end
+    f.hooks.start("rotation",saved)
+    queue_on_teleport = nil
+    assert(not f.app.lastError,f.app.lastError)
+    assert(f.pnbBlocks == 2 and #f.harvests == 0 and #f.plants == 0 and f.serverGems == 104)
+    assert(f.hooks.Core.itemCount(f.worldBoxes.FARM[0],954) == 0 and f.hooks.Core.itemCount(f.worldBoxes.FARM[0],955) == 0)
+    assert(f.hooks.Core.itemCount(f.worldBoxes.BREAK[8],955) >= 7)
+end)
+
+test("PNB claims leftover blocks/seeds/gems before treating empty storage as exhausted", function()
+    local f = rotationFixture()
+    f.world.enter("BREAK")
+    f.worldBoxes.BREAK[8],f.worldBoxes.BREAK[12] = {},{}
+    f.addDrop(10000,954,1,10.5,8.5)
+    f.addDrop(10001,955,3,10.5,8.5)
+    f.addDrop(10002,112,4,10.5,8.5)
+    f.app.job,f.app.token = "pnb",1
+    f.hooks.takeControls()
+    assert(f.hooks.runPNB(1) == true)
+    assert(f.pnbBlocks == 1 and #f.worldDrops.BREAK == 0 and f.serverGems == 104)
+    assert(f.serverItems[955] == 4 and f.inventory:count(955) == 4 and f.app.pending == 0)
+end)
+
+test("Saved stock recovery cannot approve tree harvesting or accept malformed empty-supply state", function()
+    local f = rotationFixture()
+    local state = {phase="harvest",worldIndex=1,cycle=1,work=0,seedCargo=0,
+        collectOnly=true,harvestPass={world="FARM",phase="trees"}}
+    f.hooks.saveRotationResume(state)
+    rejects(f.hooks.readRotationResume,"Stock collection cannot start a tree harvest")
+    state.harvestPass.phase = "collect"
+    f.hooks.saveRotationResume(state)
+    assert(f.hooks.readRotationResume().state.collectOnly)
+    state.collectOnly,state.harvestPass,state.phase,state.pnbEmpty = nil,nil,"waitPNB","yes"
+    f.hooks.saveRotationResume(state)
+    rejects(f.hooks.readRotationResume,"Invalid saved PNB supply state")
+    state.pnbEmpty,state.emptyChecks = true,{FARM=1}
+    f.hooks.saveRotationResume(state)
+    rejects(f.hooks.readRotationResume,"Invalid saved rotation schedule value")
+end)
+
+test("Existing farm stock is recovered without harvesting growing trees or delaying a ready farm", function()
     local f=rotationFixture()
     fillGrowingFarms(f,{FARM=200,FARM2=0})
     f.treeTimes.FARM[8*f.world.w+1]=0-f.app.runtime.items[955].grow
@@ -5370,11 +5490,11 @@ test("Old farm drops and stored crop never override a growing tree's rotation de
     f.afterWait=function() if #f.harvests==5 then f.app:stop() end end
     f.hooks.start("rotation")
     assert(not f.app.lastError,f.app.lastError)
-    assert(#f.harvests==5 and f.harvests[1].world=="FARM2" and #f.worldDrops.FARM==1)
-    assert(f.hooks.Core.storageCount(f.worldBoxes.FARM[0],954,955)==1)
+    assert(#f.harvests==5 and f.harvests[1].world=="FARM2" and #f.worldDrops.FARM==0)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.FARM[0],954,955)==0 and f.app.stats.moved==2)
 end)
 
-test("Resuming an immature harvest returns to PNB instead of harvesting or transferring stored crop", function()
+test("An unapproved immature harvest recovers stored stock without breaking or planting trees", function()
     local f=rotationFixture()
     fillGrowingFarms(f,{FARM=200,FARM2=200})
     f.worldBoxes.FARM[0]={{954,1}}
@@ -5384,7 +5504,7 @@ test("Resuming an immature harvest returns to PNB instead of harvesting or trans
     f.hooks.start("rotation",f.hooks.readRotationResume())
     assert(not f.app.lastError,f.app.lastError)
     assert(#f.harvests==0 and #f.plants==0 and f.pnbBlocks==2)
-    assert(f.hooks.Core.storageCount(f.worldBoxes.FARM[0],954,955)==1)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.FARM[0],954,955)==0 and f.app.stats.moved==1)
 end)
 
 test("Combined rotation loads PNB seeds and replants both ripe farms during harvest before breaking", function()

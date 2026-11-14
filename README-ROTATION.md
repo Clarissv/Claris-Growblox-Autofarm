@@ -1,8 +1,8 @@
 # Full Rotation guide
 
-For **Claris Growblox 0.1.35**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
+For **Claris Growblox 0.1.36**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
 
-The usual flow is **fill planting space → PNB while trees grow → harvest a ready farm → transfer its blocks and seeds → replant that farm → repeat**. Planting and ready harvests normally take priority over breaking. When the planting seed supply is exhausted, rotation finishes the full PNB block stock first. A full farm skips planting even when seed storage contains thousands of seeds.
+The usual flow is **fill planting space → collect existing farm stock if needed → PNB while trees grow → harvest a ready farm → transfer its blocks and seeds → replant that farm → repeat**. Planting and ready harvests normally take priority over breaking. When the planting seed supply is exhausted, rotation finishes the full PNB block stock first. A full farm skips planting even when seed storage contains thousands of seeds.
 
 ## Contents
 
@@ -91,7 +91,7 @@ The existing **Save Farm storage** controls also remember the box for that world
 
 Choose the harvesting method on **Harvest Drops** before starting rotation.
 
-From v0.1.32, a harvest pass starts only when **every tree of the selected crop in that farm world is fully grown**. This automatic check applies to Fist and Tractor and includes trees outside the detected walking rows. One growing matching tree makes rotation wait for that world's latest maturity deadline, process other ready farms, and continue PNB while it waits. Existing loose drops or blocks/seeds in the farm box do not override the check. Missing tree growth data pauses with diagnostics instead of assuming maturity.
+From v0.1.32, a tree-harvesting pass starts only when **every tree of the selected crop in that farm world is fully grown**. This automatic check applies to Fist and Tractor and includes trees outside the detected walking rows. One growing matching tree makes rotation wait for that world's latest maturity deadline, process other ready farms, and continue PNB while it waits. From v0.1.36, existing loose drops and stored farm harvest can be collected and transferred during this wait, with growing trees left untouched. Missing tree growth data pauses with diagnostics instead of assuming maturity.
 
 Rotation checks again before starting a new harvest after a reload, world change or seed refill. Combined planting begins only after the farm passes this check. From v0.1.35, an already approved pass saves its tree-work or collection stage across retries and reloads. Its newly planted trees do not trigger another maturity wait before the remaining trees, Fist cleanup and loose-drop collection finish. Once that pass ends, the next harvest again requires the whole farm to mature. Standalone **Collect harvest** stops with a waiting status and leaves the trees and drops untouched if the world is immature; start it again when ready, or use Full Rotation for automatic waiting. **Copy diagnostics → Farm maturity check** shows the last checked world's ripe/growing counts; **Saved harvest pass** shows the current rotation harvest stage. No new toggle or configuration is required.
 
@@ -148,7 +148,8 @@ A fresh run begins with a planting pass over the full list. It fills empty suppo
 | --- | --- |
 | Full farms with growing trees and seeds still in storage | Skips planting and runs PNB while the trees grow. |
 | Full farms where every selected tree is ripe, with planting seeds available | Skips occupied tiles and processes ready harvests before breaking existing PNB stock. |
-| A farm has both ripe and growing selected trees | Waits for every selected tree in that world to mature; processes other ready farms or PNB while waiting. Old drops and staged farm storage do not trigger early harvest. |
+| A farm has both ripe and growing selected trees | Waits for every selected tree before breaking trees; can collect existing drops and transfer stored farm stock to PNB during that wait. |
+| PNB is empty but farms still have loose drops or stored blocks/seeds | Checks waiting farms once, collects existing harvest with the Tractor off, transfers it to PNB, and resumes breaking while trees grow. Saved future growth timers do not hide this stock. |
 | Empty supported planting spaces with seeds available | Fills them during the initial planting pass, before the harvest/wait flow. |
 | A farm becomes ready during normal PNB | Finishes the current block and pickups, stores unused inventory, then leaves for harvest. |
 | A farm has been harvested | Transfers its blocks/seeds and replants remaining empty spaces before more PNB. With Replant during harvest On, some or all tiles were already replanted during the harvest pass. |
@@ -159,7 +160,9 @@ A fresh run begins with a planting pass over the full list. It fills empty suppo
 | PNB drain finishes | Confirms no inventory/storage blocks or placed PNB block remain, settles pickups and stores seeds, then returns to normal farm scheduling. |
 | No eligible crop, planting stock, or PNB blocks can provide work | Pauses with an error instead of endlessly repeating empty travel. |
 
-For the tree-maturity wait, a farm is ready when its remaining matching growing trees have matured. The script uses planting times and growth duration, then confirms maturity after entering the farm. Harvested items already in its box or loose matching drops do not bypass the whole-world maturity check.
+For the tree-maturity wait, a farm is ready when its remaining matching growing trees have matured. The script uses planting times and growth duration, then confirms maturity after entering the farm. Harvested items already in its box or loose matching drops can provide collection/transfer work during the wait; this does not authorize breaking or replanting the growing trees.
+
+From v0.1.36, when PNB has no blocks, rotation checks each unfinished waiting farm once for loose or stored harvest even if its saved maturity deadline is still in the future. Collection-only recovery keeps the Tractor off, collects blocks/seeds/gems, stores the crop, transfers blocks and seeds to PNB, and resumes the original maturity schedule. The farm remains unfinished until its actual harvest/replant completes. These supply checks and collection/transfer progress survive supported world-change reloads. If every farm has been checked and no stock exists, rotation waits in PNB instead of repeating empty drains or server changes. New PNB stock starts another supply cycle; mature-farm deadlines still interrupt breaking normally.
 
 The list order is the planting order and resolves equal deadlines. Harvest scheduling can choose a later farm that matures sooner. A farm's replant normally takes priority after its harvest, before processing another farm. Seed exhaustion temporarily gives the full PNB drain priority. A completed rotation cycle counts the processed farm pass; it does not mean the PNB box was emptied.
 
@@ -173,7 +176,7 @@ Having 5,000 seeds does not make it plant over trees. Having 11,000 blocks does 
 
 The trigger is an empty planting backpack **and** an empty left PNB seed box. Seeds already carried for planting can still be used. If the last seeds finish a farm exactly, rotation checks the box before scheduling another farm, so exhaustion is detected even without a failed refill. No new toggle is required.
 
-For example, with no seeds left and 11,000 PNB blocks, rotation stays in PNB until all 11,000 blocks and returned blocks are consumed. It stores produced seeds without restarting planting after the first few seeds. Already-ripe farms also wait. After the drain, ready harvests and unfinished planting can resume using the accumulated stock. If PNB is already empty, it returns to normal farm scheduling immediately; growing farms wait for maturity.
+For example, with no seeds left and 11,000 PNB blocks, rotation stays in PNB until all 11,000 blocks and returned blocks are consumed. It stores produced seeds without restarting planting after the first few seeds. Already-ripe farms also wait. After the drain, ready harvests and unfinished planting can resume using the accumulated stock. If PNB is already empty, it checks waiting farms for existing drops and stored harvest. Growing trees still wait for maturity, but their already harvested stock can refill PNB.
 
 `checkSeeds` and `drainPNB` are saved phases. Reloading or a supported world teleport does not cancel an active drain when its seed box has refilled. Normal Stop still stops the task and clears its automatic-resume checkpoint. An interrupted storage request still pauses for inspection.
 
@@ -332,7 +335,8 @@ Accounts can use the same webhook and ping the same Discord user; reports identi
 | Missing farm box | Visit the exact named farm and save its reachable harvest box. Check every listed world. |
 | Full farm is not planting | Occupied tiles are intentionally skipped. Growing trees lead to PNB; ripe trees lead to harvest. |
 | Some trees are ripe but the farm is still growing | The maturity wait accounts for remaining matching growing trees too. |
-| Empty PNB storage while trees grow | Waits in the PNB world; harvest due or new blocks can provide the next work. |
+| Empty PNB storage while trees grow | v0.1.36 checks each waiting farm once for loose/stored harvest and moves recovered stock to PNB. If no stock exists, it waits without repeating an empty drain. |
+| Repeated “Seed supply exhausted” / “PNB block supply finished” with empty storage | Update to v0.1.36 and resume the saved rotation. It remembers that the drain finished, checks farm stock despite saved growth deadlines, and resumes PNB when stock arrives. |
 | Empty seed box and planting backpack | Drains PNB fully before more planting/harvesting. Produced seeds do not interrupt an active drain. If no blocks remain, normal farm scheduling resumes. |
 | Ripe farm waits during `drainPNB` | Expected after seed exhaustion. It resumes after all PNB inventory/storage blocks and pickups finish. |
 | Two cloud-phone accounts mix configs or rotations | Update both to v0.1.29 or newer. Check different account IDs/data folders in diagnostics; restore any previously overwritten config from an export/backup or resave it. |
