@@ -45,6 +45,7 @@ local function fixture()
         HttpService = http, Players = { LocalPlayer = localPlayer },
         ReplicatedStorage = { GetAttribute = function() return "session-registry" end },
         UserInputService = { GetFocusedTextBox = function() return nil end },
+        Workspace = {GetServerTimeNow = function() return os.clock() end},
     }
     game = { GetService = function(_, name) assert(services[name], name); return services[name] end }
     task = {
@@ -55,12 +56,14 @@ local function fixture()
         defer = function(fn) queue[#queue + 1] = fn end,
         wait = function(seconds)
             context.waits = (context.waits or 0) + 1
-            ticks = ticks + (seconds or 0.03)
+            assert(context.waits < 10000, "Offline task exceeded 10000 scheduler waits without completing or stopping")
+            local elapsed = math.max(seconds or 0.03, 0.000001)
+            ticks = ticks + elapsed -- A real scheduler yield advances time even for a zero/tiny wait.
             local pending = queue
             queue = {}
             for _, fn in ipairs(pending) do fn() end
-            if context.onWait then context.onWait(seconds or 0.03) end
-            return seconds
+            if context.onWait then context.onWait(elapsed) end
+            return elapsed
         end,
     }
     local function loadScript()
@@ -2528,6 +2531,7 @@ end)
 
 test("Tree and equipment discovery binds shared native upvalues, including empty metadata", function()
     local f = fixture()
+    f.services.Workspace.GetServerTimeNow = function() return 1000 end
     local items, world, trees, renders, worn = f.app.runtime.items, f.world, {}, {}, {feet = 898}
     prepareDiscovery(f, true)
     attachWorldHandlers(f, items)
@@ -2552,6 +2556,7 @@ test("Tree and equipment discovery binds shared native upvalues, including empty
     assert(r.treeRipe(2, 2, 955) == true)
     setTree(2, 2, {p = 2000})
     assert(r.treeRipe(2, 2, 955) == false)
+    assert(r.treeRemaining(2, 2, 955) == 1000)
     r.harvestGear.wear(777)
     assert(worn.feet == 777)
     local transfer = f.hooks.connectGame({transferOnly = true})
@@ -3693,6 +3698,10 @@ local function rotationFixture()
         if planted == nil then return nil end
         return os.clock() >= planted + f.app.runtime.items[955].grow
     end
+    f.app.runtime.treeRemaining = function(x,y)
+        local planted = f.treeTimes[f.world.name][y*f.world.w+x]
+        return planted and math.max(0, planted + f.app.runtime.items[955].grow - os.clock())
+    end
     f.app.runtime.handlers = {
         canPlace = function() return true end,
         plantSeed = function(id,x,y)
@@ -3733,6 +3742,194 @@ local function rotationFixture()
     return f
 end
 
+local function fillGrowingFarms(f, readyIn)
+    f.worldBoxes.BREAK[8] = {{955,200}}
+    f.worldBoxes.BREAK[12] = {{954,400}}
+    for _, name in ipairs(f.app.config.planting.worlds) do
+        for x=1,5 do
+            f.grids[name][8][x] = 955
+            f.treeTimes[name][8*f.world.w+x] = os.clock() + readyIn[name] - f.app.runtime.items[955].grow
+        end
+    end
+end
+
+test("Full growing farms skip planting with seed stock available and run PNB while waiting", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=200,FARM2=200})
+    f.afterWait=function() if f.pnbBlocks == 3 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(#f.plants == 0 and #f.harvests == 0 and f.pnbBlocks == 3)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) == 200)
+    assert(#f.entries == 2 and f.entries[1] == "FARM2" and f.entries[2] == "BREAK")
+end)
+
+test("Harvest deadlines interrupt PNB with blocks remaining and the cleared farm is replanted first", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=40,FARM2=200})
+    local brokenAtHarvest, brokenAtPlant
+    local hit,plant=f.app.runtime.handlers.hit,f.app.runtime.handlers.plantSeed
+    f.app.runtime.handlers.hit=function(x,y)
+        if f.world.name ~= "BREAK" and not brokenAtHarvest then brokenAtHarvest=f.pnbBlocks end
+        hit(x,y)
+    end
+    f.app.runtime.handlers.plantSeed=function(...)
+        brokenAtPlant=brokenAtPlant or f.pnbBlocks
+        plant(...)
+    end
+    f.afterWait=function() if #f.plants == 5 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(brokenAtHarvest > 0 and brokenAtHarvest == brokenAtPlant and brokenAtPlant == f.pnbBlocks)
+    assert(#f.harvests == 5 and f.harvests[1].world == "FARM" and #f.plants == 5)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12],954) > 0, "PNB must yield before draining storage")
+    assert(f.grids.BREAK[7][10] == 0 and #f.worldDrops.BREAK == 0 and f.app.pending == 0,
+        "The current PNB block and its pickups must settle before leaving")
+end)
+
+test("A later farm that matures first has harvest priority over an earlier growing farm", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=200,FARM2=40})
+    f.afterWait=function() if #f.plants == 5 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(f.pnbBlocks > 0 and #f.harvests == 5 and f.harvests[1].world == "FARM2")
+    assert(#f.plants == 5 and f.plants[1].world == "FARM2")
+end)
+
+test("Empty PNB storage waits in the breaking world without repeated farm travel or planting", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=200,FARM2=200})
+    f.worldBoxes.BREAK[12]={}
+    local waits=0
+    f.afterWait=function()
+        if f.app.status:find("PNB block storage is empty",1,true) then
+            waits=waits+1
+            if waits == 3 then f.app:stop() end
+        end
+    end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError and f.pnbBlocks == 0 and #f.plants == 0 and #f.harvests == 0)
+    assert(#f.entries == 2 and f.world.name == "BREAK" and f.withdrawals == 0)
+end)
+
+test("PNB seed production interrupts breaking to resume unfinished planting", function()
+    local f=rotationFixture()
+    f.worldBoxes.BREAK[8],f.worldBoxes.BREAK[12]={},{{954,10}}
+    f.afterWait=function() if #f.plants == 3 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(#f.plants == 3 and f.pnbBlocks == 3 and #f.harvests == 0)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12],954) > 0)
+end)
+
+test("World-change execution queues the loader and restores rotation config and PNB schedule after a reset", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=200,FARM2=250})
+    f.app.profile="Cloud Rotation"
+    f.env.ClarisGrowbloxLoaderURL="https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/loader.lua"
+    local queued,enter={},f.world.enter
+    queue_on_teleport=function(code) queued[#queued+1]=code end
+    f.world.enter=function(name)
+        enter(name)
+        if name == "BREAK" then return true,nil,true end
+        return true
+    end
+    f.afterWait=function() if f.app.teleporting then f.app.alive=false end end
+    f.hooks.start("rotation")
+    assert(#queued == 1 and queued[1]:find("ClarisGrowbloxAutoResume = true",1,true))
+    assert(queued[1]:find(f.env.ClarisGrowbloxLoaderURL,1,true))
+    local runtime=f.app.runtime
+    local next=f.reload()
+    f.hooks,f.app=next,next.App
+    f.app.runtime=runtime
+    local saved=next.readRotationResume()
+    assert(saved.state.phase == "waitPNB" and saved.state.readyAt.FARM > f.services.Workspace:GetServerTimeNow())
+    assert(saved.profile == "Cloud Rotation" and saved.config.planting.worlds[2] == "FARM2")
+    assert(saved.config.points.pnb.world == "BREAK" and saved.config.rotation.farms.FARM2.x == 0)
+    f.app.config,f.app.profile=saved.config,saved.profile
+    f.world.enter=enter
+    f.entries={}
+    f.afterWait=function() if f.pnbBlocks == 2 then f.app:stop() end end
+    next.start("rotation",saved)
+    queue_on_teleport=nil
+    assert(not f.app.lastError and f.pnbBlocks == 2 and #f.entries == 0 and #f.plants == 0 and #f.harvests == 0)
+    assert(#queued == 2, "Each fresh script must register its world-change execution again")
+end)
+
+test("A past saved server-time deadline resumes harvest before placing another PNB block", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=0,FARM2=200})
+    local clock=os.clock
+    f.services.Workspace.GetServerTimeNow=function() return 5000+clock() end
+    f.app.runtime.treeRipe=function(x,y)
+        local planted=f.treeTimes[f.world.name][y*f.world.w+x]
+        return planted and clock() >= planted+f.app.runtime.items[955].grow
+    end
+    f.hooks.saveRotationResume({phase="waitPNB",worldIndex=1,cycle=1,work=0,seedCargo=0,
+        completed={},readyAt={FARM=5000,FARM2=5200}})
+    task.wait(1000)
+    os.clock=function() return clock()-1000 end -- Executor uptime changes; server time does not.
+    f.afterWait=function() if #f.harvests == 5 then f.app:stop() end end
+    f.hooks.start("rotation",f.hooks.readRotationResume())
+    assert(not f.app.lastError and f.pnbBlocks == 0 and #f.harvests == 5 and f.harvests[1].world == "FARM")
+end)
+
+test("A storage withdrawal that crosses the harvest deadline never places another PNB block", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=40,FARM2=200})
+    local server,delayed=f.server,false
+    f.server=function(name,x,...)
+        local results=table.pack(server(name,x,...))
+        if name == "DisplayItem" and x == 12 and not delayed then delayed=true; task.wait(60) end
+        return table.unpack(results,1,results.n)
+    end
+    f.afterWait=function() if #f.harvests == 5 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(delayed and f.pnbBlocks == 0 and #f.harvests == 5 and f.inventory:count(954) == 0)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12],954) == 400)
+end)
+
+test("A reset during replant restores its config and reconciles the confirmed seed without planting twice", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=200,FARM2=200})
+    for x=1,5 do f.grids.FARM2[8][x]=0; f.treeTimes.FARM2[8*f.world.w+x]=nil end
+    f.grids.FARM2[8][1],f.treeTimes.FARM2[8*f.world.w+1]=955,os.clock()
+    f.serverItems[955]=9; f.inventory:add(955,9)
+    f.app.profile="Replant Recovery"
+    f.hooks.saveRotationResume({phase="replant",worldIndex=2,cycle=1,work=10,seedCargo=0,
+        completed={FARM=true},readyAt={},plant={phase="farm",worldIndex=2,skipped={},
+            pending={world="FARM2",x=1,y=8,before=10}}})
+    local runtime=f.app.runtime
+    local next=f.reload()
+    f.hooks,f.app=next,next.App
+    f.app.runtime=runtime
+    local saved=next.readRotationResume()
+    f.app.config,f.app.profile=saved.config,saved.profile
+    f.afterWait=function() if f.app.stats.cycles == 1 then f.app:stop() end end
+    next.start("rotation",saved)
+    assert(not f.app.lastError,f.app.lastError)
+    assert(f.app.profile == "Replant Recovery" and #f.plants == 4 and f.app.stats.planted == 5)
+    assert(f.plants[1].x == 2 and f.plants[1].world == "FARM2" and #f.harvests == 0 and f.pnbBlocks == 0)
+end)
+
+test("Invalid saved harvest deadlines are rejected before rotation can enter a world", function()
+    local f=rotationFixture()
+    f.hooks.saveRotationResume({phase="waitPNB",worldIndex=1,cycle=1,work=0,seedCargo=0,
+        completed={},readyAt={FARM=-1}})
+    rejects(f.hooks.readRotationResume,"schedule value")
+    assert(#f.entries == 0 and f.pnbBlocks == 0)
+end)
+
+test("An interrupted PNB inventory deposit pauses rotation without replaying storage or travel", function()
+    local f=rotationFixture()
+    f.hooks.saveRotationResume({phase="pnbStorePending",worldIndex=1,cycle=1,work=0,seedCargo=0})
+    f.hooks.start("rotation",f.hooks.readRotationResume())
+    assert(f.app.lastError:find("storage request was interrupted",1,true) and #f.entries == 0 and f.withdrawals == 0)
+    assert(f.hooks.readRotationResume().state.phase == "pnbStorePending")
+end)
+
 test("Full rotation plants both farms, waits for maturity, harvests seeds and blocks, runs PNB, and repeats", function()
     local f = rotationFixture()
     local waited = false
@@ -3745,10 +3942,11 @@ test("Full rotation plants both farms, waits for maturity, harvests seeds and bl
     end
     f.hooks.start("rotation")
     assert(not f.app.lastError, f.app.lastError)
-    assert(waited and f.app.stats.cycles == 2 and f.pnbBlocks == 20 and #f.harvests == 20, "wait=" .. tostring(waited) .. " cycles=" .. f.app.stats.cycles .. " PNB=" .. f.pnbBlocks .. " trees=" .. #f.harvests .. " plants=" .. #f.plants)
-    assert(#f.plants == 20 and f.plants[1].world == "FARM" and f.plants[6].world == "FARM2")
+    assert(waited and f.app.stats.cycles == 2 and f.pnbBlocks == 10 and #f.harvests == 20, "wait=" .. tostring(waited) .. " cycles=" .. f.app.stats.cycles .. " PNB=" .. f.pnbBlocks .. " trees=" .. #f.harvests .. " plants=" .. #f.plants)
+    assert(#f.plants == 30 and f.plants[1].world == "FARM" and f.plants[6].world == "FARM2")
     assert(f.plants[11].world == "FARM" and f.plants[16].world == "FARM2")
-    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) == 30)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) + f.inventory:count(955) == 10)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12],954) == 10, "Last harvest stays in PNB storage for the next growth wait")
     assert(f.app.stats.harvestSeeds == 20 and f.app.stats.stashedSeeds == 30)
     assert(f.app.job == nil and not f.app.runToggles.rotation.Value and not f.hooks.readRotationResume())
 end)
@@ -3764,7 +3962,7 @@ test("A rotation stopped during maturity wait makes no tree, pickup, or PNB acti
     assert(not f.hooks.readRotationResume())
 end)
 
-test("Saved rotation resumes the second farm's transfer without replanting or repeating its harvest", function()
+test("Saved rotation resumes the second farm's transfer and replants only that farm without repeating its harvest", function()
     local f = rotationFixture()
     f.worldBoxes.FARM2[0]={{955,5}}
     f.worldBoxes.BREAK[12]={{954,5}}
@@ -3775,8 +3973,8 @@ test("Saved rotation resumes the second farm's transfer without replanting or re
     f.afterWait=function() if f.app.stats.cycles == 1 then f.app:stop() end end
     f.hooks.start("rotation",saved)
     assert(not f.app.lastError,f.app.lastError)
-    assert(#f.plants == 0 and #f.harvests == 0 and f.pnbBlocks == 5 and f.app.stats.cycles == 1)
-    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) == 220)
+    assert(#f.plants == 5 and f.plants[1].world == "FARM2" and #f.harvests == 0 and f.pnbBlocks == 0 and f.app.stats.cycles == 1)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) + f.inventory:count(955) == 210)
 end)
 
 test("Ambiguous rotation seed withdrawals pause before world entry or additional storage mutations", function()
@@ -3801,12 +3999,13 @@ test("Rotation reconciles a planted seed after a picker interruption and continu
     f.afterWait=function() if f.app.stats.cycles == 1 then f.app:stop() end end
     f.hooks.start("rotation")
     assert(not f.app.lastError,f.app.lastError)
-    assert(interrupted and #f.plants == 10 and #f.harvests == 10 and f.pnbBlocks == 10)
-    assert(f.app.stats.planted == 10 and f.app.stats.cycles == 1)
+    assert(interrupted and #f.plants == 20 and #f.harvests == 10 and f.pnbBlocks == 0)
+    assert(f.app.stats.planted == 20 and f.app.stats.cycles == 1)
 end)
 
 test("Rotation rejoins PNB after an interrupted break without placing or harvesting twice", function()
     local f=rotationFixture()
+    f.worldBoxes.BREAK[12]={{954,10}}
     local hit=f.app.runtime.handlers.hit
     local interrupted=false
     f.app.runtime.handlers.hit=function(...)
@@ -3819,8 +4018,8 @@ test("Rotation rejoins PNB after an interrupted break without placing or harvest
     f.afterWait=function() if f.app.stats.cycles == 1 then f.app:stop() end end
     f.hooks.start("rotation")
     assert(not f.app.lastError,f.app.lastError)
-    assert(interrupted and #f.plants == 10 and #f.harvests == 10 and f.pnbBlocks == 10)
-    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) == 20)
+    assert(interrupted and #f.plants == 20 and #f.harvests == 10 and f.pnbBlocks == 10)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) + f.inventory:count(955) == 10)
 end)
 
 test("An empty rotation with no seeds or crop pauses after checking the list instead of repeating empty travel", function()

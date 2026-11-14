@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.23.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.24.
+
+Version 0.1.24 runs PNB while rotation farms grow. Full farms skip planting even when seed storage is stocked. When a farm is ready, PNB finishes its current block and pickups, stores unused inventory, and yields for harvesting, transfer, and replanting. Farm timers recorded during planting avoid another startup scan; the next expected mature farm gets priority across the list. Empty PNB storage waits in the breaking world. Saved configuration, task phase, replant progress, completed farms, and server-time harvest deadlines survive world-change reloads through the queued loader.
 
 Version 0.1.23 adds a saved **Discord user ID to ping on failure** and a separate **Failure alerts** toggle. Task/startup failures send a red work report with the original error, player, world, profile, task, and progress; only that saved user can be pinged. Failure alerts work when timed reports are Off. Automatic reports now describe Full Rotation's farm, phase, and cycle, all tree/seed counters, completed tasks, and completed rotation cycles. Alerts take priority over timed stats, bypass stuck read-only game queries, respect Discord rate limits, and keep late successful replies from causing another ping. Normal Stop and successfully handled recovery do not send failure alerts.
 
@@ -205,7 +207,7 @@ Automatic PNB recovery uses `ClarisGrowblox/pnb-resume.json`, containing the run
 
 Planting recovery uses `ClarisGrowblox/plant-resume.json`, with the configuration, farm index, refill phase, skipped cells, and any pending seed action. It is checked against the account and a six-hour expiry. Counters such as Seeds planted describe the current loaded script instance.
 
-Rotation recovery uses `ClarisGrowblox/rotation-resume.json`, bound to the account and a six-hour checkpoint expiry. Running rotations refresh it during maturity waits, actions, phase changes, and at least every two minutes while requests are settled. A continuously refreshed checkpoint does not impose a six-hour run limit.
+Rotation recovery uses `ClarisGrowblox/rotation-resume.json`, bound to the account and a six-hour checkpoint expiry. It includes configuration/profile, PNB during growth waits, replant progress, completed farms, and harvest deadlines based on server time rather than executor uptime. Each fresh script registers the loader for the next supported teleport, then automatic resume restores the rotation before considering standalone task checkpoints. Running rotations refresh their checkpoint during waits, actions, phase changes, and at least every two minutes while requests are settled. A continuously refreshed checkpoint does not impose a six-hour run limit. See the [rotation guide](README-ROTATION.md) for setup and executor fallback behavior.
 
 ## Development
 
@@ -219,7 +221,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.23 passes 282 offline checks: 41 configuration/layout/storage tests, 233 generated-runtime tests against mock services/server, six generated-loader tests, and two release checks. Added coverage includes exact Discord user-ID validation and persistence, failure-only mention permissions, failures with timed reports Off, original progress snapshots, normal Stop/completion behavior, actual completed rotation reports, bounded retry/rate-limit handling, delayed successful replies, and alerts that preempt stuck game-stat queries. Earlier export/import, harvesting, rotation, transfer, navigation, and recovery checks remain passing. These mocks do not establish live Discord delivery, clipboard behavior, tractor/server acceptance, Delta frame times, planting reach, route geometry, permissions, or teleport queue behavior.
+Version 0.1.24 passes 293 offline checks: 41 configuration/layout/storage tests, 244 generated-runtime tests against mock services/server, six generated-loader tests, and two release checks. New coverage checks full stocked farms skipping planting, PNB during growth waits, harvest priority with remaining PNB blocks, a later farm maturing first, replanting before more breaking, empty-stock waits without repeated farm travel, PNB seed production resuming planting, a withdrawal crossing the harvest deadline, queued-loader registration after a reset, saved config/schedule restoration, executor-clock resets, replant reconciliation, and invalid/ambiguous checkpoints. Earlier webhook, export/import, harvesting, rotation, transfer, navigation, and recovery checks remain passing. These mocks do not establish live Discord delivery, clipboard behavior, tractor/server acceptance, Delta frame times, planting reach, route geometry, permissions, or teleport queue behavior.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 

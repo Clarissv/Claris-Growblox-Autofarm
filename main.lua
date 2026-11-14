@@ -648,10 +648,11 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.23"
+local VERSION = "0.1.24"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local player = Players.LocalPlayer
 local env = getgenv and getgenv() or _G
@@ -1122,7 +1123,11 @@ local function treeGrowthHooks(world, items, handlers, scan)
         local tree = trees[y * world.w + x]
         if type(tree) ~= "table" or type(tree.p) ~= "number" then return nil end
         return ripe(id, tree)
-    end, equipment
+    end, equipment, function(x, y, id)
+        local tree, item = trees[y * world.w + x], items[id]
+        if type(tree) ~= "table" or type(tree.p) ~= "number" or not item then return nil end
+        return math.max(0, tree.p + (item.grow or 0) - Workspace:GetServerTimeNow())
+    end
 end
 
 local function discover(options)
@@ -1260,15 +1265,15 @@ local function discover(options)
     end
     local items, itemSource = resolveItems(world, objects, registry, scan)
     local respawn, respawnSource = findRespawn(world, objects, scan)
-    local treeRipe, harvestGear
-    if not scan.transferOnly then treeRipe, harvestGear = treeGrowthHooks(world, items, handlers, scan) end
+    local treeRipe, harvestGear, treeRemaining
+    if not scan.transferOnly then treeRipe, harvestGear, treeRemaining = treeGrowthHooks(world, items, handlers, scan) end
     table.insert(App.discoveryReport, "Item definitions: " .. itemSource)
     local runtime = { world = world, body = body, controls = controls[1], inventory = inventory,
         items = items, handlers = handlers, issues = issues,
         readInventoryView = readInventoryView, ready = #issues == 0, gemHud = gemHud,
         picker = findWorldPicker(world, objects, scan), farmingDeferred = scan.transferOnly,
         respawn = respawn, respawnSource = respawnSource,
-        treeRipe = treeRipe, harvestGear = harvestGear }
+        treeRipe = treeRipe, harvestGear = harvestGear, treeRemaining = treeRemaining }
     table.insert(App.discoveryReport, "Inventory: " .. (readInventoryView and "readable snapshot" or "live backpack"))
     table.insert(App.discoveryReport, "Farming hooks: " .. (scan.transferOnly and "deferred until PNB or Planting starts"
         or #issues == 0 and "ready" or table.concat(issues, " ")))
@@ -1541,7 +1546,8 @@ local function moveToPoint(point, token)
     moveTo(point.standX or point.x, point.standY or point.y, point.world, token)
 end
 local function assertPNBPosition()
-    if App.job ~= "pnb" and not (App.job == "rotation" and App.rotationState and App.rotationState.phase == "pnb") then return end
+    if App.job ~= "pnb" and not (App.job == "rotation" and App.rotationState
+        and (App.rotationState.phase == "pnb" or App.rotationState.phase == "waitPNB")) then return end
     local point, state = App.config.points.pnb, position()
     if not state.grounded or math.abs(state.x - (point.x + 0.5)) > 0.3
         or math.abs(state.y - (point.y + 1)) > 0.25 then
@@ -2510,7 +2516,7 @@ local function runHarvest(token)
     end) end)
 end
 
-local function runPNB(token)
+local function runPNB(token, shouldYield)
     Core.checkSetup(App.config, "pnb", runtime().items)
     local p = App.config.points
     local blockId = App.config.blockId
@@ -2537,14 +2543,24 @@ local function runPNB(token)
         for _, point in ipairs(grid) do
             if tileAt(point.x, point.y) == blockId then existing = true end
         end
+        -- Yield only between complete place/break/pickup iterations. An existing
+        -- block from an interrupted iteration must be settled before travel.
+        if not existing and shouldYield and shouldYield() then
+            collectDrops(p.pnb, blockId, seedId, token)
+            return false
+        end
         if count(blockId) == 0 and not existing then
             setStatus("Refilling blocks from the right storage box...")
             local taken = withdraw(p.blockBox, blockId, token)
             if taken == 0 then
                 setStatus("Finished: no blocks remain in your backpack or block storage.")
-                return
+                return true
             end
             moveToPoint(p.pnb, token)
+        end
+        if not existing and shouldYield and shouldYield() then
+            collectDrops(p.pnb, blockId, seedId, token)
+            return false
         end
         setStatus("Placing one " .. runtime().items[blockId].name .. " directly above the player...")
         for _, point in ipairs(grid) do
@@ -2871,10 +2887,12 @@ local function enterPlantWorld(name, state, token)
             if teleport then
                 App.teleporting = true
                 setStatus(queued and (App.rotationState and "Changing servers; rotation will resume after loading." or "Changing servers; planting will resume after loading.")
-                    or "Changing servers. Run the loader after arrival, then use Resume planting.")
+                    or (App.rotationState and "Changing servers. Run the loader after arrival, then use Resume saved rotation."
+                        or "Changing servers. Run the loader after arrival, then use Resume planting."))
                 local teleportDeadline = os.clock() + 45
                 while os.clock() < teleportDeadline do pause(0.2, token) end
-                error("Server teleport did not finish. Use Resume planting after arrival.")
+                error(App.rotationState and "Server teleport did not finish. Use Resume saved rotation after arrival."
+                    or "Server teleport did not finish. Use Resume planting after arrival.")
             end
             if not entered then assert(attempts < 3, tostring(message or "Could not enter " .. name))
             elseif r.picker and r.world.name == name then r.picker.complete() end
@@ -2937,7 +2955,33 @@ local function plantTile(point, state, token)
         return true
     end)
 end
-local function runPlant(token, saved)
+local function rotationFarmStatus(r, box, id, seedId)
+    local growing, ripeCount, remaining, unknownTimer = 0, 0, nil, false
+    for _, row in ipairs(Core.farmRows(r.world, r.items)) do
+        for x = row.left, row.right do
+            if tileAt(x, row.y) == seedId then
+                assert(type(r.treeRipe) == "function", "Tree growth hooks are unavailable for rotation.")
+                local ripe = r.treeRipe(x, row.y, seedId)
+                assert(ripe ~= nil, "Tree growth data is not ready. Reconnect and copy diagnostics.")
+                if ripe then ripeCount = ripeCount + 1
+                else
+                    growing = growing + 1
+                    local left = type(r.treeRemaining) == "function" and r.treeRemaining(x, row.y, seedId) or nil
+                    if type(left) == "number" and left == left and left > 0 and left < math.huge then
+                        remaining = math.max(remaining or left, left)
+                    else unknownTimer = true end
+                end
+            end
+        end
+    end
+    local crop = growing == 0 and ripeCount > 0 or storageCount(box, id, seedId) > 0
+        or storageCount(box, seedId, id) > 0
+    for _, drop in pairs(r.world.dropList()) do
+        if not drop.display and (drop.id == id or drop.id == seedId) and (drop.n or 0) > 0 then crop = true end
+    end
+    return growing, crop, unknownTimer and math.min(remaining or 30, 30) or remaining or 30
+end
+local function runPlant(token, saved, lastWorldIndex)
     return harvestEquipmentScope(function()
         suspendHarvestVehicle(token)
         Core.checkSetup(App.config, "plant", runtime().items)
@@ -2945,7 +2989,8 @@ local function runPlant(token, saved)
         local state = saved and saved.state or {worldIndex = 1, phase = "farm", skipped = {}}
         assert(state.phase ~= "pickupPending", "A seed storage withdrawal was interrupted. Check the backpack and box, then clear saved planting.")
         savePlantResume(state)
-        while state.worldIndex <= #settings.worlds do
+        local lastWorld = lastWorldIndex or #settings.worlds
+        while state.worldIndex <= lastWorld do
             checkpoint(token)
             if state.phase == "stock" then
                 enterPlantWorld(settings.storageWorld, state, token)
@@ -3013,13 +3058,19 @@ local function runPlant(token, saved)
             else
                 local skipped = 0
                 for _ in pairs(state.skipped) do skipped = skipped + 1 end
+                if App.rotationState then
+                    local rotation = App.rotationState
+                    local growing, crop, left = rotationFarmStatus(r, App.config.rotation.farms[name], App.config.blockId, id)
+                    rotation.readyAt[name] = growing > 0 and not crop and Workspace:GetServerTimeNow() + left or 0
+                end
                 setStatus("Processed " .. name .. ": " .. skipped .. " tiles skipped due to access or route. Moving to the next farm.")
                 state.worldIndex, state.skipped, state.rows, state.rowY = state.worldIndex + 1, {}, nil, nil
             end
             savePlantResume(state)
         end
         clearPlantResume()
-        setStatus("Finished planting all configured farms. Seeds planted this session: " .. App.stats.planted)
+        setStatus((lastWorldIndex and "Finished replanting " .. settings.worlds[lastWorldIndex] .. "."
+            or "Finished planting all configured farms.") .. " Seeds planted this session: " .. App.stats.planted)
         return true
     end)
 end
@@ -3052,7 +3103,7 @@ local function readRotationResume()
     assert(type(record.updatedAt) == "number" and os.time() - record.updatedAt < 21600, "Saved rotation is over six hours old. Check inventory and start again.")
     record.config, record.profile = Core.validate(record.config), Core.profileName(record.profile)
     local state = record.state
-    local phases = {plant=true, wait=true, harvest=true, transfer=true, seeds=true, seedDeliver=true,
+    local phases = {plant=true, wait=true, waitPNB=true, pnbStorePending=true, replant=true, harvest=true, transfer=true, seeds=true, seedDeliver=true,
         seedPickupPending=true, seedDepositPending=true, pnb=true, finish=true}
     assert(type(state) == "table" and phases[state.phase], "Invalid saved rotation phase.")
     for _, key in ipairs({"worldIndex", "cycle", "work", "seedCargo"}) do
@@ -3060,6 +3111,18 @@ local function readRotationResume()
     end
     assert(state.worldIndex >= 1 and state.worldIndex <= #record.config.planting.worlds and state.seedCargo <= 200,
         "Invalid saved rotation farm or seed cargo.")
+    for _, key in ipairs({"completed", "readyAt"}) do
+        if state[key] ~= nil then
+            assert(type(state[key]) == "table", "Invalid saved rotation schedule.")
+            for index, value in pairs(state[key]) do
+                assert(type(index) == "string" and record.config.rotation.farms[index], "Invalid saved rotation scheduled farm.")
+                assert(key == "completed" and type(value) == "boolean"
+                    or key == "readyAt" and type(value) == "number" and value == value and value >= 0 and value < math.huge,
+                    "Invalid saved rotation schedule value.")
+            end
+        end
+    end
+    if state.seedWait ~= nil then assert(type(state.seedWait) == "boolean", "Invalid saved rotation seed wait.") end
     if state.plant then
         readPlantResume({version=1, active=true, userId=record.userId, updatedAt=record.updatedAt,
             config=record.config, profile=record.profile, state=state.plant})
@@ -3079,6 +3142,14 @@ local function runRotation(token, saved)
     local state = saved and saved.state or {phase="plant", worldIndex=1, cycle=1, work=0, seedCargo=0}
     local settings, p = App.config.planting, App.config.points
     local id, seedId = App.config.blockId, settings.seedId
+    if not state.completed then
+        state.completed = {}
+        -- Older checkpoints processed farms in order.
+        if state.phase ~= "plant" then
+            for index = 1, state.worldIndex - 1 do state.completed[settings.worlds[index]] = true end
+        end
+    end
+    state.readyAt = state.readyAt or {}
     local failures = 0
     local function transition(phase)
         state.phase = phase
@@ -3088,13 +3159,48 @@ local function runRotation(token, saved)
         saveRotationResume(state)
         enterPlantWorld(name, state.plant or {worldIndex=1,phase="farm",skipped={}}, token)
     end
+    local function nextFarm()
+        local earliest, deadline
+        for index, name in ipairs(settings.worlds) do
+            if not state.completed[name] then
+                local due = state.readyAt[name] or 0
+                if not deadline or due < deadline then earliest, deadline = index, due end
+            end
+        end
+        return earliest, deadline
+    end
+    local function continueFarms()
+        local index, deadline = nextFarm()
+        if index then
+            state.worldIndex = index
+            transition(deadline > Workspace:GetServerTimeNow() and "waitPNB" or "wait")
+        elseif state.seedWait then transition("waitPNB")
+        else transition("finish") end
+    end
+    local function yieldPNB()
+        local _, deadline = nextFarm()
+        return deadline and Workspace:GetServerTimeNow() >= deadline
+            or state.seedWait and (count(seedId) > 0 or storageCount(p.seedBox, seedId) > 0)
+    end
+    local function storePNBInventory()
+        refreshInventory(token)
+        for _, target in ipairs({{p.blockBox, id}, {p.seedBox, seedId}}) do
+            if count(target[2]) > 0 then
+                local phase = state.phase
+                transition("pnbStorePending")
+                deposit(target[1], target[2], count(target[2]), token)
+                transition(phase)
+            end
+        end
+        clearPNBResume()
+    end
     return harvestEquipmentScope(function()
         suspendHarvestVehicle(token)
         saveRotationResume(state)
         queueResume()
         while true do
             checkpoint(token)
-            assert(state.phase ~= "seedPickupPending" and state.phase ~= "seedDepositPending",
+            assert(state.phase ~= "seedPickupPending" and state.phase ~= "seedDepositPending" and state.phase ~= "pnbStorePending",
                 "A rotation seed storage request was interrupted. Check the backpack and boxes, then clear saved rotation.")
             if state.transfer then assert(state.transfer.phase ~= "pickupPending" and state.transfer.phase ~= "depositPending"
                 and state.transfer.phase ~= "seedReturnPending",
@@ -3103,32 +3209,55 @@ local function runRotation(token, saved)
                 local name = settings.worlds[state.worldIndex]
                 p.farmBox = App.config.rotation.farms[name]
                 if state.phase == "plant" then
-                    runPlant(token, state.plant and {state=state.plant} or nil)
+                    if not state.plant then state.completed, state.readyAt = {}, {} end
+                    state.seedWait = not runPlant(token, state.plant and {state=state.plant} or nil)
                     -- With insufficient stock, harvest the existing partial farms to replenish it.
                     state.plant = nil
                     clearPlantResume()
-                    state.worldIndex = 1
-                    transition("wait")
+                    local index, deadline = nextFarm()
+                    state.worldIndex = index or 1
+                    transition(deadline and deadline > Workspace:GetServerTimeNow() and "waitPNB" or "wait")
                 elseif state.phase == "wait" then
                     travel(name)
                     local r = worldCheck(name, token)
-                    local growing = 0
-                    for _, row in ipairs(Core.farmRows(r.world, r.items)) do
-                        for x = row.left, row.right do
-                            if tileAt(x, row.y) == seedId then
-                                assert(type(r.treeRipe) == "function", "Tree growth hooks are unavailable for rotation.")
-                                local ripe = r.treeRipe(x, row.y, seedId)
-                                assert(ripe ~= nil, "Tree growth data is not ready. Reconnect and copy diagnostics.")
-                                if not ripe then growing = growing + 1 end
-                            end
-                        end
+                    local growing, crop, remaining = rotationFarmStatus(r, p.farmBox, id, seedId)
+                    if crop then
+                        state.readyAt[name] = nil
+                        transition("harvest")
+                    elseif growing > 0 then
+                        -- Server-time deadlines survive executor reloads and do not
+                        -- require entering the same growing farm every few seconds.
+                        state.readyAt[name] = Workspace:GetServerTimeNow() + remaining
+                        local index, deadline = nextFarm()
+                        state.worldIndex = index
+                        if deadline <= Workspace:GetServerTimeNow() then transition("wait")
+                        else transition("waitPNB") end
+                    else
+                        state.completed[name], state.readyAt[name] = true, nil
+                        continueFarms()
                     end
-                    if growing > 0 then
+                elseif state.phase == "waitPNB" then
+                    travel(p.pnb.world)
+                    takeControls()
+                    local brokenBefore = App.stats.broken
+                    local exhausted = runPNB(token, yieldPNB)
+                    state.work = state.work + App.stats.broken - brokenBefore
+                    storePNBInventory()
+                    local index, deadline = nextFarm()
+                    if index and deadline <= Workspace:GetServerTimeNow() then
+                        state.worldIndex = index
+                        transition("wait")
+                    elseif state.seedWait and storageCount(p.seedBox, seedId) > 0 then
+                        transition("plant")
+                    elseif exhausted and not index then
+                        state.seedWait = false
+                        transition("finish")
+                    elseif exhausted then
                         releaseControls()
-                        setStatus("Rotation " .. state.cycle .. ": waiting for " .. growing .. " growing trees in " .. name .. "...")
+                        setStatus("Rotation " .. state.cycle .. ": waiting for growing trees; PNB block storage is empty.")
                         saveRotationResume(state)
-                        pause(5, token)
-                    else transition("harvest") end
+                        pause(math.min(5, math.max(0.1, deadline - Workspace:GetServerTimeNow())), token)
+                    end
                 elseif state.phase == "harvest" then
                     travel(name)
                     takeControls()
@@ -3146,7 +3275,7 @@ local function runRotation(token, saved)
                     travel(name)
                     takeControls()
                     assert(storageCount(p.farmBox, id, seedId) == 0, "Farm blocks changed after transfer. Check the Farm box before resuming rotation.")
-                    if storageCount(p.farmBox, seedId, id) == 0 then transition("pnb")
+                    if storageCount(p.farmBox, seedId, id) == 0 then transition("replant")
                     else
                         transition("seedPickupPending")
                         local taken, blocks = withdraw(p.farmBox, seedId, token, id)
@@ -3164,16 +3293,20 @@ local function runRotation(token, saved)
                     state.seedCargo = 0
                     transition("seeds")
                 elseif state.phase == "pnb" then
+                    -- Legacy checkpoints can still be at the old post-harvest PNB
+                    -- phase. Do not drain that storage before replanting the farm.
                     travel(p.pnb.world)
                     takeControls()
-                    runPNB(token)
-                    refreshInventory(token)
-                    if count(seedId) > 0 then deposit(p.seedBox, seedId, count(seedId), token) end
-                    clearPNBResume()
-                    if state.worldIndex < #settings.worlds then
-                        state.worldIndex = state.worldIndex + 1
-                        transition("wait")
-                    else transition("finish") end
+                    collectDrops(p.pnb, id, seedId, token)
+                    storePNBInventory()
+                    transition("replant")
+                elseif state.phase == "replant" then
+                    local planting = state.plant or {worldIndex=state.worldIndex,phase="farm",skipped={}}
+                    state.seedWait = not runPlant(token, {state=planting}, state.worldIndex)
+                    state.plant = nil
+                    clearPlantResume()
+                    state.completed[name], state.readyAt[name] = true, nil
+                    continueFarms()
                 elseif state.phase == "finish" then
                     assert(state.work > 0, "Rotation found no harvest or stored crop in the farm list. Check seed stock, supported rows, and access.")
                     App.stats.cycles = App.stats.cycles + 1
@@ -3187,8 +3320,8 @@ local function runRotation(token, saved)
             if ok then failures = 0
             else
                 checkpoint(token)
-                if state.phase == "pnb" then problem = classifyPNBFault(problem, token) end
-                assert(state.phase ~= "seedPickupPending" and state.phase ~= "seedDepositPending"
+                if state.phase == "pnb" or state.phase == "waitPNB" then problem = classifyPNBFault(problem, token) end
+                assert(state.phase ~= "seedPickupPending" and state.phase ~= "seedDepositPending" and state.phase ~= "pnbStorePending"
                     and (not state.transfer or state.transfer.phase ~= "pickupPending" and state.transfer.phase ~= "depositPending"
                         and state.transfer.phase ~= "seedReturnPending"),
                     "A rotation storage request was interrupted. Check the backpack and boxes before resuming. " .. tostring(problem))
@@ -3197,7 +3330,7 @@ local function runRotation(token, saved)
                 assert(failures <= 3, "Rotation recovery failed three times. Check connection and copy diagnostics.")
                 releaseControls()
                 setStatus("Rotation interrupted; returning to the saved phase...")
-                if state.phase == "pnb" then
+                if state.phase == "pnb" or state.phase == "waitPNB" then
                     local interruptions = 0
                     while true do
                         local recovered, issue = pcall(recoverPNB, problem, token)
@@ -4210,7 +4343,7 @@ do
         end) })
 end
 
-rotationTab:Paragraph({ Title = "Plant, harvest, break, repeat", Desc = "Use the full Planting farm list. Plant all farms, wait for trees to mature, harvest with Fist or Dear John Tractor, transport blocks to PNB, return harvested seeds to planting stock, and repeat. Rotation enters saved worlds directly; it does not need linked doors." })
+rotationTab:Paragraph({ Title = "Plant, harvest, break, repeat", Desc = "Use the full Planting farm list. Fill empty planting rows, then break PNB stock while trees grow. When a farm is ready, finish the current block and pickups, harvest, transport its blocks/seeds, and replant before returning to PNB. Full farms skip planting. Rotation saves progress and enters worlds directly; it does not need linked doors." })
 ui.rotationFarms = rotationTab:Paragraph({ Title = "Farm storage saved per world", Desc = "Visit every listed farm, stand beside its Display Box, and save it here. Harvest Drops and Moving Drops save buttons also remember each world." })
 rotationTab:Button({ Title = "Save this farm's harvest box", Desc = "Stand beside a Display Box in a world from your Planting list.", Callback = uiAction(function() captureNearby("farmBox", "box") end) })
 rotationTab:Button({ Title = "Use PNB seeds for planting", Desc = "Use the saved left PNB Display Box for planting stock and select the matching seed.", Callback = uiAction(function()
@@ -4224,7 +4357,7 @@ rotationTab:Button({ Title = "Use PNB seeds for planting", Desc = "Use the saved
 end) })
 ui.rotationStatus = rotationTab:Paragraph({ Title = "Status", Desc = App.status })
 App.runToggles.rotation = rotationTab:Toggle({ Title = "Continuous full rotation", Value = false,
-    Desc = "Run every farm in the Planting list and repeat until stopped. Choose your harvesting method on Harvest Drops.",
+    Desc = "Planting and ready harvests take priority; run PNB while farms grow. Choose your harvesting method on Harvest Drops.",
     Callback = function(enabled) setRunningEnabled("rotation", enabled) end })
 local function resumeRotation()
     idle()
