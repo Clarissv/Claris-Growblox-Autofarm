@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.33"
+local VERSION = "0.1.35"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -952,15 +952,19 @@ local function takeControls()
     local world = runtime().world
     local hold = { table = controls, dir = controls.dir, jumping = controls.jumping, direction = 0, jump = false,
         world = world, displayTake = world.displayTake, takeDrop = world.takeDrop, autoTakes = 0,
-        syncing = false, pausePickup = false }
+        syncing = false, pausePickup = false, suppressedTakes = {} }
     hold.dirOverride = function() return hold.direction end
     hold.jumpOverride = function() return hold.jump end
     controls.dir, controls.jumping = hold.dirOverride, hold.jumpOverride
     hold.displayOverride = function() end
-    hold.takeOverride = function(...)
-        if hold.syncing or hold.pausePickup then return 0 end
+    hold.takeOverride = function(uid, ...)
+        if hold.syncing or hold.pausePickup then
+            hold.suppressedTakes[uid] = {grid = world.fg, at = os.clock()}
+            return 0
+        end
+        hold.suppressedTakes[uid] = nil
         hold.autoTakes = hold.autoTakes + 1
-        local result = table.pack(pcall(hold.takeDrop, ...))
+        local result = table.pack(pcall(hold.takeDrop, uid, ...))
         task.defer(function() hold.autoTakes = hold.autoTakes - 1 end)
         if not result[1] then error(result[2]) end
         return table.unpack(result, 2, result.n)
@@ -1399,6 +1403,7 @@ local function takeDropBatch(anchor, targets, attempts, retryAt, eligible, token
             local state = position()
             if id ~= 112 then reserved[id] = (reserved[id] or 0) + want end
             attempts[uid] = (attempts[uid] or 0) + 1
+            if App.controls then App.controls.suppressedTakes[uid] = nil end
             drop.taking = true
             -- Settlement owns the drop even after Stop; native pickup cannot
             -- race it and a packet's remaining count is never subtracted twice.
@@ -1572,6 +1577,8 @@ local makeHarvestPlanter
 local function runTreeHarvest(token)
     local name, id = App.config.points.farmBox.world, App.config.blockId
     local r = worldCheck(name, token)
+    local rotation, pass = App.rotationState, App.rotationState and App.rotationState.harvestPass
+    assert(not pass or pass.world == name and pass.phase == "trees", "The saved tree pass belongs to another farm or harvest stage.")
     local seedId = Core.seedId(r.items, id)
     local planter = App.rotationState and App.config.options.harvestPlanting and makeHarvestPlanter(token) or nil
     if not Core.hasTrees(r.world, seedId) then
@@ -1588,7 +1595,7 @@ local function runTreeHarvest(token)
     local growing, ripeCount, remaining = Core.treeGrowth(r.world, seedId, r.treeRipe, r.treeRemaining,
         function() pause(0, token); worldCheck(name, token) end)
     App.harvestMaturity = name .. ": " .. ripeCount .. " ripe; " .. growing .. " growing"
-    if growing > 0 then
+    if growing > 0 and not pass then
         suspendHarvestVehicle(token)
         App.harvestPhase = "Waiting for all farm trees to grow"
         setStatus("Waiting for all trees in " .. name .. " to grow: " .. growing .. " still growing; check again in "
@@ -1646,6 +1653,59 @@ local function runTreeHarvest(token)
         end
     end
     feet(nil)
+    local gems = (function()
+        local jobs, attempts, retryAt, deferred = {}, {}, {}, {}
+        local nextScan = 0
+        local function settle(waitAll)
+            for index = #jobs, 1, -1 do
+                local job = jobs[index]
+                if waitAll or job.request.done then
+                    local amount = awaitRequest(job.request, job.deadline, token)
+                    if amount > 0 then attempts[job.uid] = 0
+                    else deferred[job.uid] = true end -- Retry in the collection pass, without reversing the tractor.
+                    table.remove(jobs, index)
+                else
+                    assert(os.clock() < job.deadline, "Request timed out. Wait for it to finish before restarting.")
+                end
+            end
+        end
+        local function step()
+            worldCheck(name, token)
+            settle(false)
+            if #jobs >= 8 or os.clock() < nextScan then return end
+            nextScan = os.clock() + 0.05
+            local state = position()
+            local function eligible(drop, avatar)
+                return type(drop) == "table" and drop.id == 112 and not drop.display
+                    and type(drop.uid) == "number" and type(drop.n) == "number" and drop.n > 0
+                    and type(drop.x) == "number" and type(drop.y) == "number"
+                    and not drop.pending and not drop.taking and not deferred[drop.uid]
+                    and Navigation.pickupOverlap(avatar or position(), drop)
+                    and os.clock() >= math.max(drop.readyAt or 0, retryAt[drop.uid] or 0)
+            end
+            local targets = {}
+            for _, drop in pairs(r.world.dropList()) do
+                if type(drop) == "table" and drop.id == 112 and type(drop.uid) == "number" then
+                    local refused = drop.refused or -math.huge
+                    local suppressed = App.controls and App.controls.suppressedTakes[drop.uid]
+                    -- The native loop marks our blocked attempts as refusals.
+                    -- Only genuine server refusals should delay currency pickup.
+                    if suppressed and suppressed.grid == r.world.fg and refused >= suppressed.at then
+                        refused = -math.huge
+                    end
+                    retryAt[drop.uid] = retryAt[drop.uid] or (refused + 1)
+                    if eligible(drop, state) then table.insert(targets, drop) end
+                end
+            end
+            -- Claim only currency during tree work. Blocks/seeds stay suppressed
+            -- so planting's server seed counts remain unambiguous.
+            local batch = takeDropBatch({world = name}, targets, attempts, retryAt, eligible, token, nil,
+                {defer = true, limit = 8 - #jobs})
+            for _, job in ipairs(batch) do table.insert(jobs, job) end
+            settle(false)
+        end
+        return {step = step, finish = function() settle(true) end}
+    end)()
     local missed, counted = {}, {}
     local function countTree(point)
         local key = point.y * r.world.w + point.x
@@ -1717,6 +1777,12 @@ local function runTreeHarvest(token)
         end
     end
     App.harvestPhase, App.harvestGearError = "Breaking ripe trees", nil
+    if rotation and not pass then
+        -- Approval survives retries/reloads after we have replanted cleared tiles.
+        -- Growing replacements must not cancel the rest of this harvest pass.
+        rotation.harvestPass = {world = name, phase = "trees"}
+        saveRotationResume(rotation)
+    end
     for _, row in ipairs(rows) do
         worldCheck(name, token)
         local points = Core.ripeTrees(r.world, seedId, row, r.treeRipe)
@@ -1733,9 +1799,12 @@ local function runTreeHarvest(token)
                     worldCheck(name, token)
                     assert(gear.feet() == tractor, "Dear John Tractor was unequipped during harvesting.")
                     cleanup(state)
-                    if planter then return planter.step(row, points, countTree) end
+                    local proceed = planter and planter.step(row, points, countTree)
+                    gems.step()
+                    return proceed
                 end)
                 feet(nil)
+                gems.finish()
                 if planter then planter.finish() end
                 pause(0.25, token) -- Observe late tree corrections before queuing misses.
                 for _, point in ipairs(points) do
@@ -1826,11 +1895,25 @@ local function runHarvest(token)
     local seedId = Core.seedId(r.items, id)
     storageCount(box, id, seedId) -- Reject unsuitable storage before claiming anything.
     return harvestEquipmentScope(function() return withoutPickups(function()
+        local storedBefore, seedsBefore, gemsBefore = App.stats.stashed, App.stats.stashedSeeds, App.stats.gems
         refreshInventory(token)
-        if runTreeHarvest(token) == false then return false end
+        local rotation, pass = App.rotationState, App.rotationState and App.rotationState.harvestPass
+        assert(not pass or pass.world == box.world, "The saved harvest pass belongs to another farm.")
+        if pass and pass.phase == "collect" then
+            assert(not rotation.harvestPlant or not rotation.harvestPlant.pending,
+                "A harvest planting batch is still pending before collection. Check the saved rotation.")
+            suspendHarvestVehicle(token)
+            setStatus("Resuming harvest block, seed and gem collection in " .. box.world .. "...")
+        else
+            if runTreeHarvest(token) == false then return false end
+            if rotation then
+                -- Save before collection travel or storage respawns can interrupt us.
+                rotation.harvestPass = {world = box.world, phase = "collect"}
+                saveRotationResume(rotation)
+            end
+        end
         r = worldCheck(box.world, token)
         App.harvestPhase = "Collecting blocks, seeds and gems"
-        local storedBefore, seedsBefore, gemsBefore = App.stats.stashed, App.stats.stashedSeeds, App.stats.gems
         local attempts, retryAt, needsApproach, approached = {}, {}, {}, {}
         local lastRefusal = {}
         App.lastHarvestRefusal = nil
@@ -3161,6 +3244,14 @@ local function readRotationResume()
         end
     end
     if state.seedWait ~= nil then assert(type(state.seedWait) == "boolean", "Invalid saved rotation seed wait.") end
+    if state.harvestPass then
+        local pass = state.harvestPass
+        assert(type(pass) == "table" and state.phase == "harvest"
+            and pass.world == record.config.planting.worlds[state.worldIndex]
+            and (pass.phase == "trees" or pass.phase == "collect"), "Invalid saved harvest pass.")
+        assert(pass.phase ~= "collect" or not state.harvestPlant or not state.harvestPlant.pending,
+            "A saved harvest collection pass has an unconfirmed planting batch.")
+    end
     if state.plant then
         readPlantResume({version=1, active=true, userId=record.userId, updatedAt=record.updatedAt,
             config=record.config, profile=record.profile, state=state.plant})
@@ -3343,6 +3434,7 @@ local function runRotation(token, saved)
                     takeControls()
                     local harvested = runHarvest(token)
                     state.harvestPlant = nil
+                    state.harvestPass = nil
                     if harvested == false then
                         -- Recheck after reload/refill as well as scheduled entry.
                         -- New growing trees defer this farm to the normal PNB wait.
@@ -4218,7 +4310,7 @@ settingsControls.harvestMethod = harvestTab:Dropdown({ Title = "Harvest method",
         App.config.harvesting.method = method
         pcall(saveSession)
     end })
-harvestTab:Paragraph({ Title = "Dear John Tractor", Desc = "Keep the tractor in your backpack. Drive each row once, then clear misses with Fist from a lower row where reachable. The tractor is removed for Fist, travel and collection; previous footwear is restored afterward. Use Fist for farms containing different seed types." })
+harvestTab:Paragraph({ Title = "Dear John Tractor", Desc = "Keep the tractor in your backpack. Drive each row once and collect nearby gems while harvesting, then clear misses with Fist from a lower row where reachable. Blocks, seeds and remaining gems are collected afterward with the tractor off. Travel and Fist also remove it; previous footwear is restored afterward. Use Fist for farms containing different seed types." })
 ui.harvestPoint = harvestTab:Paragraph({ Title = "Farm storage", Desc = pointText("farmBox") })
 harvestTab:Button({ Title = "Save Farm storage", Desc = "Stand beside the farm world's Display Box.",
     Callback = uiAction(function() captureNearby("farmBox", "box") end) })
@@ -4666,6 +4758,8 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nRotation phase: " .. (App.rotationState and (App.rotationState.phase .. "; cycle " .. App.rotationState.cycle
             .. "; farm " .. App.rotationState.worldIndex .. "/" .. #App.config.planting.worlds) or "idle")
         .. "\nHarvest method: " .. App.config.harvesting.method .. "; phase: " .. (App.harvestPhase or "not started")
+        .. "\nSaved harvest pass: " .. (App.rotationState and App.rotationState.harvestPass
+            and (App.rotationState.harvestPass.world .. "; " .. App.rotationState.harvestPass.phase) or "not started")
         .. "\nTrees harvested: " .. App.stats.trees .. "; equipment restore: " .. (App.harvestGearError or "ready")
         .. "\nFarm maturity check: " .. (App.harvestMaturity or "not requested")
         .. "\nPlanting recovery: " .. (App.plantingRecovery or "not requested")

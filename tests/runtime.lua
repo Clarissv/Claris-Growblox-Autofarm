@@ -2709,6 +2709,7 @@ local function treeHarvestFixture(method)
         f.treeActions[#f.treeActions + 1] = {x = x, y = y, tractor = tractor, avatarX=f.avatar.x, avatarY=f.avatar.y}
         f.world.fg[y][x], f.trees[y * f.world.w + x] = 0, nil
         f.addDrop(100 + #f.treeActions, 954, 10, x + 0.5, y + 0.5)
+        if f.treeDrops then f.treeDrops(x, y, #f.treeActions) end
     end
     f.app.runtime.handlers = {hit = function(x, y)
         assert(f.worn ~= 898, "Fist must remove the automatic harvesting vehicle first")
@@ -2733,8 +2734,10 @@ local function treeHarvestFixture(method)
     end
     local accept = f.accept
     f.accept = function(drop, want)
-        assert(not f.world.riding or not f.world.riding.harvest, "Collection must remove the tractor")
-        assert(#f.treeActions == (f.expectedTrees or 0), "All trees must be harvested before the first block pickup")
+        if drop.id ~= 112 then
+            assert(not f.world.riding or not f.world.riding.harvest, "Block/seed collection must remove the tractor")
+            assert(#f.treeActions == (f.expectedTrees or 0), "All trees must be harvested before the first block/seed pickup")
+        end
         return accept(drop, want)
     end
     return f
@@ -2844,6 +2847,177 @@ test("Tractor harvests by native walking, removes it between rows, and restores 
     assert(equips == 3 and f.world.riding == nil)
 end)
 
+local function addTreeCurrency(f)
+    f.treeDrops = function(x, y, index)
+        f.addDrop(1000 + index * 2, 112, 3, x + 0.5, y + 0.5)
+        f.addDrop(1001 + index * 2, 955, 2, x + 0.5, y + 0.5)
+    end
+end
+
+test("Tractor collects gems while harvesting before blocks/seeds, with complete gem totals and HUD", function()
+    local f = treeHarvestFixture("tractor")
+    addTreeCurrency(f)
+    for _, y in ipairs({2,4,6}) do for _, x in ipairs({2,7,13}) do f.addTree(x,y) end end
+    f.expectedTrees, f.app.stats.gems = 9, 5
+    local displayed = f.addDrop(9000,112,100,7.5,2.5)
+    displayed.display = true
+    f.addDrop(9001,956,10,7.5,2.5)
+    local accept, early, moving, balance = f.accept, 0, 0
+    f.accept = function(drop,want)
+        if drop.id == 112 and f.world.riding and f.world.riding.harvest then
+            if #f.treeActions < f.expectedTrees then early = early+1 end
+            if f.controls.dir() ~= 0 and math.abs(f.avatar.vx) > 0.8 then moving = moving+1 end
+        end
+        return accept(drop,want)
+    end
+    f.app.runtime.gemHud = {setGems=function(n) balance=n end}
+    f.harvest()
+    assert(early >= 6 and moving >= 6, "Gems should be picked up during the moving Tractor pass")
+    assert(f.app.stats.gems == 32 and f.serverGems == 127 and balance == 127)
+    assert(f.app.status:find("27 gems collected",1,true), f.app.status)
+    assert(f.app.stats.stashed == 90 and f.app.stats.stashedSeeds == 18)
+    assert(f.hooks.Core.itemCount(f.boxes[12],112) == 0 and f.inventory:count(112) == 0)
+    assert(#f.drops == 2 and not displayed.taking and f.app.pending == 0 and f.worn == 777)
+end)
+
+test("Tractor leaves unready/refused gems for the final sweep and handles partial gem takes", function()
+    local f = treeHarvestFixture("tractor")
+    for _, x in ipairs({2,7,13}) do f.addTree(x,2) end
+    f.expectedTrees = 3
+    f.treeDrops = function(x,y,index)
+        local drop = f.addDrop(1000+index,112,index+3,x+0.5,y+0.5)
+        if index == 1 then drop.readyAt = os.clock()+1 end
+    end
+    local accept, refused, partial, readiness = f.accept, 0, 0, false
+    f.accept = function(drop,want)
+        if drop.id == 112 then
+            assert(os.clock() >= (drop.readyAt or 0))
+            local riding = f.world.riding and f.world.riding.harvest
+            if drop.uid == 1001 then readiness = not riding end
+            if drop.uid == 1002 and riding then refused = refused+1; return 0 end
+            if drop.uid == 1003 and want > 2 then partial = partial+1; return 2 end
+        end
+        return accept(drop,want)
+    end
+    f.harvest()
+    assert(readiness and refused == 1 and partial > 0)
+    assert(#f.drops == 0 and f.app.stats.gems == 15 and f.serverGems == 115)
+    assert(f.app.stats.stashed == 30 and f.app.pending == 0)
+end)
+
+test("Native suppressed pickup attempts cannot postpone fresh gems until after Tractor harvesting", function()
+    local f = treeHarvestFixture("tractor")
+    addTreeCurrency(f)
+    for _, x in ipairs({2,7,13}) do f.addTree(x,2) end
+    f.expectedTrees = 3
+    local physics, accept, early, suppressed = f.onWait, f.accept, 0, 0
+    f.onWait = function(dt)
+        physics(dt)
+        if not f.app.controls then return end
+        for _, drop in ipairs(f.drops) do
+            if not drop.taking and f.hooks.Navigation.pickupOverlap(f.avatar,drop)
+                and os.clock() >= math.max(drop.readyAt or 0,(drop.refused or -math.huge)+1) then
+                -- Match the native client's bookkeeping around the intercepted hook.
+                drop.taking = true
+                assert(f.world.takeDrop(drop.uid,drop.n) == 0)
+                drop.taking, drop.refused = false, os.clock()
+                if drop.id == 112 then suppressed = suppressed+1 end
+            end
+        end
+    end
+    f.accept = function(drop,want)
+        if drop.id == 112 and f.world.riding and f.world.riding.harvest then early = early+1 end
+        return accept(drop,want)
+    end
+    f.harvest()
+    assert(suppressed == 3 and early == 3, "All fresh gems should be collected despite synthetic cooldowns")
+    assert(#f.drops == 0 and f.app.stats.gems == 9 and f.serverGems == 109)
+    assert(f.app.stats.stashed == 30 and f.app.stats.stashedSeeds == 6 and f.app.pending == 0)
+end)
+
+test("Delayed Tractor gem replies stay bounded while driving and settle before storage travel", function()
+    local f = treeHarvestFixture("tractor")
+    for _, x in ipairs({2,7,13}) do f.addTree(x,2) end
+    f.expectedTrees = 3
+    f.treeDrops = function(x,y,index)
+        for n=1,12 do f.addDrop(1000+index*20+n,112,1,x+0.5,y+0.5) end
+    end
+    local delayed, physics, peak, moving = {}, f.onWait, 0, 0
+    f.spawn = function(fn)
+        peak = math.max(peak,f.app.pending)
+        if f.world.riding and f.world.riding.harvest then
+            delayed[#delayed+1] = {fn=fn,at=os.clock()+0.12}
+        else task.defer(fn) end
+    end
+    f.onWait = function(dt)
+        if #delayed > 0 and f.controls.dir() ~= 0 then moving = moving+1 end
+        physics(dt)
+        local ready = {}
+        for index=#delayed,1,-1 do
+            if delayed[index].at <= os.clock() then
+                ready[#ready+1] = delayed[index].fn; table.remove(delayed,index)
+            end
+        end
+        for _,complete in ipairs(ready) do complete() end
+    end
+    local server = f.server
+    f.server = function(name,...)
+        if name == "DisplayItem" then assert(#delayed == 0, "Gem replies must settle before storage travel") end
+        return server(name,...)
+    end
+    f.harvest()
+    assert(peak == 8 and moving > 0 and #delayed == 0 and f.app.pending == 0)
+    assert(#f.drops == 0 and f.app.stats.gems == 36 and f.serverGems == 136 and f.app.stats.stashed == 30)
+end)
+
+test("Stop holds an in-flight Tractor gem until its late reply settles once", function()
+    local f = treeHarvestFixture("tractor")
+    for _, x in ipairs({2,7,13}) do f.addTree(x,2) end
+    f.expectedTrees = 3
+    local gem, delayed
+    f.treeDrops = function(x,y,index)
+        if index == 1 then gem = f.addDrop(1000,112,7,x+0.5,y+0.5) end
+    end
+    f.spawn = function(fn)
+        if f.world.riding and f.world.riding.harvest then delayed = fn else fn() end
+    end
+    local physics = f.onWait
+    f.onWait = function(dt)
+        if delayed then f.app:stop() else physics(dt) end
+    end
+    rejects(f.harvest,"Stopped")
+    assert(delayed and gem.taking and f.app.pending == 1 and f.worn == 777)
+    assert(#f.treeActions < 3 and f.app.stats.stashed == 0)
+    f.allowLatePickup, f.allowMovingPickup = true, true
+    f.accept = function(drop,want) assert(drop == gem); return want end
+    delayed()
+    assert(not gem.taking and f.app.pending == 0 and f.app.stats.gems == 7 and f.serverGems == 107)
+    for _,drop in ipairs(f.drops) do assert(drop ~= gem) end
+end)
+
+test("Late Tractor gem replies do not modify drops or totals after a world change", function()
+    local f = treeHarvestFixture("tractor")
+    for _, x in ipairs({2,7,13}) do f.addTree(x,2) end
+    local gem, delayed
+    f.treeDrops = function(x,y,index)
+        if index == 1 then gem = f.addDrop(1000,112,7,x+0.5,y+0.5) end
+    end
+    f.spawn = function(fn)
+        if f.world.riding and f.world.riding.harvest then delayed = fn else fn() end
+    end
+    local physics = f.onWait
+    f.onWait = function(dt)
+        if delayed then f.world.name, f.world.fg = "OTHER", {} else physics(dt) end
+    end
+    rejects(f.harvest,"The world changed")
+    assert(delayed and gem.taking and f.app.pending == 1)
+    f.allowLatePickup, f.allowMovingPickup = true, true
+    f.accept = function(drop,want) assert(drop == gem); return want end
+    delayed()
+    assert(not gem.taking and gem.n == 7 and f.app.pending == 0 and f.app.stats.gems == 0)
+    assert(f.serverGems == 107 and f.worn == 777)
+end)
+
 local function requireForwardTractorPass(f)
     local physics = f.onWait
     f.onWait = function(dt)
@@ -2903,6 +3077,92 @@ test("Rotation replants cleared trees while the Tractor keeps its forward zigzag
     end
     assert(moving>=6, "Replanting should share the Tractor movement")
     assert(f.app.rotationState.harvestPlant.pending==nil and f.worn==777)
+end)
+
+test("Tractor gem pickups preserve seed confirmation during combined harvest planting", function()
+    local f = harvestPlantingFixture(9)
+    addTreeCurrency(f)
+    for _,y in ipairs({2,4,6}) do for _,x in ipairs({2,7,13}) do f.addTree(x,y) end end
+    f.expectedTrees = 9
+    local accept, early = f.accept, 0
+    f.accept = function(drop,want)
+        if drop.id == 112 and f.world.riding and f.world.riding.harvest and #f.treeActions < 9 then early = early+1 end
+        return accept(drop,want)
+    end
+    f.harvest()
+    assert(early > 0 and f.app.stats.gems == 27 and f.serverGems == 127)
+    assert(f.app.stats.trees == 9 and f.app.stats.planted == 9 and #f.seedPlants == 9)
+    assert(f.app.stats.stashed == 90 and f.app.stats.stashedSeeds == 18 and f.serverItems[955] == 0)
+    assert(f.app.rotationState.harvestPlant.pending == nil and f.worn == 777 and f.app.pending == 0)
+end)
+
+test("Retrying combined Tractor collection does not wait for its newly replanted trees", function()
+    local f = harvestPlantingFixture(9)
+    addTreeCurrency(f)
+    for _,y in ipairs({2,4,6}) do for _,x in ipairs({2,7,13}) do f.addTree(x,y) end end
+    f.expectedTrees = 9
+    local physics, interrupted, allowCollection = f.onWait, false, false
+    f.onWait = function(dt)
+        if not allowCollection and f.app.harvestPhase == "Collecting blocks, seeds and gems" then
+            interrupted = true
+            error("Returning to the saved position timed out. Check the route.")
+        end
+        physics(dt)
+    end
+    rejects(f.harvest,"Returning to the saved position timed out")
+    assert(interrupted and f.app.stats.planted == 9 and #f.drops > 0)
+    allowCollection = true
+    assert(f.harvest() ~= false, "Collection retries must finish the current harvest before the next maturity wait")
+    assert(#f.drops == 0 and f.app.stats.stashed == 90 and f.app.stats.stashedSeeds == 18)
+    assert(#f.treeActions == 9 and #f.seedPlants == 9 and f.app.stats.gems == 27)
+end)
+
+test("A collection checkpoint reload finishes Tractor blocks/seeds with growing replacements and full backpacks", function()
+    local f = harvestPlantingFixture(36)
+    addTreeCurrency(f)
+    for _,y in ipairs({2,4,6}) do for x=2,13 do f.addTree(x,y) end end
+    f.expectedTrees = 36
+    local physics, allowCollection = f.onWait, false
+    f.onWait = function(dt)
+        if not allowCollection and f.app.harvestPhase == "Collecting blocks, seeds and gems" then
+            error("Returning to the saved position timed out. Check the route.")
+        end
+        physics(dt)
+    end
+    rejects(f.harvest,"Returning to the saved position timed out")
+    local runtime, saved = f.app.runtime, f.hooks.readRotationResume()
+    assert(saved.state.harvestPass.world == "FARM" and saved.state.harvestPass.phase == "collect")
+    assert(saved.state.harvestPlant.pending == nil and #f.seedPlants == 36)
+    f.hooks = f.reload()
+    f.app = f.hooks.App
+    f.app.runtime, f.app.config, f.app.rotationState = runtime, saved.config, saved.state
+    f.app.job, f.app.token, allowCollection = "rotation", 1, true
+    f.worn, f.world.riding = 898, {harvest=true,speed=3.6}
+    assert(f.harvest() ~= false)
+    assert(#f.drops == 0 and #f.treeActions == 36 and #f.seedPlants == 36)
+    assert(f.app.stats.stashed == 360 and f.app.stats.stashedSeeds == 72 and #f.deposits >= 3)
+    assert(f.serverGems == 208 and f.app.pending == 0 and f.worn == 898)
+end)
+
+test("An approved partial Tractor pass resumes remaining trees despite its growing replanted rows", function()
+    local f = harvestPlantingFixture(9)
+    addTreeCurrency(f)
+    for _,y in ipairs({2,4,6}) do for _,x in ipairs({2,7,13}) do f.addTree(x,y) end end
+    f.expectedTrees = 9
+    local physics, allowHarvest = f.onWait, false
+    f.onWait = function(dt)
+        if not allowHarvest and #f.seedPlants >= 3 then
+            error("Returning to the saved position timed out. Check the route.")
+        end
+        physics(dt)
+    end
+    rejects(f.harvest,"Returning to the saved position timed out")
+    assert(#f.treeActions >= 3 and #f.treeActions < 9 and #f.seedPlants >= 3)
+    assert(f.hooks.readRotationResume().state.harvestPass.phase == "trees")
+    allowHarvest = true
+    assert(f.harvest() ~= false)
+    assert(#f.drops == 0 and #f.treeActions == 9 and f.app.stats.stashed == 90 and f.app.stats.stashedSeeds == 18)
+    assert(f.serverGems == 127 and f.app.pending == 0)
 end)
 
 test("Tractor misses are broken and replanted with Fist from the same lower position", function()
@@ -5144,6 +5404,53 @@ test("Combined rotation loads PNB seeds and replants both ripe farms during harv
     assert(not f.app.lastError,f.app.lastError)
     assert(#f.harvests==10 and #f.plants==10 and f.app.stats.planted==10 and f.pnbBlocks==0)
     assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12],954)==410)
+end)
+
+test("Rotation retries combined harvest collection before leaving a newly replanted farm", function()
+    local f = rotationFixture()
+    fillGrowingFarms(f,{FARM=0,FARM2=0})
+    f.app.config.options.harvestPlanting = true
+    local interrupted, retrying, enter = false, false, f.world.enter
+    f.afterWait = function()
+        if f.app.status:find("Retrying rotation phase harvest",1,true) then retrying = true end
+        if not retrying and #f.harvests == 5 and f.app.harvestPhase == "Collecting blocks, seeds and gems" then
+            interrupted = true
+            error("Returning to the saved position timed out. Check the route.")
+        end
+        if f.app.stats.cycles == 1 then f.app:stop() end
+    end
+    f.world.enter = function(name)
+        if name == "BREAK" and #f.harvests >= 5 then
+            assert(#f.worldDrops.FARM == 0, "Rotation must collect the first farm before leaving for PNB")
+            if #f.harvests == 10 then assert(#f.worldDrops.FARM2 == 0) end
+        end
+        return enter(name)
+    end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(interrupted and retrying and #f.harvests == 10 and #f.plants == 10)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12],954) == 410)
+    assert(f.app.stats.stashed == 10 and f.app.stats.stashedSeeds == 400 and f.app.stats.cycles == 1)
+    assert(not f.app.rotationState or f.app.rotationState.harvestPass == nil)
+end)
+
+test("Saved harvest passes cannot apply another farm's approval or collect an unconfirmed seed batch", function()
+    local f = rotationFixture()
+    local state = {phase="harvest",worldIndex=1,cycle=1,work=0,seedCargo=0,
+        harvestPass={world="FARM2",phase="collect"}}
+    f.hooks.saveRotationResume(state)
+    rejects(f.hooks.readRotationResume,"Invalid saved harvest pass")
+    state.harvestPass = {world="FARM",phase="collect"}
+    state.harvestPlant = {worldIndex=1,phase="farm",skipped={},
+        pending={world="FARM",x=1,y=8,before=1,tiles={{x=1,y=8}}}}
+    f.hooks.saveRotationResume(state)
+    rejects(f.hooks.readRotationResume,"unconfirmed planting batch")
+    state.harvestPlant.pending, state.harvestPass.phase = nil, "trees"
+    f.hooks.saveRotationResume(state)
+    assert(f.hooks.readRotationResume().state.harvestPass.phase == "trees")
+    state.phase = "wait"
+    f.hooks.saveRotationResume(state)
+    rejects(f.hooks.readRotationResume,"Invalid saved harvest pass")
 end)
 
 test("An interrupted harvest stock withdrawal never retries its storage request on resume", function()
