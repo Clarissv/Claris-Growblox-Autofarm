@@ -461,7 +461,7 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.17"
+local VERSION = "0.1.18"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -690,6 +690,24 @@ end
 local function readField(value, key)
     local ok, field = pcall(function() return value[key] end)
     if ok then return field end
+end
+local function findRespawn(world, objects, scan)
+    scan = scan or newScan()
+    -- Some client versions expose the method directly. The supplied client
+    -- exposes it on the menu adapter, alongside enter/currentWorld instead.
+    if type(rawget(world, "respawn")) == "function" then return world.respawn, "world method" end
+    local found
+    for _, candidate in pairs(objects or {}) do
+        scanStep(scan, "Finding Respawn action")
+        if type(candidate) == "table" and type(rawget(candidate, "respawn")) == "function"
+            and type(rawget(world, "enter")) == "function" and rawget(candidate, "enter") == world.enter
+            and type(rawget(candidate, "currentWorld")) == "function"
+            and owns(candidate.currentWorld, world, scan) then
+            if found and found ~= candidate.respawn then return nil, "ambiguous native menu adapters" end
+            found = candidate.respawn
+        end
+    end
+    return found, found and "native menu adapter" or "unavailable; no matching native menu adapter"
 end
 local function findWorldPicker(world, objects, scan)
     scan = scan or newScan()
@@ -1005,15 +1023,18 @@ local function discover(options)
         end
     end
     local items, itemSource = resolveItems(world, objects, registry, scan)
+    local respawn, respawnSource = findRespawn(world, objects, scan)
     table.insert(App.discoveryReport, "Item definitions: " .. itemSource)
     local runtime = { world = world, body = body, controls = controls[1], inventory = inventory,
         items = items, handlers = handlers, issues = issues,
         readInventoryView = readInventoryView, ready = #issues == 0, gemHud = gemHud,
-        picker = findWorldPicker(world, objects, scan), farmingDeferred = scan.transferOnly }
+        picker = findWorldPicker(world, objects, scan), farmingDeferred = scan.transferOnly,
+        respawn = respawn, respawnSource = respawnSource }
     table.insert(App.discoveryReport, "Inventory: " .. (readInventoryView and "readable snapshot" or "live backpack"))
     table.insert(App.discoveryReport, "Farming hooks: " .. (scan.transferOnly and "deferred until PNB or Planting starts"
         or #issues == 0 and "ready" or table.concat(issues, " ")))
     table.insert(App.discoveryReport, "Movement and storage: " .. (#issues == 0 and "ready" or table.concat(issues, " ")))
+    table.insert(App.discoveryReport, "Respawn hook: " .. respawnSource)
     table.insert(App.discoveryReport, "World picker: " .. (runtime.picker and "UI cleanup ready" or "UI hook unavailable"))
     table.insert(App.discoveryReport, "Planting hook: " .. (ambiguousHandlers.plantSeed and "ambiguous"
         or handlers.plantSeed and "ready" or "unavailable"))
@@ -1783,14 +1804,31 @@ local function runHarvest(token)
             local state, point = position(), box
             local dx = math.abs(state.x - ((point.standX or point.x) + 0.5))
             local dy = math.abs(state.y - ((point.standY or point.y) + 1))
-            if not App.config.options.harvestRespawn or type(r.world.respawn) ~= "function" or dx + dy <= 4 then return end
+            if not App.config.options.harvestRespawn then
+                App.harvestReturnDebug = "Walking; Respawn to Farm storage is Off."
+                return
+            end
+            if dx + dy <= 4 then
+                App.harvestReturnDebug = "Walking; already within four tiles of Farm storage."
+                return
+            end
+            local respawn = r.respawn or r.world.respawn
+            if type(respawn) ~= "function" then
+                App.harvestReturnDebug = "Respawn unavailable: " .. (r.respawnSource or "no native action attached")
+                    .. ". Walking to Farm storage."
+                setStatus("Respawn unavailable; walking to Farm storage. Copy diagnostics to check the hook.")
+                return
+            end
             local hold = takeControls()
             hold.direction, hold.jump = 0, false
             assert(App.pending == 0, "Wait for pending pickups before respawning to storage.")
             refreshInventory(token)
             local beforeX, beforeY, beforeCount = state.x, state.y, count(id)
+            local began = os.clock()
+            App.harvestReturnDebug = "Respawn requested using " .. (r.respawnSource or "world method")
+                .. " from " .. string.format("%.2f, %.2f", beforeX, beforeY)
             setStatus("Respawning near Farm storage...")
-            bounded(r.world.respawn, App.config.options.actionTimeout, token)
+            bounded(respawn, App.config.options.actionTimeout, token)
             local readyDeadline, changed, stable = os.clock() + math.max(15, App.config.options.actionTimeout), false, nil
             while true do
                 checkpoint(token)
@@ -1807,6 +1845,9 @@ local function runHarvest(token)
             worldCheck(box.world, token)
             refreshInventory(token)
             assert(count(id) == beforeCount, "Backpack blocks changed during respawn. Check inventory before restarting harvest.")
+            local arrived = position()
+            App.harvestReturnDebug = "Respawn finished in " .. string.format("%.2fs", os.clock() - began)
+                .. " at " .. string.format("%.2f, %.2f", arrived.x, arrived.y) .. "; backpack confirmed."
         end
         local function stash()
             if count(id) == 0 then return end
@@ -2751,7 +2792,7 @@ if env.ClarisGrowbloxTest then
         savePNBResume = savePNBResume, readPNBResume = readPNBResume, refreshPNBCheckpoint = refreshPNBCheckpoint,
         webhookPayload = webhookPayload, setWebhookSetting = setWebhookSetting,
         resetWebhookSchedule = resetWebhookSchedule, sendWebhook = sendWebhook, pollWebhook = pollWebhook,
-        findWorldPicker = findWorldPicker, pickerOpen = pickerOpen, runHarvest = runHarvest,
+        findWorldPicker = findWorldPicker, findRespawn = findRespawn, pickerOpen = pickerOpen, runHarvest = runHarvest,
         saveSession = saveSession, restoreSession = restoreSession, pollSession = pollSession,
         runPlant = runPlant, plantTile = plantTile, enterPlantWorld = enterPlantWorld,
         readPlantResume = readPlantResume, savePlantResume = savePlantResume, clearPlantResume = clearPlantResume,
@@ -3259,6 +3300,7 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nAnti-AFK: " .. (App.antiAFKError or "ready")
         .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
         .. "\nLast refused harvest pickup: " .. (App.lastHarvestRefusal or "none")
+        .. "\nHarvest storage return: " .. (App.harvestReturnDebug or "not requested")
         .. "\nRecovery save: " .. (App.recoverySaveError or "ready")
         .. "\nSession save: " .. (App.sessionSaveError or "ready")
         .. "\nSession restore: " .. (App.sessionRestoreError or "ready")

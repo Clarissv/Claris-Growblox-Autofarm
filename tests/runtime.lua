@@ -2107,6 +2107,35 @@ test("Harvest respawns after pickups settle and deposits the preserved backpack"
     assert(not f.avatar.dead and f.app.pending==0)
 end)
 
+test("Harvest uses the native menu Respawn action when the world has no respawn method", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    attachPhysics(f, map)
+    f.addDrop(1, 954, 20, 4.5, 8.5)
+    f.accept = function(drop, want) return math.abs(drop.x - f.avatar.x) < 0.6 and want or 0 end
+    local respawns = 0
+    f.app.runtime.respawn = function()
+        assert(f.world.respawn == nil and f.app.pending == 1)
+        respawns = respawns + 1
+        f.avatar.x, f.avatar.y, f.avatar.vx, f.avatar.vy = 10.5, 8.999, 0, 0
+    end
+    f.app.runtime.respawnSource = "native menu adapter"
+    f.harvest()
+    assert(respawns == 1 and f.app.stats.stashed == 20 and #f.deposits == 1,
+        "An adapter-bound Respawn must replace the walking return")
+end)
+
+test("An enabled but unavailable respawn hook explains the walking fallback", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    attachPhysics(f, map)
+    f.addDrop(1, 954, 20, 4.5, 8.5)
+    f.accept = function(drop, want) return math.abs(drop.x - f.avatar.x) < 0.6 and want or 0 end
+    f.harvest()
+    assert(f.app.stats.stashed == 20 and f.app.harvestReturnDebug:find("unavailable", 1, true))
+    assert(table.concat(f.app.logs, "\n"):find("Respawn unavailable", 1, true))
+end)
+
 test("Disabling harvest respawn preserves the walking return to storage", function()
     local f = harvestFixture()
     local map = harvestFloor(f)
@@ -2938,6 +2967,43 @@ test("Transfer attachment skips unrelated function upvalues and defers punching 
     f.server = function(name) assert(name == "GetInventory"); return {slots = {}, capacity = 54} end
     f.hooks.start("pnb")
     assert(not f.app.runtime.farmingDeferred and f.app.runtime.handlers.hit and not f.app.lastError)
+end)
+
+test("Fast attachment binds Respawn from the menu adapter belonging to the active world", function()
+    local f = fixture()
+    local items = f.app.runtime.items
+    prepareDiscovery(f, true)
+    attachWorldHandlers(f, items)
+    local world = f.world
+    world.enter = function() return true end
+    world.definitions = function() return items end
+    local called = 0
+    local adapter = {enter = world.enter, currentWorld = function() return world.name end,
+        respawn = function() called = called + 1 end}
+    local otherWorld = {name = "OTHER"}
+    local unrelated = {enter = world.enter, currentWorld = function() return otherWorld.name end,
+        respawn = function() error("Unrelated adapter must never be selected") end}
+    table.insert(f.discoveryObjects, unrelated)
+    table.insert(f.discoveryObjects, adapter)
+    local r = f.hooks.connectGame({transferOnly = true})
+    assert(r.respawn == adapter.respawn and r.respawnSource == "native menu adapter" and called == 0)
+    r.respawn()
+    assert(called == 1 and world.respawn == nil)
+end)
+
+test("Respawn discovery accepts aliases but rejects conflicting menu actions", function()
+    local f = fixture()
+    local world = f.world
+    world.enter = function() return true end
+    local currentWorld = function() return world.name end
+    local first = {enter = world.enter, currentWorld = currentWorld,
+        respawn = function() error("Discovery must not execute Respawn") end}
+    local alias = {enter = world.enter, currentWorld = currentWorld, respawn = first.respawn}
+    assert(f.hooks.findRespawn(world, {first, alias}) == first.respawn)
+    local other = {enter = world.enter, currentWorld = currentWorld,
+        respawn = function() error("Conflicting action must not be chosen") end}
+    local action, source = f.hooks.findRespawn(world, {first, other})
+    assert(not action and source:find("ambiguous", 1, true))
 end)
 
 test("Discovery stops at its next frame boundary when the app is unloaded", function()

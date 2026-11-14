@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.17.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.18.
+
+Version 0.1.18 fixes Respawn to Farm storage silently walking back because the script looked for Respawn on the world table. The supplied client exposes it on the native menu adapter. Attachment now finds that adapter using its matching world-entry function and world-owned currentWorld function, including during the faster startup. Harvest invokes the native menu action after pickups settle, waits for respawn, confirms the backpack, and walks the remaining distance to storage. Diagnostics show the bound Respawn source and whether the return was requested, completed, skipped because storage was within four tiles, or unavailable. Unavailable actions produce a visible walking-fallback message.
 
 Version 0.1.17 speeds up Moving Drops attachment after script reloads and server changes. Startup attaches movement, storage, and the live backpack first; punching and planting hooks are discovered when their tasks start. The loader caches verified release files locally and starts both downloads together when a release is new. Transfer trips use four inventory reads rather than six, preserving before/after confirmation for each storage action. Door entry and resumed transfers wait for the destination avatar to be ready instead of imposing the old half-second door wait and three-second teleport startup delay. Diagnostics show attachment time, cached/downloaded files, and the last door's readiness wait.
 
@@ -82,7 +84,7 @@ For an existing checkout with the GitHub remote configured, upload this rebuilt 
 ```powershell
 Set-Location -LiteralPath 'F:\VSCode\Luau\Claris Growblox Autofarm\logic'
 git add .
-git commit -m "Speed up Moving Drops reloads and transfers"
+git commit -m "Bind the native Respawn action for harvest storage returns"
 git push
 ```
 
@@ -187,7 +189,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.17 passes 204 offline checks: 28 configuration/layout/storage tests, 168 tests executing the generated runtime against mock services and a mock server, six generated-loader cache/download tests, and two release checks. Added checks cover exact transfer cargo and four inventory reads per trip, immediate and delayed door readiness, resumed avatar loading and Stop, deferred punching-hook discovery with 5,000 unrelated functions, concurrent downloads, cache reuse in a new server environment, cache corruption, unavailable file functions, and rejected downloads. Existing startup, attachment, planting, PNB, harvest, navigation, respawn, webhook, recovery, anti-AFK, and storage checks remain. These mocks do not establish live speed gains, Delta frame times, planting reach, route geometry, world permissions, teleport queue behavior, or Discord delivery.
+Version 0.1.18 passes 208 offline checks: 28 configuration/layout/storage tests, 172 tests executing the generated runtime against mock services and a mock server, six generated-loader cache/download tests, and two release checks. New checks cover a native menu Respawn with no world-table method, adapter discovery during fast attachment, rejection of unrelated or conflicting actions, and visible walking fallback when the hook is unavailable. Existing startup, attachment, planting, PNB, harvest, navigation, respawn, webhook, recovery, anti-AFK, and storage checks remain. These mocks do not establish live speed gains, Delta frame times, planting reach, route geometry, world permissions, teleport queue behavior, or Discord delivery.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 
