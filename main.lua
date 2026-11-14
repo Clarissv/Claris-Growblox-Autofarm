@@ -648,7 +648,7 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.27"
+local VERSION = "0.1.29"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -656,7 +656,11 @@ local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local player = Players.LocalPlayer
 local env = getgenv and getgenv() or _G
-local ROOT = "ClarisGrowblox"
+local ACCOUNT_ID = player.UserId
+assert(type(ACCOUNT_ID) == "number" and ACCOUNT_ID > 0 and ACCOUNT_ID == math.floor(ACCOUNT_ID),
+    "The Roblox account is not ready. Run the loader after signing in.")
+local LEGACY_ROOT = "ClarisGrowblox"
+local ROOT = LEGACY_ROOT .. "/accounts/" .. tostring(ACCOUNT_ID)
 local PROFILE_DIR = ROOT .. "/profiles"
 local RESUME_FILE = ROOT .. "/resume.json"
 local PNB_RESUME_FILE = ROOT .. "/pnb-resume.json"
@@ -696,11 +700,13 @@ local function exists(path)
     return type(isfile) == "function" and isfile(path)
 end
 local function filesystem()
+    assert(player.UserId == ACCOUNT_ID, "The Roblox account changed. Reload the script for this account.")
     assert(type(readfile) == "function" and type(writefile) == "function"
         and type(isfolder) == "function" and type(makefolder) == "function",
         "Delta file functions are unavailable. Profile saving needs readfile/writefile/makefolder.")
-    if not isfolder(ROOT) then makefolder(ROOT) end
-    if not isfolder(PROFILE_DIR) then makefolder(PROFILE_DIR) end
+    for _, folder in ipairs({LEGACY_ROOT, LEGACY_ROOT .. "/accounts", ROOT, PROFILE_DIR}) do
+        if not isfolder(folder) then makefolder(folder) end
+    end
 end
 local function writeJSON(path, value)
     filesystem()
@@ -715,6 +721,7 @@ local function writeJSON(path, value)
 end
 
 local App = {
+    userId = ACCOUNT_ID, dataFolder = ROOT,
     alive = true, job = nil, token = 0, pending = 0, configuring = false,
     config = Core.defaults(), profile = "Default", status = "Connecting to Growblox...",
     logs = {}, controls = nil, runtime = nil, resume = nil,
@@ -729,10 +736,11 @@ local WindUI
 local ui = {}
 
 local function saveSession()
+    assert(player.UserId == ACCOUNT_ID, "The Roblox account changed. Reload the script for this account.")
     local config, profile = Core.validate(App.config), Core.profileName(App.profile)
     local signature = encode({config = config, profile = profile})
     if signature == App.sessionSignature then return end
-    writeJSON(SESSION_FILE, {version = 1, userId = player.UserId, config = config, profile = profile})
+    writeJSON(SESSION_FILE, {version = 1, userId = ACCOUNT_ID, config = config, profile = profile})
     App.sessionSignature, App.sessionSaveError = signature, nil
 end
 local function saveFPSPreference()
@@ -742,7 +750,7 @@ local function saveFPSPreference()
     for _, path in ipairs({RESUME_FILE, PNB_RESUME_FILE, PLANT_RESUME_FILE, ROTATION_RESUME_FILE}) do
         if exists(path) then
             local record = decode(readfile(path))
-            if type(record) == "table" and record.active and record.userId == player.UserId
+            if type(record) == "table" and record.active and record.userId == ACCOUNT_ID
                 and record.profile == App.profile then
                 record.config = Core.validate(record.config)
                 record.config.options.fpsBooster = App.config.options.fpsBooster
@@ -753,15 +761,50 @@ local function saveFPSPreference()
 end
 local function restoreSession(previous)
     local record
-    if previous and previous.config then
-        record = {version = 1, userId = player.UserId, config = previous.config, profile = previous.profile}
+    if previous and previous.userId == ACCOUNT_ID and previous.config then
+        record = {version = 1, userId = ACCOUNT_ID, config = previous.config, profile = previous.profile}
     elseif exists(SESSION_FILE) then record = decode(readfile(SESSION_FILE)) end
     if not record then return false end
     assert(type(record) == "table", "The saved session file is invalid.")
     assert(record.version == 1, "Unsupported saved session schema: " .. tostring(record.version))
-    assert(record.userId == player.UserId, "The saved session belongs to another account.")
+    assert(record.userId == ACCOUNT_ID, "The saved session belongs to another account.")
     App.config, App.profile = Core.validate(record.config), Core.profileName(record.profile)
     return true
+end
+local function migrateLegacyStorage()
+    local marker = ROOT .. "/migration.json"
+    if exists(marker) then return end
+    local migrated, session = 0, nil
+    for _, name in ipairs({"session", "resume", "pnb-resume", "plant-resume", "rotation-resume"}) do
+        local oldPath, newPath = LEGACY_ROOT .. "/" .. name .. ".json", ROOT .. "/" .. name .. ".json"
+        if not exists(newPath) and exists(oldPath) then
+            local ok, record = pcall(function() return decode(readfile(oldPath)) end)
+            if ok and type(record) == "table" and record.userId == ACCOUNT_ID then
+                writeJSON(newPath, record)
+                migrated = migrated + 1
+                if name == "session" then session = record end
+            end
+        end
+    end
+    -- Legacy profile files have no owner. Recover the active profile from the
+    -- owned session snapshot, rather than a same-name file another account used.
+    if not session and exists(SESSION_FILE) then
+        local ok, record = pcall(function() return decode(readfile(SESSION_FILE)) end)
+        if ok and type(record) == "table" and record.userId == ACCOUNT_ID then session = record end
+    end
+    if session then
+        local ok, config, profile = pcall(function()
+            return Core.validate(session.config), Core.profileName(session.profile)
+        end)
+        if ok then
+            local path = PROFILE_DIR .. "/" .. profile .. ".json"
+            if not exists(path) then writeJSON(path, config) end
+        end
+    end
+    -- Never delete shared legacy files, and never resurrect cleared checkpoints
+    -- on later reloads. Each account completes migration independently.
+    writeJSON(marker, {version = 1, userId = ACCOUNT_ID})
+    App.migratedFiles = migrated
 end
 local function pollSession()
     if App.alive and not App.configuring then
@@ -801,6 +844,7 @@ local function idle()
 end
 local function checkpoint(token)
     assert(App.alive and App.job and token == App.token, "Stopped.")
+    assert(player.UserId == ACCOUNT_ID, "The Roblox account changed. Reload the script for this account.")
 end
 local function pause(seconds, token)
     local deadline = os.clock() + seconds
@@ -1695,7 +1739,7 @@ local function moveToPoint(point, token)
 end
 local function assertPNBPosition()
     if App.job ~= "pnb" and not (App.job == "rotation" and App.rotationState
-        and (App.rotationState.phase == "pnb" or App.rotationState.phase == "waitPNB")) then return end
+        and (App.rotationState.phase == "pnb" or App.rotationState.phase == "waitPNB" or App.rotationState.phase == "drainPNB")) then return end
     local point, state = App.config.points.pnb, position()
     if not state.grounded or math.abs(state.x - (point.x + 0.5)) > 0.3
         or math.abs(state.y - (point.y + 1)) > 0.25 then
@@ -1772,7 +1816,7 @@ local function clearPNBResume()
 end
 local function savePNBResume()
     saveSession()
-    writeJSON(PNB_RESUME_FILE, {version = 1, active = true, userId = player.UserId, updatedAt = os.time(),
+    writeJSON(PNB_RESUME_FILE, {version = 1, active = true, userId = ACCOUNT_ID, updatedAt = os.time(),
         config = Core.validate(App.config), profile = App.profile})
     App.lastPNBSave = os.clock()
 end
@@ -1788,7 +1832,7 @@ local function readPNBResume()
     if not exists(PNB_RESUME_FILE) then return nil end
     local record = decode(readfile(PNB_RESUME_FILE))
     if not record.active then return nil end
-    assert(record.version == 1 and record.userId == player.UserId, "The saved farm belongs to another account or script version.")
+    assert(record.version == 1 and record.userId == ACCOUNT_ID, "The saved farm belongs to another account or script version.")
     assert(type(record.updatedAt) == "number" and os.time() - record.updatedAt < 21600,
         "The saved farm is over six hours old. Load your profile and start it again.")
     record.config, record.profile = Core.validate(record.config), Core.profileName(record.profile)
@@ -1796,7 +1840,7 @@ local function readPNBResume()
 end
 local function saveResume(phase, cargo)
     saveSession()
-    local record = { version = 1, active = true, userId = player.UserId, updatedAt = os.time(),
+    local record = { version = 1, active = true, userId = ACCOUNT_ID, updatedAt = os.time(),
         config = Core.validate(App.config), profile = App.profile, phase = phase, cargo = cargo or 0,
         seeds = count(Core.seedId(runtime().items, App.config.blockId)) }
     writeJSON(RESUME_FILE, record)
@@ -1948,7 +1992,7 @@ local function breakTile(point, id, token)
     App.stats.broken = App.stats.broken + 1
 end
 
-local function takeDropBatch(anchor, targets, attempts, retryAt, eligible, token, onTaken)
+local function takeDropBatch(anchor, targets, attempts, retryAt, eligible, token, onTaken, options)
     local r = worldCheck(anchor.world, token)
     local take = App.controls and App.controls.takeDrop or r.world.takeDrop
     assert(type(take) == "function" and type(r.world.dropTaken) == "function",
@@ -1956,12 +2000,13 @@ local function takeDropBatch(anchor, targets, attempts, retryAt, eligible, token
     local jobs, reserved = {}, {}
     local deadline = os.clock() + App.config.options.actionTimeout
     for _, drop in ipairs(targets) do
-        if #jobs >= 8 then break end
+        if #jobs >= (options and options.limit or 8) then break end
         worldCheck(anchor.world, token)
         assertPNBPosition()
         local present = false
         for _, current in pairs(r.world.dropList()) do if current == drop then present = true; break end end
-        local room = drop.id == 112 and 65535 or math.max(0, r.inventory:room(drop.id) - (reserved[drop.id] or 0))
+        local room = drop.id == 112 and 65535 or math.max(0, r.inventory:room(drop.id)
+            - (reserved[drop.id] or 0) - (options and options.reserved[drop.id] or 0))
         local want = math.floor(math.min(drop.n, room, 65535))
         if want > 0 and present and eligible(drop) then
             local before, grid, uid, id = drop.n, r.world.fg, drop.uid, drop.id
@@ -1990,10 +2035,11 @@ local function takeDropBatch(anchor, targets, attempts, retryAt, eligible, token
                 assert(ok, tostring(result))
                 return result
             end)
-            table.insert(jobs, {request = request, uid = uid, id = id,
+            table.insert(jobs, {request = request, uid = uid, id = id, want = want, deadline = deadline,
                 avatarX = state.x, avatarY = state.y, dropX = drop.x, dropY = drop.y})
         end
     end
+    if options and options.defer then return jobs end
     local results = {}
     for _, job in ipairs(jobs) do
         local amount = awaitRequest(job.request, deadline, token)
@@ -2262,7 +2308,7 @@ local function runTreeHarvest(token)
             end
         end
     end
-    App.harvestPhase = "Collecting blocks and seeds"
+    App.harvestPhase = "Collecting blocks, seeds and gems"
 end
 
 local function runHarvest(token)
@@ -2275,8 +2321,8 @@ local function runHarvest(token)
         refreshInventory(token)
         runTreeHarvest(token)
         r = worldCheck(box.world, token)
-        App.harvestPhase = "Collecting blocks and seeds"
-        local storedBefore, seedsBefore = App.stats.stashed, App.stats.stashedSeeds
+        App.harvestPhase = "Collecting blocks, seeds and gems"
+        local storedBefore, seedsBefore, gemsBefore = App.stats.stashed, App.stats.stashedSeeds, App.stats.gems
         local attempts, retryAt, needsApproach, approached = {}, {}, {}, {}
         local lastRefusal = {}
         App.lastHarvestRefusal = nil
@@ -2284,14 +2330,16 @@ local function runHarvest(token)
         local farmRows, farmRowsByY, activeFarmRow, restrictRoute = {}, {}, nil, false
         local rangeLimited, emptySince = false, nil
         local deadline = os.clock() + App.config.options.actionTimeout
+        local routeJobs, routeReserved, routeAccepted = {}, {}, 0
         local function selected(drop)
-            return type(drop) == "table" and not drop.display and (drop.id == id or drop.id == seedId)
+            return type(drop) == "table" and not drop.display and (drop.id == id or drop.id == seedId or drop.id == 112)
                 and type(drop.uid) == "number" and type(drop.n) == "number" and drop.n > 0
                 and type(drop.x) == "number" and type(drop.y) == "number"
         end
         local function capacityBlocked()
             for _, drop in pairs(r.world.dropList()) do
-                if selected(drop) and r.inventory:room(drop.id) <= 0 then
+                if selected(drop) and drop.id ~= 112 and r.inventory:room(drop.id) - (routeReserved[drop.id] or 0) <= 0 then
+                    if (routeReserved[drop.id] or 0) > 0 then return true end
                     assert(count(drop.id) > 0, "Your backpack has no room for harvested blocks or seeds. Free a slot before collecting.")
                     return true
                 end
@@ -2300,7 +2348,7 @@ local function runHarvest(token)
         end
         local function onTaken(_, takenId, amount)
             if takenId == id then App.stats.harvested = App.stats.harvested + amount
-            else App.stats.harvestSeeds = App.stats.harvestSeeds + amount end
+            elseif takenId == seedId then App.stats.harvestSeeds = App.stats.harvestSeeds + amount end
         end
         local function near(state, drop)
             return Navigation.pickupOverlap(state, drop)
@@ -2334,7 +2382,7 @@ local function runHarvest(token)
                 .. ". Last pickup: " .. tostring(lastRefusal[drop.uid])
                 .. ". Check pickup reach and access; copy diagnostics.")
         end
-        local function applyResults(results, fromRoute)
+        local function applyResults(results, fromRoute, deferred)
             local accepted = false
             for _, result in ipairs(results) do
                 if result.amount > 0 then
@@ -2358,64 +2406,62 @@ local function runHarvest(token)
                 end
                 approached[result.uid] = nil
             end
-            if accepted then
+            if accepted and not deferred then
                 refreshInventory(token)
                 deadline = os.clock() + App.config.options.actionTimeout
             end
             return accepted
         end
+        local function settleRoute(waitAll)
+            local results = {}
+            for index = #routeJobs, 1, -1 do
+                local job = routeJobs[index]
+                if waitAll or job.request.done then
+                    local amount = awaitRequest(job.request, job.deadline, token)
+                    if amount > 0 then attempts[job.uid], routeAccepted = 0, routeAccepted + 1 end
+                    if job.id ~= 112 then
+                        routeReserved[job.id] = (routeReserved[job.id] or 0) - job.want + amount
+                    end
+                    job.amount = amount
+                    table.insert(results, job)
+                    table.remove(routeJobs, index)
+                else assert(os.clock() < job.deadline, "Request timed out. Wait for it to finish before restarting.") end
+            end
+            if #results > 0 then applyResults(results, true, true) end
+            if #routeJobs == 0 and (waitAll or routeAccepted >= 8) then
+                if routeAccepted > 0 then refreshInventory(token) end
+                routeReserved, routeAccepted = {}, 0
+            end
+        end
         local function collectOnRoute(state)
+            settleRoute(false)
             if restrictRoute and not rowHasDrops(activeFarmRow) then return false end
             if not state.grounded then return end
             sweepRow, sweepX = math.floor(state.y - 0.01), state.x
             if capacityBlocked() then return false end
-            local focus, found = {}, false
+            if #routeJobs >= 8 then return end
+            local function eligible(drop)
+                return selected(drop) and onActiveRow(drop) and near(position(), drop)
+                    and not needsApproach[drop.uid] and not drop.pending and not drop.taking
+                    and os.clock() >= math.max(drop.readyAt or 0, retryAt[drop.uid] or 0)
+            end
+            local targets = {}
             for _, drop in pairs(r.world.dropList()) do
-                if selected(drop) and near(state, drop) and onActiveRow(drop) and not needsApproach[drop.uid]
-                    and math.abs(drop.x - state.x) <= 0.55 then
-                    focus[drop.uid], found = true, true
+                if selected(drop) and near(state, drop) and onActiveRow(drop) then
+                    retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
+                    checkAttempts(drop)
+                    if eligible(drop) then table.insert(targets, drop) end
                 end
             end
-            if not found then return end
-            -- Stop advancing until these stacks are gone, including late replies,
-            -- partial takes and additional batches at the same pickup position.
-            local hold = takeControls()
-            hold.direction, hold.jump = 0, false
-            local pickupDeadline = os.clock() + App.config.options.actionTimeout
-            while true do
-                worldCheck(box.world, token)
-                state = position()
-                sweepRow, sweepX = math.floor(state.y - 0.01), state.x
-                if capacityBlocked() then return false end
-                local targets, remaining = {}, false
-                for _, drop in pairs(r.world.dropList()) do
-                    if selected(drop) and near(state, drop) and onActiveRow(drop) and not needsApproach[drop.uid] then
-                        if math.abs(drop.x - state.x) <= 0.55 then focus[drop.uid] = true end
-                        if focus[drop.uid] then
-                            remaining = true
-                            retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
-                            checkAttempts(drop)
-                            if not drop.pending and not drop.taking
-                                and os.clock() >= math.max(drop.readyAt or 0, retryAt[drop.uid]) then
-                                table.insert(targets, drop)
-                            end
-                        end
-                    end
-                end
-                if not remaining then return end
-                assert(os.clock() < pickupDeadline,
-                    "Nearby harvested stacks did not finish collecting. Check pending drops and copy diagnostics.")
-                if #targets > 0 then
-                    local results = takeDropBatch(box, targets, attempts, retryAt, function(drop)
-                        return selected(drop) and onActiveRow(drop) and focus[drop.uid]
-                            and not drop.pending and not drop.taking and near(position(), drop)
-                    end, token, onTaken)
-                    if applyResults(results, true) then pickupDeadline = os.clock() + App.config.options.actionTimeout
-                    else pause(0.05, token) end
-                    -- A refusal leaves this UID for a precise approach after
-                    -- the row pass. Do not hold and exhaust retries here.
-                else pause(0.05, token) end
+            -- Keep steering while native pickup replies settle. Reserve backpack
+            -- room across all outstanding jobs and reconcile once per eight takes.
+            local jobs = takeDropBatch(box, targets, attempts, retryAt, eligible, token, onTaken,
+                {defer = true, limit = 8 - #routeJobs, reserved = routeReserved})
+            for _, job in ipairs(jobs) do
+                table.insert(routeJobs, job)
+                if job.id ~= 112 then routeReserved[job.id] = (routeReserved[job.id] or 0) + job.want end
             end
+            settleRoute(false)
         end
         local function returnToStorage()
             local state, point = position(), box
@@ -2467,6 +2513,7 @@ local function runHarvest(token)
                 .. " at " .. string.format("%.2f, %.2f", arrived.x, arrived.y) .. "; backpack confirmed."
         end
         local function stash()
+            settleRoute(true)
             if count(id) == 0 and count(seedId) == 0 then return end
             returnToStorage()
             setStatus("Storing harvested " .. r.items[id].name .. " in Farm storage...")
@@ -2498,7 +2545,7 @@ local function runHarvest(token)
                 end
             end
         end
-        if #farmRows >= 2 then
+        if #farmRows >= 1 then
             for index = 1, #farmRows do
                 -- Keep the physical row index for direction, but visit only live harvest work.
                 if rowHasDrops(index) then
@@ -2523,6 +2570,7 @@ local function runHarvest(token)
                         end
                         if not swept then
                             swept = moveTo(exit, row.y, box.world, token, collectOnRoute) ~= false
+                            settleRoute(true)
                             deadline = os.clock() + App.config.options.actionTimeout
                         end
                         if swept then
@@ -2545,6 +2593,7 @@ local function runHarvest(token)
                                 })
                                 assert(goal, tostring(message) .. " Drop uid " .. drop.uid .. " at " .. drop.x .. ", " .. drop.y)
                                 local finished = moveTo(goal.x, goal.y, box.world, token, collectOnRoute)
+                                settleRoute(true)
                                 if finished ~= false and near(position(), drop) then
                                     needsApproach[drop.uid], approached[drop.uid] = nil, true
                                 end
@@ -2567,6 +2616,7 @@ local function runHarvest(token)
             end
             activeFarmRow, restrictRoute = nil, false
         end
+        settleRoute(true)
         while true do
             worldCheck(box.world, token)
             local state = position()
@@ -2583,8 +2633,14 @@ local function runHarvest(token)
                 stash()
                 emptySince = emptySince or os.clock()
                 if os.clock() - emptySince >= math.max(0.3, App.config.options.collectDelay) then
+                    if App.stats.gems > gemsBefore and r.gemHud then
+                        local gems = bounded(r.world.call, App.config.options.actionTimeout, token, "GetGems")
+                        assert(type(gems) == "number" and gems >= 0, "Invalid gem balance from the server.")
+                        r.gemHud.setGems(gems)
+                    end
                     setStatus("Finished collecting harvest: " .. (App.stats.stashed - storedBefore)
-                        .. " blocks and " .. (App.stats.stashedSeeds - seedsBefore) .. " seeds stored in the farm Display Box.")
+                        .. " blocks and " .. (App.stats.stashedSeeds - seedsBefore) .. " seeds stored in the farm Display Box; "
+                        .. (App.stats.gems - gemsBefore) .. " gems collected.")
                     return
                 end
                 pause(0.05, token)
@@ -2650,6 +2706,7 @@ local function runHarvest(token)
                         end
                     end
                     local finished = moveTo(goal.x, goal.y, box.world, token, collectOnRoute)
+                    settleRoute(true)
                     if finished ~= false and near(position(), nextDrop) then
                         needsApproach[nextDrop.uid], approached[nextDrop.uid] = nil, true
                     end
@@ -2954,7 +3011,7 @@ local function savePlantResume(state)
         copy.rowY = state.rowY
     end
     for key, reason in pairs(state.skipped or {}) do copy.skipped[key] = reason end
-    writeJSON(PLANT_RESUME_FILE, {version = 1, active = true, userId = player.UserId, updatedAt = os.time(),
+    writeJSON(PLANT_RESUME_FILE, {version = 1, active = true, userId = ACCOUNT_ID, updatedAt = os.time(),
         config = Core.validate(App.config), profile = App.profile, state = copy})
     App.plantState = state
     if App.rotationState then
@@ -2968,7 +3025,7 @@ local function readPlantResume(record)
         record = decode(readfile(PLANT_RESUME_FILE))
     end
     if not record.active then return nil end
-    assert(record.version == 1 and record.userId == player.UserId, "The saved planting task belongs to another account or script version.")
+    assert(record.version == 1 and record.userId == ACCOUNT_ID, "The saved planting task belongs to another account or script version.")
     assert(type(record.updatedAt) == "number" and os.time() - record.updatedAt < 21600, "Saved planting is over six hours old. Start it again.")
     record.config, record.profile = Core.validate(record.config), Core.profileName(record.profile)
     local state = record.state
@@ -3135,6 +3192,15 @@ local function plantRow(row, reverse, state, token)
             end
         end
         if #points == 0 or count(id) == 0 then return end
+        -- rowY preserves zigzag progress, not the avatar's position after entry.
+        -- A refill/reload may return below the row or beyond its next empty tile.
+        local avatar, first = position(), points[1]
+        local ahead = (first.x + 0.5 - avatar.x) * (reverse and -1 or 1)
+        if not avatar.grounded or math.abs(avatar.y - (row.y + 1)) > 0.22 or ahead < -1.2 then
+            moveTo(first.x, row.y, name, token, function()
+                return Core.rowHasPlantingSpace(r.world, r.items, row, state.skipped)
+            end)
+        end
         local available = refreshInventory(token)[id] or 0
         local cursor, nextPlant, lastPlant = 1, 0, 0
         local function confirm()
@@ -3372,7 +3438,7 @@ saveRotationResume = function(state)
         return result
     end
     saveSession()
-    writeJSON(ROTATION_RESUME_FILE, {version = 1, active = true, userId = player.UserId, updatedAt = os.time(),
+    writeJSON(ROTATION_RESUME_FILE, {version = 1, active = true, userId = ACCOUNT_ID, updatedAt = os.time(),
         config = Core.validate(App.config), profile = App.profile, state = copy(state)})
     App.rotationState = state
     App.lastRotationSave = os.clock()
@@ -3381,11 +3447,11 @@ local function readRotationResume()
     if not exists(ROTATION_RESUME_FILE) then return nil end
     local record = decode(readfile(ROTATION_RESUME_FILE))
     if not record.active then return nil end
-    assert(record.version == 1 and record.userId == player.UserId, "The saved rotation belongs to another account or script version.")
+    assert(record.version == 1 and record.userId == ACCOUNT_ID, "The saved rotation belongs to another account or script version.")
     assert(type(record.updatedAt) == "number" and os.time() - record.updatedAt < 21600, "Saved rotation is over six hours old. Check inventory and start again.")
     record.config, record.profile = Core.validate(record.config), Core.profileName(record.profile)
     local state = record.state
-    local phases = {plant=true, wait=true, waitPNB=true, pnbStorePending=true, replant=true, harvest=true, transfer=true, seeds=true, seedDeliver=true,
+    local phases = {plant=true, wait=true, waitPNB=true, checkSeeds=true, drainPNB=true, pnbStorePending=true, replant=true, harvest=true, transfer=true, seeds=true, seedDeliver=true,
         seedPickupPending=true, seedDepositPending=true, pnb=true, finish=true}
     assert(type(state) == "table" and phases[state.phase], "Invalid saved rotation phase.")
     for _, key in ipairs({"worldIndex", "cycle", "work", "seedCargo"}) do
@@ -3459,6 +3525,11 @@ local function runRotation(token, saved)
         elseif state.seedWait then transition("waitPNB")
         else transition("finish") end
     end
+    local function afterPlant()
+        if state.seedWait then transition("drainPNB")
+        elseif count(seedId) == 0 then transition("checkSeeds")
+        else continueFarms() end
+    end
     local function yieldPNB()
         local _, deadline = nextFarm()
         return deadline and Workspace:GetServerTimeNow() >= deadline
@@ -3493,12 +3564,17 @@ local function runRotation(token, saved)
                 if state.phase == "plant" then
                     if not state.plant then state.completed, state.readyAt = {}, {} end
                     state.seedWait = not runPlant(token, state.plant and {state=state.plant} or nil)
-                    -- With insufficient stock, harvest the existing partial farms to replenish it.
                     state.plant = nil
                     clearPlantResume()
-                    local index, deadline = nextFarm()
+                    local index = nextFarm()
                     state.worldIndex = index or 1
-                    transition(deadline and deadline > Workspace:GetServerTimeNow() and "waitPNB" or "wait")
+                    afterPlant()
+                elseif state.phase == "checkSeeds" then
+                    travel(p.pnb.world)
+                    refreshInventory(token)
+                    if count(seedId) == 0 and storageCount(p.seedBox, seedId) == 0 then
+                        transition("drainPNB")
+                    else continueFarms() end
                 elseif state.phase == "wait" then
                     travel(name)
                     local r = worldCheck(name, token)
@@ -3518,13 +3594,24 @@ local function runRotation(token, saved)
                         state.completed[name], state.readyAt[name] = true, nil
                         continueFarms()
                     end
-                elseif state.phase == "waitPNB" then
+                elseif state.phase == "waitPNB" or state.phase == "drainPNB" then
                     travel(p.pnb.world)
                     takeControls()
+                    if state.phase == "waitPNB" then
+                        refreshInventory(token)
+                        if count(seedId) == 0 and storageCount(p.seedBox, seedId) == 0 then transition("drainPNB") end
+                    end
+                    local draining = state.phase == "drainPNB"
+                    if draining then setStatus("Seed supply exhausted: finishing all PNB blocks before planting or harvesting.") end
                     local brokenBefore = App.stats.broken
-                    local exhausted = runPNB(token, yieldPNB)
+                    local exhausted = runPNB(token, not draining and yieldPNB or nil)
                     state.work = state.work + App.stats.broken - brokenBefore
                     storePNBInventory()
+                    if draining then
+                        assert(exhausted, "PNB drain ended before the block supply was exhausted.")
+                        transition("waitPNB")
+                        setStatus("PNB block supply finished. Resuming farm planting and harvest scheduling.")
+                    end
                     local index, deadline = nextFarm()
                     if index and deadline <= Workspace:GetServerTimeNow() then
                         state.worldIndex = index
@@ -3588,7 +3675,7 @@ local function runRotation(token, saved)
                     state.plant = nil
                     clearPlantResume()
                     state.completed[name], state.readyAt[name] = true, nil
-                    continueFarms()
+                    afterPlant()
                 elseif state.phase == "finish" then
                     assert(state.work > 0, "Rotation found no harvest or stored crop in the farm list. Check seed stock, supported rows, and access.")
                     App.stats.cycles = App.stats.cycles + 1
@@ -3602,7 +3689,7 @@ local function runRotation(token, saved)
             if ok then failures = 0
             else
                 checkpoint(token)
-                if state.phase == "pnb" or state.phase == "waitPNB" then problem = classifyPNBFault(problem, token) end
+                if state.phase == "pnb" or state.phase == "waitPNB" or state.phase == "drainPNB" then problem = classifyPNBFault(problem, token) end
                 assert(state.phase ~= "seedPickupPending" and state.phase ~= "seedDepositPending" and state.phase ~= "pnbStorePending"
                     and (not state.transfer or state.transfer.phase ~= "pickupPending" and state.transfer.phase ~= "depositPending"
                         and state.transfer.phase ~= "seedReturnPending"),
@@ -3612,7 +3699,7 @@ local function runRotation(token, saved)
                 assert(failures <= 3, "Rotation recovery failed three times. Check connection and copy diagnostics.")
                 releaseControls()
                 setStatus("Rotation interrupted; returning to the saved phase...")
-                if state.phase == "pnb" or state.phase == "waitPNB" then
+                if state.phase == "pnb" or state.phase == "waitPNB" or state.phase == "drainPNB" then
                     local interruptions = 0
                     while true do
                         local recovered, issue = pcall(recoverPNB, problem, token)
@@ -4148,7 +4235,7 @@ local function importConfiguration(text, name)
     local path = PROFILE_DIR .. "/" .. profile .. ".json"
     local prior = {[path] = exists(path) and readfile(path) or false,
         [SESSION_FILE] = exists(SESSION_FILE) and readfile(SESSION_FILE) or false}
-    local session = {version = 1, userId = player.UserId, config = config, profile = profile}
+    local session = {version = 1, userId = ACCOUNT_ID, config = config, profile = profile}
     local signature = encode({config = config, profile = profile})
     local saved, problem = pcall(function()
         writeJSON(path, config)
@@ -4175,6 +4262,8 @@ local function importConfiguration(text, name)
     return profile
 end
 
+local migrationOK, migrationProblem = pcall(migrateLegacyStorage)
+App.storageMigrationError = not migrationOK and tostring(migrationProblem) or nil
 local sessionOK, sessionProblem = pcall(restoreSession, previousSession)
 App.sessionRestoreError = not sessionOK and tostring(sessionProblem) or nil
 previousSession = nil
@@ -4383,7 +4472,7 @@ App.runToggles.transfer = transferTab:Toggle({ Title = "Moving Drops", Value = f
 local selectedProfile, profileNameInput, profileDropdown = nil, nil, nil
 local settingsControls = {}
 ui.harvestStatus = harvestTab:Paragraph({ Title = "Status", Desc = App.status })
-harvestTab:Paragraph({ Title = "Harvest trees, blocks, and seeds", Desc = "Break ripe trees of the block selected on Place & Break, then collect matching blocks and seeds into the same Farm Display Box. Follow top-down zigzag rows and skip rows without work. Growing trees stay planted." })
+harvestTab:Paragraph({ Title = "Harvest trees and collect drops", Desc = "Break ripe trees of the selected block, then collect matching blocks, seeds and gems while walking top-down zigzag rows. Blocks and seeds share the Farm Display Box; gems update your balance. Skip empty rows and leave growing trees planted." })
 settingsControls.harvestMethod = harvestTab:Dropdown({ Title = "Harvest method", Values = {"Fist", "Dear John Tractor"},
     Value = App.config.harvesting.method == "tractor" and "Dear John Tractor" or "Fist",
     Callback = function(value)
@@ -4550,7 +4639,7 @@ local function listProfiles()
     profileDropdown:Refresh(names)
     return names
 end
-profileTab:Paragraph({ Title = "Named configurations", Desc = "Each profile saves the chosen block, saved locations, timing settings, and Discord webhook settings. Give each farm setup its own name. Files stay in Delta's ClarisGrowblox/profiles folder." })
+profileTab:Paragraph({ Title = "Named configurations", Desc = "Each profile saves the chosen block, saved locations, timing settings, and Discord webhook settings. Files are separate for Roblox account " .. ACCOUNT_ID .. " in " .. PROFILE_DIR .. "." })
 profileNameInput = profileTab:Input({ Title = "Profile name", Value = App.profile, Placeholder = "e.g. Sugar Cane - Farm 1", Callback = function() end })
 profileDropdown = profileTab:Dropdown({ Title = "Saved profiles", Values = {}, SearchBarEnabled = true,
     Callback = function(name) selectedProfile = name end })
@@ -4633,7 +4722,7 @@ do
         end) })
 end
 
-rotationTab:Paragraph({ Title = "Plant, harvest, break, repeat", Desc = "Use the full Planting farm list. Fill empty planting rows, then break PNB stock while trees grow. When a farm is ready, finish the current block and pickups, harvest, transport its blocks/seeds, and replant before returning to PNB. Full farms skip planting. Rotation saves progress and enters worlds directly; it does not need linked doors." })
+rotationTab:Paragraph({ Title = "Plant, harvest, break, repeat", Desc = "Use the full Planting farm list. Fill empty rows and break PNB stock while trees grow. Ready farms normally interrupt PNB for harvest, transfer and replant. If planting seed supply runs out, finish all remaining PNB blocks first, storing produced seeds, then resume farms. Full farms skip planting. Account-specific progress resumes across supported world changes." })
 ui.rotationFarms = rotationTab:Paragraph({ Title = "Farm storage saved per world", Desc = "Visit every listed farm, stand beside its Display Box, and save it here. Harvest Drops and Moving Drops save buttons also remember each world." })
 rotationTab:Button({ Title = "Save this farm's harvest box", Desc = "Stand beside a Display Box in a world from your Planting list.", Callback = uiAction(function() captureNearby("farmBox", "box") end) })
 rotationTab:Button({ Title = "Use PNB seeds for planting", Desc = "Use the saved left PNB Display Box for planting stock and select the matching seed.", Callback = uiAction(function()
@@ -4647,7 +4736,7 @@ rotationTab:Button({ Title = "Use PNB seeds for planting", Desc = "Use the saved
 end) })
 ui.rotationStatus = rotationTab:Paragraph({ Title = "Status", Desc = App.status })
 App.runToggles.rotation = rotationTab:Toggle({ Title = "Continuous full rotation", Value = false,
-    Desc = "Planting and ready harvests take priority; run PNB while farms grow. Choose your harvesting method on Harvest Drops.",
+    Desc = "Run PNB while farms grow. When planting seeds run out, finish all PNB blocks before more planting or harvest. Choose your harvesting method on Harvest Drops.",
     Callback = function(enabled) setRunningEnabled("rotation", enabled) end })
 local function resumeRotation()
     idle()
@@ -4669,7 +4758,7 @@ local function readResume()
     if not exists(RESUME_FILE) then return nil end
     local record = decode(readfile(RESUME_FILE))
     if not record.active then return nil end
-    assert(record.version == 1 and record.userId == player.UserId, "The saved transfer belongs to another account or script version.")
+    assert(record.version == 1 and record.userId == ACCOUNT_ID, "The saved transfer belongs to another account or script version.")
     assert(type(record.updatedAt) == "number" and os.time() - record.updatedAt < 21600,
         "Saved transfer is over six hours old. Check your backpack and clear it before restarting.")
     record.config = Core.validate(record.config)
@@ -4818,6 +4907,8 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
     local text = "Claris Growblox " .. VERSION .. "\n"
         .. "World: " .. (App.runtime and App.runtime.world.name or "unconnected")
         .. "\nProfile: " .. App.profile .. "\nStatus: " .. App.status
+        .. "\nRoblox account: " .. ACCOUNT_ID .. "\nAccount data: " .. ROOT
+        .. "\nAccount migration: " .. (App.storageMigrationError or "ready")
         .. "\nPending requests: " .. App.pending .. "\n" .. table.concat(App.logs, "\n")
         .. "\nConnection error: " .. (App.connectionError or "none")
         .. "\nLoader: " .. (env.ClarisGrowbloxLoaderDebug or "direct script")

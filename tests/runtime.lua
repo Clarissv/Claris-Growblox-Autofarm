@@ -14,9 +14,14 @@ local function rejects(fn, fragment)
     assert(not ok, "Expected rejection")
     if fragment then assert(tostring(message):find(fragment, 1, true), tostring(message)) end
 end
-local function fixture()
-    local env, files, encoded, queue = { ClarisGrowbloxTest = true }, {}, {}, {}
-    local ticks, serial = 0, 0
+local function onlyMigrationFiles(files)
+    for path in pairs(files) do if not path:match("/migration%.json$") then return false end end
+    return true
+end
+local function fixture(userId, storage)
+    storage = storage or {files = {}, encoded = {}, serial = 0}
+    local env, files, encoded, queue = { ClarisGrowbloxTest = true }, storage.files, storage.encoded, {}
+    local ticks = 0
     local context = { pickups = 0, displays = 0 }
     request, http_request, syn, http = nil, nil, nil, nil
     shared, getrenv, getrawmetatable, getgc = {}, nil, nil, nil
@@ -33,14 +38,14 @@ local function fixture()
     delfile = function(path) files[path] = nil end
     local http = {
         JSONEncode = function(_, value)
-            serial = serial + 1
-            local key = "mock-json-" .. serial
+            storage.serial = storage.serial + 1
+            local key = "mock-json-" .. storage.serial
             encoded[key] = value
             return key
         end,
         JSONDecode = function(_, text) return encoded[text] end,
     }
-    local localPlayer = { UserId = 1234, Name = "TestPlayer", DisplayName = "Test Player", GetAttribute = function() return nil end }
+    local localPlayer = { UserId = userId or 1234, Name = "TestPlayer", DisplayName = "Test Player", GetAttribute = function() return nil end }
     local services = {
         HttpService = http, Players = { LocalPlayer = localPlayer },
         ReplicatedStorage = { GetAttribute = function() return "session-registry" end },
@@ -75,7 +80,7 @@ local function fixture()
         return loadScript()
     end
     context.hooks, context.env, context.files = hooks, env, files
-    context.encoded = encoded
+    context.encoded, context.storage = encoded, storage
     local app = hooks.App
     app.config.blockId = 954
     local function point(world, x)
@@ -151,6 +156,13 @@ local function fixture()
     context.app, context.world, context.inventory = app, world, inventory
     context.player, context.services = localPlayer, services
     context.controls, context.avatar, context.drops, context.boxes = controls, avatar, drops, boxes
+    local bindings = {getgenv=getgenv, isfile=isfile, isfolder=isfolder, makefolder=makefolder,
+        readfile=readfile, writefile=writefile, delfile=delfile, game=game, task=task}
+    local clock = os.clock
+    context.activate = function()
+        for key, value in pairs(bindings) do _G[key] = value end
+        os.clock = clock
+    end
     return context
 end
 
@@ -634,14 +646,14 @@ test("Farm checkpoints refresh during a long run but never after Stop", function
     local f = fixture()
     f.app.job = "pnb"
     f.hooks.savePNBResume()
-    local first = f.files["ClarisGrowblox/pnb-resume.json"]
+    local first = f.files["ClarisGrowblox/accounts/1234/pnb-resume.json"]
     task.wait(121)
     f.hooks.refreshPNBCheckpoint()
-    assert(f.files["ClarisGrowblox/pnb-resume.json"] ~= first)
+    assert(f.files["ClarisGrowblox/accounts/1234/pnb-resume.json"] ~= first)
     f.app:stop()
     task.wait(121)
     f.hooks.refreshPNBCheckpoint()
-    assert(not f.files["ClarisGrowblox/pnb-resume.json"])
+    assert(not f.files["ClarisGrowblox/accounts/1234/pnb-resume.json"])
 end)
 
 test("Failed world entry stops after three attempts with the farm toggle Off", function()
@@ -2113,7 +2125,7 @@ test("Harvest collection stores held blocks and all selected drops while leaving
     f.harvest()
     assert(f.hooks.Core.itemCount(f.boxes[12], 954) == 320 and f.hooks.Core.itemCount(f.boxes[12], 955) == 10 and f.inventory:count(954) == 0)
     assert(f.app.stats.harvested == 120 and f.app.stats.stashed == 320)
-    assert(#f.drops == 2 and seed.n == 0 and gems.n == 20 and other.n == 5)
+    assert(#f.drops == 1 and seed.n == 0 and gems.n == 0 and other.n == 5 and f.app.stats.gems == 20)
     assert(f.app.stats.harvestSeeds == 10 and f.app.stats.stashedSeeds == 10)
     assert(f.app.status:find("Finished collecting harvest", 1, true))
 end)
@@ -2153,7 +2165,7 @@ test("Harvest collection walks to distant drops when the server requires proximi
         return want
     end
     f.harvest()
-    assert(rejected == 1 and visited["4:8"] and #f.drops == 0)
+    assert(rejected == 0 and visited["4:8"] and #f.drops == 0)
     assert(f.hooks.Core.storageCount(f.boxes[12], 954) == 20 and f.app.stats.stashed == 20)
     assert(math.abs(f.avatar.x - 10.5) < 0.16 and f.controls.dir() == 0)
 end)
@@ -2249,15 +2261,14 @@ test("Harvest clears successive row drops in one direction before continuing", f
     f.accept = function(drop,want)
         if math.abs(drop.x-f.avatar.x)>0.6 then return 0 end
         accepted[#accepted+1]=drop.uid
-        assert(f.controls.dir()==0,"The player must hold position during pickup settlement")
         return want
     end
     f.harvest()
-    assert(#accepted==3 and accepted[1]==1 and accepted[2]==2 and accepted[3]==3)
+    assert(#accepted==3 and accepted[1]==3 and accepted[2]==2 and accepted[3]==1)
     assert(#f.drops==0 and f.app.stats.stashed==30)
 end)
 
-test("Harvest does not pass a partially collected stack while its pickup replies are delayed", function()
+test("Harvest revisits partially collected stacks after walking pickup replies settle", function()
     local f = harvestFixture()
     local map = harvestFloor(f)
     attachPhysics(f,map)
@@ -2271,13 +2282,12 @@ test("Harvest does not pass a partially collected stack while its pickup replies
     local physics=f.onWait
     f.onWait=function(dt)
         physics(dt)
-        assert(f.avatar.x>=3.5 or stack.n==0,"The player passed a stack before all pickup replies removed it")
     end
     f.harvest()
     assert(#f.drops==0 and f.app.stats.stashed==8)
 end)
 
-test("Harvest waits for a not-yet-ready nearby stack before advancing along the row", function()
+test("Harvest revisits a not-yet-ready stack after its readiness delay", function()
     local f = harvestFixture()
     local map = harvestFloor(f)
     attachPhysics(f,map)
@@ -2291,13 +2301,12 @@ test("Harvest waits for a not-yet-ready nearby stack before advancing along the 
             stack.readyAt,stack.pending,delayed=os.clock()+1,true,true
         end
         if delayed and os.clock()>=stack.readyAt then stack.pending=false end
-        assert(f.avatar.x>=3.5 or stack.n==0,"The player ran past a stack whose readiness delay had not finished")
     end
     f.harvest()
     assert(delayed and #f.drops==0 and f.app.stats.stashed==12)
 end)
 
-test("Harvest clears more than eight nearby UIDs before leaving the pickup position", function()
+test("Harvest finishes more than eight nearby UIDs across bounded walking batches", function()
     local f = harvestFixture()
     local map = harvestFloor(f)
     attachPhysics(f,map)
@@ -2305,17 +2314,21 @@ test("Harvest clears more than eight nearby UIDs before leaving the pickup posit
     f.addDrop(13,954,1,2.5,8.5)
     f.accept=function(drop,want)
         if math.abs(drop.x-f.avatar.x)>0.8 then return 0 end
-        task.wait(0.3)
         return want
     end
+    local delayed = {}
+    f.spawn = function(fn) delayed[#delayed + 1] = {fn=fn, at=os.clock()+0.3} end
     local physics=f.onWait
     f.onWait=function(dt)
         physics(dt)
-        if f.avatar.x<3.5 then
-            for _,drop in ipairs(f.drops) do
-                assert(drop.x~=4.5,"The player left UIDs behind after filling its eight-request batch")
+        local ready = {}
+        for index=#delayed,1,-1 do
+            if delayed[index].at <= os.clock() then
+                ready[#ready+1]=delayed[index].fn
+                table.remove(delayed,index)
             end
         end
+        for _, complete in ipairs(ready) do complete() end
     end
     f.harvest()
     assert(#f.drops==0 and f.app.stats.stashed==13)
@@ -2334,7 +2347,7 @@ test("Stopping while a nearby stack is pending keeps it in the world without mov
         physics(dt)
         if math.abs(f.avatar.x-stack.x)<=0.6 then
             stack.pending,waiting=true,true
-            if f.controls.dir()==0 then f.app:stop() end
+            f.app:stop()
         end
     end
     rejects(f.harvest,"Stopped")
@@ -2633,6 +2646,80 @@ local function treeHarvestFixture(method)
     return f
 end
 
+test("Harvest collects blocks, seeds and gems during zigzag movement with batched inventory reads", function()
+    local f = zigzagHarvestFixture()
+    for row=1,3 do
+        for x=2,13 do
+            for index,id in ipairs({954,955,112}) do f.addDrop(row*1000+x*3+index,id,1,x+0.5,row*2+0.5) end
+        end
+    end
+    local accept, moving, reads, peak = f.accept, 0, 0, 0
+    f.accept = function(drop,want)
+        if math.abs(f.avatar.vx) > 0.8 and f.controls.dir() ~= 0 then moving=moving+1 end
+        return accept(drop,want)
+    end
+    local server = f.server
+    f.server = function(name,...)
+        if name == "GetInventory" then reads=reads+1 end
+        return server(name,...)
+    end
+    f.spawn = function(fn) peak=math.max(peak,f.app.pending); task.defer(fn) end
+    f.harvest()
+    assert(moving >= 90, "Most pickups must happen while walking: " .. moving .. "/108")
+    assert(peak <= 8 and reads < 30, "Moving collection must bound requests and avoid a backpack RPC per drop")
+    assert(#f.drops == 0 and f.app.pending == 0 and f.app.stats.gems == 36 and f.serverGems == 136)
+    assert(f.app.stats.harvested == 36 and f.app.stats.harvestSeeds == 36)
+    assert(f.hooks.Core.itemCount(f.boxes[12],954) == 36 and f.hooks.Core.itemCount(f.boxes[12],955) == 36)
+    assert(f.inventory:count(112) == 0 and f.hooks.Core.itemCount(f.boxes[12],112) == 0)
+end)
+
+test("A gem-only harvest walks occupied rows without storing gems or visiting empty rows", function()
+    local f = zigzagHarvestFixture()
+    f.addDrop(1,112,7,2.5,4.5)
+    f.addDrop(2,112,11,13.5,4.5)
+    local balance
+    f.app.runtime.gemHud = {setGems=function(n) balance=n end}
+    f.harvest()
+    assert(#f.drops == 0 and f.app.stats.gems == 18 and balance == 118)
+    assert(#f.deposits == 0 and f.respawns == 0 and not f.visited["1:2"])
+    assert(f.app.stats.harvestSeeds == 0 and f.app.stats.harvested == 0)
+end)
+
+test("Walking pickup reservations prevent overflow with delayed replies and mixed stacked drops", function()
+    local f = zigzagHarvestFixture()
+    for x=2,13 do
+        f.addDrop(x*10,954,30,x+0.5,2.5)
+        f.addDrop(x*10+1,955,30,x+0.5,2.5)
+        f.addDrop(x*10+2,112,3,x+0.5,2.5)
+    end
+    local delayed, physics, peak = {}, f.onWait, 0
+    f.spawn = function(fn)
+        peak=math.max(peak,f.app.pending)
+        delayed[#delayed+1]={fn=fn,at=os.clock()+0.07}
+    end
+    f.onWait = function(dt)
+        physics(dt)
+        local ready={}
+        for index=#delayed,1,-1 do
+            if delayed[index].at <= os.clock() then
+                ready[#ready+1]=delayed[index].fn; table.remove(delayed,index)
+            end
+        end
+        for _,complete in ipairs(ready) do complete() end
+        assert((f.serverItems[954] or 0) <= 200 and (f.serverItems[955] or 0) <= 200)
+    end
+    f.accept = function(drop,want)
+        if not f.hooks.Navigation.pickupOverlap(f.avatar,drop) then return 0 end
+        if drop.id ~= 112 then assert((f.serverItems[drop.id] or 0)+want <= 200) end
+        return want
+    end
+    f.harvest()
+    assert(peak <= 8 and #delayed == 0 and #f.drops == 0 and f.app.pending == 0)
+    assert(f.app.stats.harvested == 360 and f.app.stats.harvestSeeds == 360 and f.app.stats.gems == 36)
+    assert(f.hooks.Core.itemCount(f.boxes[12],954) == 360 and f.hooks.Core.itemCount(f.boxes[12],955) == 360)
+    assert(f.serverItems[954] == 0 and f.serverItems[955] == 0)
+end)
+
 test("Fist harvests ripe trees in zigzag order before collecting their drops", function()
     local f = treeHarvestFixture("fist")
     for _, y in ipairs({2, 4, 6}) do for _, x in ipairs({2, 7, 13}) do f.addTree(x, y) end end
@@ -2809,7 +2896,7 @@ test("Harvest with no selected loose or held blocks completes without walking or
         f.avatar.x, f.avatar.y = 3.5, 6.999
         if otherDrops then
             f.addDrop(1, 18, 10, 2.5, 2.5)
-            f.addDrop(2, 112, 10, 13.5, 4.5)
+            f.addDrop(2, 1, 10, 13.5, 4.5)
             local display = f.addDrop(3, 954, 10, 7.5, 2.5)
             display.display = true
         end
@@ -2962,7 +3049,7 @@ end)
 
 test("A harvested drop refused at the standing position stops after three spaced attempts", function()
     local f = harvestFixture()
-    harvestFloor(f)
+    attachPhysics(f, harvestFloor(f))
     local drop = f.addDrop(5, 954, 20, 10.5, 8.5)
     f.accept = function() return 0 end
     rejects(f.harvest, "refused harvested drop uid 5")
@@ -3055,7 +3142,7 @@ test("Harvest completion switches to Moving Drops and transports the stored harv
     assert(f.app.stats.harvested == 23 and f.app.stats.stashed == 23 and f.app.stats.moved == 23)
     assert(not f.app.runToggles.harvest.Value and not f.app.runToggles.transfer.Value)
     assert(f.app.runToggles.transfer.history[1] == true and not f.hooks.readPNBResume())
-    local record = f.files["ClarisGrowblox/resume.json"]
+    local record = f.files["ClarisGrowblox/accounts/1234/resume.json"]
     assert(f.app.resume == nil and (not record or not f.services.HttpService:JSONDecode(record).active))
 end)
 
@@ -3099,14 +3186,166 @@ test("Reloading an existing idle app preserves its newest configuration", functi
     assert(next.App.profile == "Newest Setup" and next.App.config.options.collectDelay == 0.8 and not f.app.alive)
 end)
 
+test("Two accounts sharing executor files keep concurrent session staging and backups separate", function()
+    local storage = {files={}, encoded={}, serial=0}
+    local first, second = fixture(1234, storage), fixture(5678, storage)
+    first.app.config.options.placeDelay, second.app.config.options.placeDelay = 0.3, 0.7
+    first.activate()
+    local rawWrite, interleave = writefile
+    interleave = function(path, value)
+        if path == first.app.dataFolder .. "/session.json.pending" then
+            second.activate()
+            second.hooks.saveSession()
+            first.activate()
+            writefile = interleave
+        end
+        rawWrite(path, value)
+    end
+    writefile = interleave
+    first.hooks.saveSession()
+    first.activate()
+    first.app.config.options.placeDelay = 0.4
+    first.hooks.saveSession()
+    second.activate()
+    second.app.config.options.placeDelay = 0.8
+    second.hooks.saveSession()
+    local http = second.services.HttpService
+    assert(http:JSONDecode(storage.files[first.app.dataFolder .. "/session.json"]).config.options.placeDelay == 0.4)
+    assert(http:JSONDecode(storage.files[second.app.dataFolder .. "/session.json"]).config.options.placeDelay == 0.8)
+    assert(http:JSONDecode(storage.files[first.app.dataFolder .. "/session.json.bak"]).config.options.placeDelay == 0.3)
+    assert(http:JSONDecode(storage.files[second.app.dataFolder .. "/session.json.bak"]).config.options.placeDelay == 0.7)
+    assert(storage.files[first.app.dataFolder .. "/session.json.pending"] == nil)
+    assert(storage.files[second.app.dataFolder .. "/session.json.pending"] == nil)
+    first.activate()
+    assert(first.reload().App.config.options.placeDelay == 0.4)
+    second.activate()
+    assert(second.reload().App.config.options.placeDelay == 0.8)
+end)
+
+test("Same profile names, exports, checkpoints and clearing stay separate on a shared device", function()
+    local storage = {files={}, encoded={}, serial=0}
+    local first, second = fixture(1234, storage), fixture(5678, storage)
+    for index, f in ipairs({first,second}) do
+        f.activate()
+        f.app.job = nil
+        f.app.config.planting = {seedId=955,storageWorld="BREAK",worlds={"FARM"}}
+        f.app.config.points.plantBox = f.app.config.points.seedBox
+        f.app.config.points.pnb.x = index == 1 and 10 or 15
+        f.app.config.rotation.farms.FARM = f.app.config.points.farmBox
+        local text, record = f.hooks.exportConfiguration()
+        f.hooks.importConfiguration(text, "Shared Name")
+        f.hooks.saveConfigExport(record)
+        f.hooks.savePNBResume()
+        f.hooks.savePlantResume({phase="farm",worldIndex=1,skipped={}})
+        f.hooks.saveRotationResume({phase=index == 1 and "drainPNB" or "wait",worldIndex=1,cycle=index,work=20,seedCargo=0})
+        f.files[f.app.dataFolder .. "/resume.json"] = "private transfer " .. index
+    end
+    first.activate()
+    assert(first.hooks.readRotationResume().state.phase == "drainPNB")
+    assert(first.hooks.readPNBResume().config.points.pnb.x == 10)
+    first.hooks.clearRotationResume()
+    local ownExport = first.services.HttpService:JSONDecode(first.files[first.app.dataFolder .. "/exports/Default.json"])
+    assert(ownExport.config.points.pnb.x == 10)
+    second.activate()
+    assert(second.hooks.readRotationResume().state.phase == "wait")
+    assert(second.hooks.readPlantResume().state.worldIndex == 1)
+    assert(second.hooks.readPNBResume().config.points.pnb.x == 15)
+    local profile = second.services.HttpService:JSONDecode(second.files[second.app.dataFolder .. "/profiles/Shared Name.json"])
+    assert(profile.points.pnb.x == 15 and second.files[second.app.dataFolder .. "/resume.json"] == "private transfer 2")
+    first.activate()
+    local text = first.hooks.exportConfiguration()
+    first.hooks.importConfiguration(text, "New Setup")
+    second.activate()
+    assert(second.hooks.readRotationResume() and second.hooks.readPNBResume() and second.hooks.readPlantResume())
+    assert(second.files[second.app.dataFolder .. "/resume.json"] == "private transfer 2")
+end)
+
+test("Legacy migration copies only owned records and recovers a profile from its owned session snapshot", function()
+    local f = fixture()
+    f.app.profile = "Same Name"
+    f.hooks.saveSession()
+    f.hooks.savePNBResume()
+    local session, checkpoint = f.files[f.app.dataFolder .. "/session.json"], f.files[f.app.dataFolder .. "/pnb-resume.json"]
+    f.files["ClarisGrowblox/session.json"], f.files["ClarisGrowblox/pnb-resume.json"] = session, checkpoint
+    f.files["ClarisGrowblox/resume.json"] = f.services.HttpService:JSONEncode({version=1,userId=5678,active=false})
+    f.files["ClarisGrowblox/plant-resume.json"] = "broken legacy JSON"
+    local otherConfig = f.hooks.Core.defaults(); otherConfig.blockId=628
+    f.files["ClarisGrowblox/profiles/Same Name.json"] = f.services.HttpService:JSONEncode(otherConfig)
+    f.files[f.app.dataFolder .. "/session.json"], f.files[f.app.dataFolder .. "/pnb-resume.json"] = nil, nil
+    f.files[f.app.dataFolder .. "/migration.json"] = nil
+    local next = f.reload()
+    assert(next.App.profile == "Same Name" and next.App.config.blockId == 954 and not next.App.storageMigrationError)
+    assert(next.readPNBResume().userId == 1234 and next.App.migratedFiles == 2)
+    assert(f.services.HttpService:JSONDecode(f.files[next.App.dataFolder .. "/profiles/Same Name.json"]).blockId == 954)
+    assert(f.files[next.App.dataFolder .. "/resume.json"] == nil and f.files[next.App.dataFolder .. "/plant-resume.json"] == nil)
+    assert(f.files["ClarisGrowblox/session.json"] == session and f.files["ClarisGrowblox/pnb-resume.json"] == checkpoint)
+    next.App:stop()
+    assert(f.reload().readPNBResume() == nil, "Cleared migrated work must never be resurrected from the legacy file")
+    local other = fixture(5678, f.storage)
+    assert(other.app.config.blockId == 954 and other.app.sessionRestoreError == nil)
+    -- fixture sets block selection for test setup, but no foreign session/profile was loaded.
+    assert(other.app.profile == "Default" and other.files[other.app.dataFolder .. "/session.json"] == nil)
+    assert(other.files[other.app.dataFolder .. "/pnb-resume.json"] == nil)
+    assert(other.files[other.app.dataFolder .. "/resume.json"] and other.app.migratedFiles == 1)
+end)
+
+test("An existing account setup wins over legacy files and account swaps cannot inherit the old app", function()
+    local f = fixture()
+    f.app.profile, f.app.config.options.collectDelay = "Account One", 0.4
+    f.hooks.saveSession()
+    local legacy = f.hooks.Core.defaults(); legacy.options.collectDelay=0.9
+    f.files["ClarisGrowblox/session.json"] = f.services.HttpService:JSONEncode({version=1,userId=1234,config=legacy,profile="Legacy"})
+    f.files[f.app.dataFolder .. "/migration.json"] = nil
+    assert(f.reload().App.config.options.collectDelay == 0.4)
+    f.player.UserId = 5678
+    local next = f.reload(true)
+    assert(next.App.userId == 5678 and next.App.profile == "Default" and next.App.config.blockId == 0)
+    assert(not next.App.sessionRestoreError)
+    f.player.UserId = 1234
+    assert(f.reload(true).App.profile == "Account One")
+end)
+
+test("An interrupted legacy migration retries without overwriting copied settings or losing the active profile", function()
+    local f = fixture()
+    f.app.profile = "Migration Retry"
+    f.hooks.saveSession()
+    local session = f.files[f.app.dataFolder .. "/session.json"]
+    f.files["ClarisGrowblox/session.json"] = session
+    f.files[f.app.dataFolder .. "/session.json"], f.files[f.app.dataFolder .. "/migration.json"] = nil, nil
+    local rawWrite = writefile
+    writefile = function(path,value)
+        if path:find("/profiles/",1,true) then error("disk full during profile migration") end
+        rawWrite(path,value)
+    end
+    local next = f.reload()
+    assert(next.App.storageMigrationError:find("disk full",1,true))
+    assert(next.App.profile == "Migration Retry" and next.App.config.blockId == 954)
+    assert(f.files[next.App.dataFolder .. "/migration.json"] == nil)
+    writefile = rawWrite
+    next = f.reload()
+    assert(not next.App.storageMigrationError and next.App.profile == "Migration Retry")
+    assert(f.files[next.App.dataFolder .. "/profiles/Migration Retry.json"])
+    assert(f.files[next.App.dataFolder .. "/migration.json"] and f.files["ClarisGrowblox/session.json"] == session)
+end)
+
+test("A changed account cannot write configuration into the previous account folder", function()
+    local f = fixture()
+    f.hooks.saveSession()
+    local saved = f.files[f.app.dataFolder .. "/session.json"]
+    f.player.UserId = 5678
+    rejects(f.hooks.saveSession, "account changed")
+    rejects(function() f.hooks.checkpoint(1) end, "account changed")
+    assert(f.files[f.app.dataFolder .. "/session.json"] == saved)
+end)
+
 test("A session from another account or a damaged profile cannot replace defaults", function()
     local f = fixture()
     f.hooks.saveSession()
     f.player.UserId = 888
     local next = f.reload()
-    assert(next.App.config.blockId == 0 and next.App.sessionRestoreError:find("another account", 1, true))
+    assert(next.App.config.blockId == 0 and next.App.sessionRestoreError == nil and next.App.userId == 888)
     f.player.UserId = 1234
-    local record = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/session.json"])
+    local record = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/accounts/1234/session.json"])
     record.config.options.placeDelay = -1
     next = f.reload()
     assert(next.App.config.blockId == 0 and next.App.sessionRestoreError:find("placeDelay", 1, true))
@@ -3207,6 +3446,26 @@ local function zigzagPlantingFixture(seeds, worlds)
     f.controls.dir, f.controls.jumping = function() return 0 end, function() return false end
     f.onEnter = function(name)
         if name == "FARM1" then f.avatar.x, f.avatar.y = 3.5, 5.999 end
+        return true
+    end
+    return f
+end
+
+local function wideZigzagPlantingFixture(seeds)
+    local f = zigzagPlantingFixture(seeds)
+    f.world.w = 34
+    for _, grid in pairs(f.grids) do
+        for y = 0, 7 do for x = 7, 33 do grid[y][x] = y == 6 and 2 or 0 end end
+    end
+    for y = 0, 7 do
+        for x = 0, 33 do
+            f.grids.FARM1[y][x] = (y == 2 or y == 4 or y == 6) and x >= 1 and x <= 32
+                and ((x == 1 or x == 32) and 102 or 2) or 0
+        end
+    end
+    f.avatar.x, f.avatar.y = 17.5, 5.999
+    f.onEnter = function(name)
+        if name == "FARM1" then f.avatar.x, f.avatar.y = 17.5, 5.999 end
         return true
     end
     return f
@@ -3368,6 +3627,55 @@ test("Planting follows both platform turns and retains zigzag order after a comp
     end
 end)
 
+test("A seed refill resumes either direction of an unfinished upper row with moving batches", function()
+    for _, initial in ipairs({16, 40}) do
+        local f = wideZigzagPlantingFixture(initial)
+        local resumedRow, moving, placements = initial == 16 and 1 or 3, 0, 0
+        f.onPlant = function(_, x, y)
+            if f.withdrawals > 0 and y == resumedRow then
+                local pending = f.hooks.readPlantResume().state.pending
+                assert(pending.tiles, "Refill returned to per-tile planting on the unfinished row")
+                placements = placements + 1
+                if math.abs(f.avatar.vx) > 0.8 then moving = moving + 1 end
+            end
+        end
+        f.hooks.start("plant")
+        assert(not f.app.lastError, f.app.lastError)
+        assert(#f.plantCalls == 96 and f.withdrawals == 1 and f.app.stats.planted == 96)
+        assert(placements == (initial == 16 and 16 or 24) and moving >= math.floor(placements * 0.75),
+            "The resumed row should continue planting during movement: initial " .. initial .. ", moving " .. moving .. "/" .. placements)
+        for index, point in ipairs(f.plantCalls) do
+            local row, column = math.floor((index - 1) / 32) + 1, (index - 1) % 32 + 1
+            assert(point.y == row * 2 - 1 and point.x == (row % 2 == 1 and column or 33 - column),
+                "Refill must retain the current row direction and never replay occupied tiles")
+        end
+    end
+end)
+
+test("A fresh planting instance reconciles a pending seed then streams its saved upper row", function()
+    local f = wideZigzagPlantingFixture(120)
+    for x = 1, 16 do f.grids.FARM1[1][x] = 955 end
+    f.serverSeeds = 104
+    f.inventory:remove(955, 16)
+    f.hooks.savePlantResume({phase = "farm", worldIndex = 1, skipped = {},
+        rows = f.hooks.Core.farmRows(f.world, f.app.runtime.items), rowY = 1,
+        pending = {world = "FARM1", x = 16, y = 1, before = 105, tiles = {{x = 16, y = 1}}}})
+    local runtime, next = f.app.runtime, f.reload()
+    f.hooks, f.app = next, next.App
+    f.app.runtime = runtime
+    local moving = 0
+    f.onPlant = function(_, x, y)
+        if y == 1 then
+            assert(x > 16 and next.readPlantResume().state.pending.tiles)
+            if math.abs(f.avatar.vx) > 0.8 then moving = moving + 1 end
+        end
+    end
+    next.start("plant", next.readPlantResume())
+    assert(not f.app.lastError, f.app.lastError)
+    assert(#f.plantCalls == 80 and f.plantCalls[1].x == 17 and f.plantCalls[1].y == 1)
+    assert(moving >= 12 and f.app.stats.planted == 81 and f.serverSeeds == 24 and f.withdrawals == 0)
+end)
+
 test("A planting picker interruption after the top row preserves the next row direction", function()
     local f = zigzagPlantingFixture(20)
     f.onPlant = function()
@@ -3441,7 +3749,7 @@ test("Saved planting rows survive reload and reject changed order or an unrelate
     saved.state.rowY, saved.state.rows = nil, {[2] = saved.state.rows[2]}
     next.savePlantResume(saved.state)
     -- The public writer canonicalizes arrays; damaged persisted arrays must still reject.
-    local record = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/plant-resume.json"])
+    local record = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/accounts/1234/plant-resume.json"])
     record.state.rows = {[2] = {y = 3, left = 1, right = 5}}
     rejects(next.readPlantResume, "farm row list")
 end)
@@ -3561,7 +3869,7 @@ test("Planting checkpoints validate account, expiry, index, and pending placemen
     f.hooks.savePlantResume(saved.state)
     rejects(function() f.hooks.readPlantResume() end, "pending seed world")
     f.hooks.savePlantResume({worldIndex = 1, phase = "farm", skipped = {}})
-    local record = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/plant-resume.json"])
+    local record = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/accounts/1234/plant-resume.json"])
     record.userId = 99
     rejects(function() f.hooks.readPlantResume() end, "another account")
     record.userId, record.updatedAt = 1234, os.time() - 21601
@@ -3771,18 +4079,18 @@ test("The FPS toggle applies during an active task and saves its choice without 
     local checkpoint = {version = 1, active = true, userId = f.player.UserId, profile = app.profile,
         config = f.hooks.Core.validate(app.config), updatedAt = os.time() - 60,
         state = {phase = "seedDepositPending", seedCargo = 10, cycle = 2, worldIndex = 1}}
-    f.files["ClarisGrowblox/rotation-resume.json"] = f.services.HttpService:JSONEncode(checkpoint)
+    f.files["ClarisGrowblox/accounts/1234/rotation-resume.json"] = f.services.HttpService:JSONEncode(checkpoint)
     local token = app.token
     controls["FPS booster: hide floating drops"]:Set(true)
     assert(app.config.options.fpsBooster and drop.frame.Parent == nil and app.fpsHidden == 1)
-    local session = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/session.json"])
+    local session = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/accounts/1234/session.json"])
     assert(session.config.options.fpsBooster and app.job == "rotation" and app.token == token and app.pending == 1)
-    local restored = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/rotation-resume.json"])
+    local restored = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/accounts/1234/rotation-resume.json"])
     assert(restored.config.options.fpsBooster and restored.updatedAt == checkpoint.updatedAt)
     assert(restored.state.phase == "seedDepositPending" and restored.state.seedCargo == 10 and restored.state.cycle == 2)
     controls["FPS booster: hide floating drops"]:Set(false)
     assert(not app.config.options.fpsBooster and drop.frame.Parent == parent and app.job == "rotation" and app.pending == 1)
-    assert(not f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/rotation-resume.json"]).config.options.fpsBooster)
+    assert(not f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/accounts/1234/rotation-resume.json"]).config.options.fpsBooster)
 end)
 
 test("Use PNB seeds updates the real UI after entering farms with Select-only WindUI dropdowns", function()
@@ -3810,10 +4118,10 @@ test("Actual UI imports, loads, and resets profiles with the supported harvest d
     controls["Import config"].Props.Callback()
     workers[3]()
     assert(app.profile == "Portable UI" and controls["Harvest method"].Value == "Dear John Tractor" and not app.syncingUI)
-    assert(f.files["ClarisGrowblox/profiles/Portable UI.json"] and app.job == nil)
+    assert(f.files["ClarisGrowblox/accounts/1234/profiles/Portable UI.json"] and app.job == nil)
     -- The fixture codec stores tables by reference; snapshot the saved JSON as
     -- real serialization does before changing the live configuration.
-    f.encoded[f.files["ClarisGrowblox/profiles/Portable UI.json"]] = f.hooks.Core.validate(app.config)
+    f.encoded[f.files["ClarisGrowblox/accounts/1234/profiles/Portable UI.json"]] = f.hooks.Core.validate(app.config)
     controls["Harvest method"].Props.Callback("Fist")
     assert(app.config.harvesting.method == "fist")
     controls["Saved profiles"].Props.Callback("Portable UI")
@@ -4269,14 +4577,89 @@ test("Empty PNB storage waits in the breaking world without repeated farm travel
     assert(#f.entries == 2 and f.world.name == "BREAK" and f.withdrawals == 0)
 end)
 
-test("PNB seed production interrupts breaking to resume unfinished planting", function()
+test("Seed exhaustion drains every stored PNB block before resuming unfinished planting", function()
     local f=rotationFixture()
     f.worldBoxes.BREAK[8],f.worldBoxes.BREAK[12]={},{{954,10}}
     f.afterWait=function() if #f.plants == 3 then f.app:stop() end end
     f.hooks.start("rotation")
     assert(not f.app.lastError,f.app.lastError)
-    assert(#f.plants == 3 and f.pnbBlocks == 3 and #f.harvests == 0)
-    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12],954) > 0)
+    assert(#f.plants == 3 and f.pnbBlocks == 10 and #f.harvests == 0)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12],954) == 0)
+end)
+
+test("Empty seed stock defers already-ripe farms until all PNB blocks and pickups finish", function()
+    local f = rotationFixture()
+    fillGrowingFarms(f, {FARM=0, FARM2=0})
+    f.worldBoxes.BREAK[8], f.worldBoxes.BREAK[12] = {}, {{954,4}}
+    local hit = f.app.runtime.handlers.hit
+    f.app.runtime.handlers.hit = function(x,y)
+        if f.world.name ~= "BREAK" then
+            assert(f.pnbBlocks == 4 and f.serverItems[954] == 0 and #f.worldDrops.BREAK == 0,
+                "Ripe harvest must wait for the entire PNB drain and pickups")
+            assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12],954) == 0)
+            assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) == 4)
+        end
+        hit(x,y)
+    end
+    f.afterWait = function() if #f.harvests == 5 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(f.pnbBlocks == 4 and #f.harvests == 5 and #f.plants == 0)
+end)
+
+test("Using the final seeds to fill every farm still drains PNB before ripe harvest", function()
+    local f = rotationFixture()
+    f.worldBoxes.BREAK[12] = {{954,4}}
+    f.app.runtime.items[955].grow = 0.01
+    local hit = f.app.runtime.handlers.hit
+    f.app.runtime.handlers.hit = function(x,y)
+        if f.world.name ~= "BREAK" then assert(f.pnbBlocks == 4 and #f.plants == 10) end
+        hit(x,y)
+    end
+    f.afterWait = function() if #f.harvests == 5 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(f.pnbBlocks == 4 and #f.plants == 10 and #f.harvests == 5)
+end)
+
+test("A saved PNB drain stays active after reload even when breaking has produced seeds", function()
+    local f = rotationFixture()
+    fillGrowingFarms(f, {FARM=0, FARM2=0})
+    f.worldBoxes.BREAK[8], f.worldBoxes.BREAK[12] = {{955,3}}, {{954,4}}
+    f.hooks.saveRotationResume({phase="drainPNB", worldIndex=1, cycle=1, work=3, seedCargo=0,
+        readyAt={FARM=0,FARM2=0}, completed={}, seedWait=true})
+    local runtime, next = f.app.runtime, f.reload()
+    f.hooks, f.app = next, next.App
+    f.app.runtime = runtime
+    local saved = next.readRotationResume()
+    f.app.config, f.app.profile = saved.config, saved.profile
+    local hit = runtime.handlers.hit
+    runtime.handlers.hit = function(x,y)
+        if f.world.name ~= "BREAK" then assert(f.pnbBlocks == 4) end
+        hit(x,y)
+    end
+    f.afterWait = function() if #f.harvests == 5 then f.app:stop() end end
+    next.start("rotation", saved)
+    assert(not f.app.lastError, f.app.lastError)
+    assert(f.pnbBlocks == 4 and #f.harvests == 5 and #f.plants == 0)
+end)
+
+test("Stop interrupts a depleted-seed PNB drain before harvest or planting", function()
+    local f = rotationFixture()
+    fillGrowingFarms(f, {FARM=0,FARM2=0})
+    f.worldBoxes.BREAK[8], f.worldBoxes.BREAK[12] = {}, {{954,10}}
+    f.afterWait = function() if f.pnbBlocks == 2 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError and f.pnbBlocks == 2 and #f.harvests == 0 and #f.plants == 0)
+    assert(f.hooks.readRotationResume() == nil)
+end)
+
+test("Invalid saved seed-check and PNB drain phases cannot bypass checkpoint validation", function()
+    local f = rotationFixture()
+    f.hooks.saveRotationResume({phase="drainPNB",worldIndex=1,cycle=1,work=0,seedCargo=201})
+    rejects(f.hooks.readRotationResume, "seed cargo")
+    f.hooks.saveRotationResume({phase="checkSeeds",worldIndex=1,cycle=1,work=0,seedCargo=0})
+    assert(f.hooks.readRotationResume().state.phase == "checkSeeds")
 end)
 
 test("World-change execution queues the loader and restores rotation config and PNB schedule after a reset", function()
@@ -4300,7 +4683,7 @@ test("World-change execution queues the loader and restores rotation config and 
     f.hooks,f.app=next,next.App
     f.app.runtime=runtime
     local saved=next.readRotationResume()
-    assert(saved.state.phase == "waitPNB" and saved.state.readyAt.FARM > f.services.Workspace:GetServerTimeNow())
+    assert(saved.state.phase == "checkSeeds" and saved.state.readyAt.FARM > f.services.Workspace:GetServerTimeNow())
     assert(saved.profile == "Cloud Rotation" and saved.config.planting.worlds[2] == "FARM2")
     assert(saved.config.points.pnb.world == "BREAK" and saved.config.rotation.farms.FARM2.x == 0)
     f.app.config,f.app.profile=saved.config,saved.profile
@@ -4376,8 +4759,15 @@ test("A fresh rotation instance restores multiple pending replant seeds without 
     for x = 1, 5 do f.grids.FARM2[8][x] = 0; f.treeTimes.FARM2[8 * f.world.w + x] = nil end
     for x = 1, 3 do f.grids.FARM2[8][x] = 955; f.treeTimes.FARM2[8 * f.world.w + x] = os.clock() end
     f.serverItems[955] = 7; f.inventory:add(955, 7)
+    local plant = f.app.runtime.handlers.plantSeed
+    f.app.runtime.handlers.plantSeed = function(...)
+        plant(...)
+        assert(f.hooks.readRotationResume().state.plant.pending.tiles,
+            "Saved rotation row cursors must resume batch planting after repositioning")
+    end
     f.hooks.saveRotationResume({phase = "replant", worldIndex = 2, cycle = 1, work = 10, seedCargo = 0,
         completed = {FARM = true}, readyAt = {}, plant = {phase = "farm", worldIndex = 2, skipped = {},
+            rows = {{y = 8, left = 1, right = 5}}, rowY = 8,
             pending = {world = "FARM2", x = 1, y = 8, before = 10,
                 tiles = {{x = 1, y = 8}, {x = 2, y = 8}, {x = 3, y = 8}}}}})
     local runtime, next = f.app.runtime, f.reload()
@@ -4421,12 +4811,13 @@ test("Full rotation plants both farms, waits for maturity, harvests seeds and bl
     end
     f.hooks.start("rotation")
     assert(not f.app.lastError, f.app.lastError)
-    assert(waited and f.app.stats.cycles == 2 and f.pnbBlocks == 10 and #f.harvests == 20, "wait=" .. tostring(waited) .. " cycles=" .. f.app.stats.cycles .. " PNB=" .. f.pnbBlocks .. " trees=" .. #f.harvests .. " plants=" .. #f.plants)
+    assert(waited and f.app.stats.cycles == 2 and f.pnbBlocks == 15 and #f.harvests == 20, "wait=" .. tostring(waited) .. " cycles=" .. f.app.stats.cycles .. " PNB=" .. f.pnbBlocks .. " trees=" .. #f.harvests .. " plants=" .. #f.plants)
     assert(#f.plants == 30 and f.plants[1].world == "FARM" and f.plants[6].world == "FARM2")
     assert(f.plants[11].world == "FARM" and f.plants[16].world == "FARM2")
-    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) + f.inventory:count(955) == 10)
-    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12],954) == 10, "Last harvest stays in PNB storage for the next growth wait")
-    assert(f.app.stats.harvestSeeds == 20 and f.app.stats.stashedSeeds == 30)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) + f.inventory:count(955) == 15)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12],954) == 5, "Seed depletion drains PNB stock; subsequent harvest waits for the next growth period")
+    assert(f.app.stats.harvestSeeds == 20 and f.app.stats.stashedSeeds >= 20,
+        "All harvested seeds are stored, including any held seeds returned with them")
     assert(f.app.job == nil and not f.app.runToggles.rotation.Value and not f.hooks.readRotationResume())
 end)
 
@@ -4478,7 +4869,7 @@ test("Rotation reconciles a planted seed after a picker interruption and continu
     f.afterWait=function() if f.app.stats.cycles == 1 then f.app:stop() end end
     f.hooks.start("rotation")
     assert(not f.app.lastError,f.app.lastError)
-    assert(interrupted and #f.plants == 20 and #f.harvests == 10 and f.pnbBlocks == 0)
+    assert(interrupted and #f.plants == 20 and #f.harvests == 10 and f.pnbBlocks == 5)
     assert(f.app.stats.planted == 20 and f.app.stats.cycles == 1)
 end)
 
@@ -4534,7 +4925,7 @@ test("Export includes unsaved settings and all farm locations without exporting 
     assert(f.services.HttpService:JSONDecode(text) == record and record.profile == "Emulator Farms")
     assert(record.config.options.collectDelay == 0.7 and record.config.rotation.farms.FARM2.world == "FARM2")
     assert(record.userId == nil and record.state == nil and record.active == nil)
-    assert(f.app.job == "rotation" and f.app.pending == 2 and next(f.files) == nil)
+    assert(f.app.job == "rotation" and f.app.pending == 2 and onlyMigrationFiles(f.files))
     writefile=nil
     assert(f.hooks.exportConfiguration())
 end)
@@ -4543,7 +4934,7 @@ test("Export files preserve the portable format and back up a previous export", 
     local f=fixture()
     local _,record=f.hooks.exportConfiguration()
     local path=f.hooks.saveConfigExport(record)
-    assert(path == "ClarisGrowblox/exports/Default.json")
+    assert(path == "ClarisGrowblox/accounts/1234/exports/Default.json")
     local saved=f.services.HttpService:JSONDecode(f.files[path])
     assert(saved.format == "ClarisGrowbloxConfig" and saved.config.blockId == 954)
     f.app.config.options.collectDelay=0.8
@@ -4559,11 +4950,10 @@ test("Import on another account persists the whole setup locally and clears old 
     source.app.config.webhook.url="https://discord.com/api/webhooks/123/mock_token"
     source.app.config.webhook.enabled=true
     local _,record=source.hooks.exportConfiguration()
-    local f=fixture()
-    f.player.UserId=5678
+    local f=fixture(5678)
     f.app.job,f.app.jobToken=nil,nil
     for _,name in ipairs({"resume","pnb-resume","plant-resume","rotation-resume"}) do
-        f.files["ClarisGrowblox/" .. name .. ".json"]="old local checkpoint"
+        f.files["ClarisGrowblox/accounts/5678/" .. name .. ".json"]="old local checkpoint"
     end
     f.app.resume,f.app.plantState,f.app.rotationState={cargo=100},{pending=true},{phase="pnb"}
     local text=f.services.HttpService:JSONEncode(record)
@@ -4572,9 +4962,9 @@ test("Import on another account persists the whole setup locally and clears old 
     assert(f.app.config.webhook.url == source.app.config.webhook.url and f.app.config.webhook.enabled)
     assert(f.app.job == nil and f.app.resume == nil and f.app.plantState == nil and f.app.rotationState == nil)
     assert(f.world.name == "BREAK" and f.avatar.x == 13.5 and f.pickups == 0)
-    assert(f.files["ClarisGrowblox/resume.json"] == nil and f.files["ClarisGrowblox/rotation-resume.json"] == nil)
-    local profile=f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/profiles/Cloud Phone Farms.json"])
-    local session=f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/session.json"])
+    assert(f.files["ClarisGrowblox/accounts/5678/resume.json"] == nil and f.files["ClarisGrowblox/accounts/5678/rotation-resume.json"] == nil)
+    local profile=f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/accounts/5678/profiles/Cloud Phone Farms.json"])
+    local session=f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/accounts/5678/session.json"])
     assert(profile.planting.worlds[2] == "FARM2" and session.userId == 5678 and session.profile == "Cloud Phone Farms")
     local nextApp=f.reload().App
     assert(nextApp.profile == "Cloud Phone Farms" and nextApp.config.rotation.farms.FARM2.world == "FARM2")
@@ -4585,13 +4975,13 @@ test("Malformed pasted JSON and recovery records cannot change the current setup
     local f=fixture()
     f.app.job=nil
     local config=f.app.config
-    f.files["ClarisGrowblox/resume.json"]="old checkpoint"
+    f.files["ClarisGrowblox/accounts/1234/resume.json"]="old checkpoint"
     rejects(function() f.hooks.importConfiguration("loadstring(game:HttpGet('example'))()") end,"Invalid configuration JSON")
     rejects(function() f.hooks.importConfiguration(string.rep("x",131073)) end,"too large")
     local recovery=f.services.HttpService:JSONEncode({version=1,userId=123,config=config,phase="deliver",cargo=200})
     rejects(function() f.hooks.importConfiguration(recovery) end,"recovery files")
-    assert(f.app.config == config and f.app.profile == "Default" and f.files["ClarisGrowblox/resume.json"] == "old checkpoint")
-    assert(f.files["ClarisGrowblox/session.json"] == nil)
+    assert(f.app.config == config and f.app.profile == "Default" and f.files["ClarisGrowblox/accounts/1234/resume.json"] == "old checkpoint")
+    assert(f.files["ClarisGrowblox/accounts/1234/session.json"] == nil)
 end)
 
 test("Import refuses a running task or outstanding request before writing files", function()
@@ -4600,36 +4990,36 @@ test("Import refuses a running task or outstanding request before writing files"
     rejects(function() f.hooks.importConfiguration(text) end,"Stop the current task")
     f.app.job,f.app.pending=nil,1
     rejects(function() f.hooks.importConfiguration(text) end,"pending requests")
-    assert(next(f.files) == nil and f.app.config.blockId == 954)
+    assert(onlyMigrationFiles(f.files) and f.app.config.blockId == 954)
 end)
 
 test("A failed import save retains the previous profile, session, and recovery state", function()
     local f=fixture()
     f.app.job=nil
-    local profilePath="ClarisGrowblox/profiles/Default.json"
+    local profilePath="ClarisGrowblox/accounts/1234/profiles/Default.json"
     f.files[profilePath]="previous profile"
     f.hooks.saveSession()
-    local priorSession=f.files["ClarisGrowblox/session.json"]
-    f.files["ClarisGrowblox/resume.json"]="prior cargo"
+    local priorSession=f.files["ClarisGrowblox/accounts/1234/session.json"]
+    f.files["ClarisGrowblox/accounts/1234/resume.json"]="prior cargo"
     local oldConfig=f.app.config
     local _,record=f.hooks.exportConfiguration()
     record.config.blockId=628
     local text=f.services.HttpService:JSONEncode(record)
     local write=writefile
     writefile=function(path,value)
-        if path == "ClarisGrowblox/session.json.pending" then error("disk full") end
+        if path == "ClarisGrowblox/accounts/1234/session.json.pending" then error("disk full") end
         return write(path,value)
     end
     rejects(function() f.hooks.importConfiguration(text) end,"disk full")
     assert(f.app.config == oldConfig and f.app.config.blockId == 954)
-    assert(f.files[profilePath] == "previous profile" and f.files["ClarisGrowblox/session.json"] == priorSession)
-    assert(f.files["ClarisGrowblox/resume.json"] == "prior cargo")
+    assert(f.files[profilePath] == "previous profile" and f.files["ClarisGrowblox/accounts/1234/session.json"] == priorSession)
+    assert(f.files["ClarisGrowblox/accounts/1234/resume.json"] == "prior cargo")
 end)
 
 test("Import backs up an existing named profile and accepts a saved profile file", function()
     local f=fixture()
     f.app.job=nil
-    local path="ClarisGrowblox/profiles/Cloud Phone.json"
+    local path="ClarisGrowblox/accounts/1234/profiles/Cloud Phone.json"
     f.files[path]="previous cloud setup"
     local config=f.hooks.Core.validate(f.app.config)
     config.options.collectDelay=0.9

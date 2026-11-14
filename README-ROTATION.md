@@ -1,8 +1,8 @@
 # Full Rotation guide
 
-For **Claris Growblox 0.1.27**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
+For **Claris Growblox 0.1.29**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
 
-The usual flow is **fill planting space → PNB while trees grow → harvest a ready farm → transfer its blocks and seeds → replant that farm → repeat**. Planting and ready harvests take priority over breaking. A full farm skips planting even when seed storage contains thousands of seeds.
+The usual flow is **fill planting space → PNB while trees grow → harvest a ready farm → transfer its blocks and seeds → replant that farm → repeat**. Planting and ready harvests normally take priority over breaking. When the planting seed supply is exhausted, rotation finishes the full PNB block stock first. A full farm skips planting even when seed storage contains thousands of seeds.
 
 ## Contents
 
@@ -122,18 +122,20 @@ A fresh run begins with a planting pass over the full list. It fills empty suppo
 | Condition | Rotation behavior |
 | --- | --- |
 | Full farms with growing trees and seeds still in storage | Skips planting and runs PNB while the trees grow. |
-| Full farms with ripe trees | Skips occupied planting tiles and processes ready harvests before breaking existing PNB stock. |
+| Full farms with ripe trees and planting seeds available | Skips occupied tiles and processes ready harvests before breaking existing PNB stock. |
 | Empty supported planting spaces with seeds available | Fills them during the initial planting pass, before the harvest/wait flow. |
-| A farm becomes ready during PNB | Finishes the current block and pickups, stores unused inventory, then leaves for harvest. |
+| A farm becomes ready during normal PNB | Finishes the current block and pickups, stores unused inventory, then leaves for harvest. |
 | A farm has been harvested | Transfers its blocks/seeds and replants that farm before more PNB. |
 | A later farm matures first | Uses maturity deadlines to choose it instead of waiting at an earlier growing farm. |
 | PNB blocks run out while trees grow | Waits in the breaking world for harvest due or new blocks, without repeated growing-farm visits. |
-| Planting seed stock runs out | Existing crop or PNB blocks can replenish seeds; available stock lets unfinished planting resume. |
+| Planting backpack and seed storage run out | Enters `drainPNB`: breaks all remaining PNB blocks, stores produced seeds, then resumes planting/harvesting. Ripe farms wait during this drain. |
+| Seed box refills while `drainPNB` is active | Continues draining PNB. New seeds do not interrupt it. |
+| PNB drain finishes | Confirms no inventory/storage blocks or placed PNB block remain, settles pickups and stores seeds, then returns to normal farm scheduling. |
 | No eligible crop, planting stock, or PNB blocks can provide work | Pauses with an error instead of endlessly repeating empty travel. |
 
 For the tree-maturity wait, a farm is ready when its remaining matching growing trees have matured. The script uses planting times and growth duration, then confirms maturity after entering the farm. Harvested items already in its box or loose matching drops can also provide collection work before all current trees mature.
 
-The list order is the planting order and resolves equal deadlines. Harvest scheduling can choose a later farm that matures sooner. A farm's replant takes priority after its harvest, before processing another farm. A completed rotation cycle counts the processed farm pass; it does not mean the PNB box was emptied.
+The list order is the planting order and resolves equal deadlines. Harvest scheduling can choose a later farm that matures sooner. A farm's replant normally takes priority after its harvest, before processing another farm. Seed exhaustion temporarily gives the full PNB drain priority. A completed rotation cycle counts the processed farm pass; it does not mean the PNB box was emptied.
 
 ### Example: two ripe farms, 5,000 seeds, and 11,000 PNB blocks
 
@@ -141,11 +143,19 @@ If both farms are full of ripe trees, the initial planting pass skips their occu
 
 Having 5,000 seeds does not make it plant over trees. Having 11,000 blocks does not make it finish all PNB work before a ready harvest. If those farms have empty supported spaces, those spaces can be planted during the initial pass before harvesting starts.
 
+### When seed supply runs out
+
+The trigger is an empty planting backpack **and** an empty left PNB seed box. Seeds already carried for planting can still be used. If the last seeds finish a farm exactly, rotation checks the box before scheduling another farm, so exhaustion is detected even without a failed refill. No new toggle is required.
+
+For example, with no seeds left and 11,000 PNB blocks, rotation stays in PNB until all 11,000 blocks and returned blocks are consumed. It stores produced seeds without restarting planting after the first few seeds. Already-ripe farms also wait. After the drain, ready harvests and unfinished planting can resume using the accumulated stock. If PNB is already empty, it returns to normal farm scheduling immediately; growing farms wait for maturity.
+
+`checkSeeds` and `drainPNB` are saved phases. Reloading or a supported world teleport does not cancel an active drain when its seed box has refilled. Normal Stop still stops the task and clears its automatic-resume checkpoint. An interrupted storage request still pauses for inspection.
+
 ### What pausing PNB means
 
 Rotation switches tasks between complete place/break/pickup iterations. It finishes the current block and its pickups, checks that requests have settled, and returns unused backpack blocks/seeds to their dedicated PNB boxes before leaving.
 
-A slow current game request or pickup can delay that boundary. PNB also checks after refilling blocks so a slow withdrawal does not start another placement after harvest is due. It does not wait for the entire block box to be emptied.
+A slow current game request or pickup can delay that boundary. PNB also checks after refilling blocks so a slow withdrawal does not start another placement after harvest is due. During normal PNB it does not wait for the entire block box to be emptied. During the depleted-seed drain it finishes that box and all returned blocks before leaving.
 
 ## Routes, drops, and storage
 
@@ -155,7 +165,9 @@ From v0.1.26, planting places seeds while walking along that row. It uses the na
 
 Each attempted tile is saved before placement. After an interruption, rotation checks the saved batch against the live tiles and server seed count before continuing. Accepted seeds are counted once, empty unaccepted cells can be retried, and conflicting evidence pauses with a diagnostic. Older single-seed planting checkpoints remain supported. No new setup or toggle is required for moving planting.
 
-For worlds with many scattered drops, enable **Settings → FPS booster: hide floating drops**. It hides loose block, seed and gem sprites and stops their bobbing/pop visuals while automation keeps using their pickup data. Display Boxes remain visible. You can toggle it during rotation; it saves to the session and matching task checkpoints without changing pending cargo or progress, and applies after supported world-change resumes. Save the named profile to retain it when loading that profile or exporting to another device. New drops are hidden on a periodic scan, roughly once per second. Normal Stop keeps the boost active; switching it Off or unloading restores surviving visuals. Harvest's collection scope stays selected blocks and matching seeds; PNB also collects nearby gems. Live FPS improvement depends on the device and native client workload.
+From v0.1.28, a refill or saved resume keeps moving planting on the unfinished row. When entry leaves the avatar below that row or past its next empty tile, it walks to the next planting position before continuing the saved zigzag direction. It does not replant occupied tiles or switch the remainder of that row to per-tile planting because it arrived through the other side. Navigation, batch confirmations and genuine obstacles can still require pauses. This applies to standalone Planting, the initial rotation pass and replanting after harvest.
+
+For worlds with many scattered drops, enable **Settings → FPS booster: hide floating drops**. It hides loose block, seed and gem sprites and stops their bobbing/pop visuals while automation keeps using their pickup data. Display Boxes remain visible. You can toggle it during rotation; it saves to the session and matching task checkpoints without changing pending cargo or progress, and applies after supported world-change resumes. Save the named profile to retain it when loading that profile or exporting to another device. New drops are hidden on a periodic scan, roughly once per second. Normal Stop keeps the boost active; switching it Off or unloading restores surviving visuals. Harvest collects selected blocks, matching seeds and gems; PNB also collects nearby gems. Live FPS improvement depends on the device and native client workload.
 
 - Planting skips rows without empty supported planting tiles.
 - Harvesting skips rows without ripe selected trees or matching drops to collect.
@@ -163,7 +175,9 @@ For worlds with many scattered drops, enable **Settings → FPS booster: hide fl
 - Keep edge platforms and routes clear so the script can reach each row.
 - Occupied tiles, unsupported air, access-denied cells, and unreachable planting cells are skipped. A completed scan does not guarantee every dirt tile was planted; check skipped counts in Recent activity.
 
-Harvesting breaks the selected ripe trees before the drop-collection pass. It collects matching **blocks and seeds** and puts them in that farm's Display Box. Unrelated drops are outside harvest collection.
+Harvesting breaks the selected ripe trees before the drop-collection pass. From v0.1.29 it picks up matching **blocks, seeds and gems while walking** the supported zigzag rows, including a single supported row. It skips empty rows and keeps at most eight pickup requests in flight, reserves inventory space across late replies, and confirms inventory in batches. It settles pickups before storage trips. Delayed, partially collected or refused drops get a follow-up approach; full backpacks, turns and obstacles can still cause stops.
+
+Blocks and seeds go together into that farm's Display Box. Gems are currency and update the gem balance; they are never deposited in the box. Unrelated crop drops and Display Box contents remain outside harvest collection. PNB collection stays near the saved breaking spot so it can finish each block safely.
 
 | Storage | Contents | Purpose |
 | --- | --- | --- |
@@ -187,13 +201,13 @@ The 200 amount is the held inventory stack, **not a limit on storage stock**. Th
 | Local session | Current configuration and profile name, including unsaved setting changes | Restore this account's settings after reload. |
 | Rotation checkpoint | Configuration/profile, phase, farm, cycle, completed farms, deadlines, planting progress, transfer cargo, and pending storage actions | Resume interrupted work on this account/device. |
 
-The checkpoint is `ClarisGrowblox/rotation-resume.json`. It saves before world changes and phase transitions, during planting/storage progress, and periodically while running. Deadlines use **server time**, so restarting executor uptime does not restart tree growth.
+The checkpoint is `ClarisGrowblox/accounts/<RobloxUserId>/rotation-resume.json`. It saves before world changes and phase transitions, during planting/storage progress, and periodically while running. Deadlines use **server time**, so restarting executor uptime does not restart tree growth.
 
 ### Automatic loader execution
 
 Use the project's GitHub **loader.lua**, shown above, so the script knows which loader to queue. When Delta provides `queue_on_teleport` or a supported equivalent, it queues that loader with automatic resume before moving worlds.
 
-After a server change resets the script, the queued loader connects, restores the saved rotation's configuration/profile, and resumes its phase. This includes PNB during growth waits and unfinished replanting. Each fresh script registers execution again for the next world change. Rotation recovery takes priority over standalone PNB, Planting, and Moving Drops recovery.
+After a server change resets the script, the queued loader connects, restores the saved rotation's configuration/profile, and resumes its phase. This includes PNB during growth waits, depleted-seed PNB draining and unfinished replanting. The logged-in account selects its own checkpoint folder automatically. Each fresh script registers execution again for the next world change. Rotation recovery takes priority over standalone PNB, Planting, and Moving Drops recovery.
 
 You do not need to load a profile, resave boxes, or turn rotation On after every supported teleport. Coordinates stay attached to their saved worlds.
 
@@ -243,7 +257,7 @@ Changing webhook settings or loading/importing config clears old queued reports.
 5. Press **Import config**. Import applies and saves the profile and a session for the destination account. A same-name existing profile is backed up.
 6. Check crop, seed source, PNB boxes, farm list, harvest boxes, and webhook settings. Start Continuous full rotation for a new run.
 
-Export also writes `ClarisGrowblox/exports/<profile>.json` when file functions are available. For file transfer, copy it to the destination, enter its local path in **Configuration file path**, and press **Import config file**. Plain existing profile JSON files are supported too. If clipboard/file access fails, the export text remains in Configuration text.
+Export also writes `ClarisGrowblox/accounts/<RobloxUserId>/exports/<profile>.json` when file functions are available. For file transfer, copy it to the destination, enter its local path in **Configuration file path**, and press **Import config file**. Plain existing profile JSON files are supported too. If clipboard/file access fails, the export text remains in Configuration text.
 
 Import keeps tasks Off and clears old local recovery checkpoints. It transfers setup, **not inventory, live cargo, queued alerts, counters, or running progress**. An unfinished emulator block trip cannot resume on a cloud phone using a config export. See the [configuration transfer instructions](README.md#export-from-an-emulator-and-import-on-a-cloud-phone) for more context.
 
@@ -263,7 +277,11 @@ For each account:
 
 Use separate farms and storage for simultaneous accounts. The script does not coordinate shared harvesting, planting, or withdrawals. Each account needs world access and its own tractor for Tractor mode. Update linked doors too if using standalone Moving Drops.
 
-Accounts can use the same webhook and ping the same Discord user; reports identify the player/profile. Account-bound sessions/checkpoints remain separate from portable config. Another account's running checkpoint is rejected.
+From v0.1.29, sessions, named profiles, exports and all task checkpoints use **`ClarisGrowblox/accounts/<RobloxUserId>/`**. The user ID comes from the logged-in Roblox player, so no extra slot name or isolation setting is needed. Even identical profile names are separate. The loader's verified code cache remains shared. **Update both cloud-phone instances to v0.1.29 or newer.** In Settings > Copy diagnostics, compare Roblox account and Account data: the two IDs/folders must differ.
+
+On first upgraded load, only legacy sessions/checkpoints carrying that account's user ID are copied. Shared legacy files remain intact. The active profile is recovered from its owned session snapshot, while other ownerless legacy profiles require explicit import from `ClarisGrowblox/profiles/<name>.json`. Migration runs once per account, so clearing saved work does not resurrect it from shared old files. A configuration already overwritten by the other account needs a known export/backup or fresh setup.
+
+Accounts can use the same webhook and ping the same Discord user; reports identify the player/profile. Export/import copies setup into the destination account's folder with tasks Off. Checkpoints still validate ownership. Separate account data does not coordinate shared in-game storage or harvesting: keep each account's assigned farms and boxes separate.
 
 ## Troubleshooting
 
@@ -282,7 +300,9 @@ Accounts can use the same webhook and ping the same Discord user; reports identi
 | Full farm is not planting | Occupied tiles are intentionally skipped. Growing trees lead to PNB; ripe trees lead to harvest. |
 | Some trees are ripe but the farm is still growing | The maturity wait accounts for remaining matching growing trees too. |
 | Empty PNB storage while trees grow | Waits in the PNB world; harvest due or new blocks can provide the next work. |
-| Empty seed box | Add matching seeds, wait for existing crop, or provide PNB blocks that produce seeds. No productive work causes a pause. |
+| Empty seed box and planting backpack | Drains PNB fully before more planting/harvesting. Produced seeds do not interrupt an active drain. If no blocks remain, normal farm scheduling resumes. |
+| Ripe farm waits during `drainPNB` | Expected after seed exhaustion. It resumes after all PNB inventory/storage blocks and pickups finish. |
+| Two cloud-phone accounts mix configs or rotations | Update both to v0.1.29 or newer. Check different account IDs/data folders in diagnostics; restore any previously overwritten config from an export/backup or resave it. |
 | Tractor missing / another crop present | Supply the tractor and use a single-crop farm, or choose Fist. |
 | Refused pickup, unreachable row, skipped planting cells | Check tile/box permissions, standing positions, platforms, obstacles, and inventory space; copy diagnostics. |
 | Respawn does not reach the saved box | Saving the box does not change the game's respawn point. Check respawn destination, the route, and return diagnostics. |
@@ -326,11 +346,11 @@ No. Occupied rows are skipped. Growing trees remain until ready to harvest.
 
 **Will it finish all 11,000 PNB blocks before harvest?**
 
-No. A ready farm interrupts PNB after the current block and pickups settle. The harvested farm is replanted before more breaking.
+During normal rotation, a ready farm interrupts PNB after the current block and pickups settle. If both planting inventory and seed storage run out, it finishes all remaining PNB blocks first. Ripe farms wait until that drain completes.
 
 **Does empty seed storage stop rotation immediately?**
 
-It stops that planting attempt. Existing crop or PNB blocks can replenish stock and let planting resume. No productive work causes a pause.
+It stops that planting attempt once carried seeds are also used. Rotation then drains all remaining PNB blocks and stores the produced seeds before returning to planting or harvesting. An active drain continues even after seeds appear in storage. If PNB is already empty, normal farm scheduling resumes; with no productive crop, seeds or blocks, it pauses.
 
 **Can a saved profile resume a stopped run?**
 
@@ -340,15 +360,18 @@ A profile restores setup for a fresh run. Intentional Stop clears running progre
 
 It repeats until stopped or a terminal fault occurs, with anti-AFK and supported recovery available. Keep the device/executor active, world access valid, storage usable, and routes clear. Unresolved game/executor faults still require attention.
 
-## Push this guide to GitHub
+## Push this update to GitHub
 
-To commit and push this guide-only update from PowerShell:
+To rebuild, check, commit and push the script and guide from PowerShell:
 
 ```powershell
 cd "F:\VSCode\Luau\Claris Growblox Autofarm\logic"
-git add README-ROTATION.md
-git commit -m "Expand full rotation setup and recovery guide"
+npm.cmd run build
+npm.cmd test
+npm.cmd run test:lua
+git add src/main.lua tests/runtime.lua package.json main.lua loader.lua release.json releases/ README.md README-ROTATION.md RESEARCH.md
+git commit -m "Isolate account data and improve rotation collection"
 git push origin HEAD
 ```
 
-Future script changes need a rebuild and relevant checks before publishing. Push the updated loader, manifest, bundle, and new immutable release folder together. A guide-only edit does not need a rebuild. Keep using the same GitHub loader command after updates.
+Run the Git commands only after the checks pass. Push the updated loader, manifest, bundle, and new immutable release folder together. Keep using the same GitHub loader command after updates, and reload both accounts onto v0.1.29 or newer.
