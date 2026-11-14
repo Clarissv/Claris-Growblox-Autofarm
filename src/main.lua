@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.32"
+local VERSION = "0.1.33"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -984,7 +984,14 @@ local function navigationMap(r)
         end,
     }
 end
-local function moveTo(x, y, worldName, token, onStep)
+local function transientRouteFault(problem)
+    if type(problem)~="string" then return false end
+    return problem:find("Returning to the saved position timed out",1,true)
+        or problem:find("Could not reach the saved position",1,true)
+        or problem:find("The planned jumps did not reach the platforms",1,true)
+        or problem:find("The avatar did not land on a reachable floor or platform",1,true)
+end
+local function walkTo(x, y, worldName, token, onStep)
     local r = worldCheck(worldName, token)
     tileAt(x, y)
     local hold = takeControls()
@@ -1092,6 +1099,25 @@ local function moveTo(x, y, worldName, token, onStep)
             assert(replans <= 4, "The planned jumps did not reach the platforms. Check the entrance and route layout.")
             setStatus("Trying another route around the obstacle...")
         end
+    end
+end
+local function moveTo(x,y,worldName,token,onStep)
+    for attempt=1,3 do
+        local result=table.pack(pcall(walkTo,x,y,worldName,token,onStep))
+        if result[1] then return table.unpack(result,2,result.n) end
+        checkpoint(token)
+        local state=App.rotationState
+        local pending=App.plantState and App.plantState.pending
+            or state and (state.plant and state.plant.pending or state.harvestPlant and state.harvestPlant.pending)
+        if App.job~="rotation" or App.pending>0 or pending or not transientRouteFault(result[2]) or attempt==3 then
+            error(result[2],0)
+        end
+        worldCheck(worldName,token)
+        local hold=takeControls()
+        hold.direction,hold.jump=0,false
+        App.navigationRecovery=worldName .. ": replanning walking route, attempt " .. (attempt+1) .. "/3"
+        setStatus("Movement delayed; " .. App.navigationRecovery .. "...")
+        pause(0.5,token)
     end
 end
 local function moveToPoint(point, token)
@@ -2484,7 +2510,7 @@ local function clearPlantResume()
 end
 local function savePlantResume(state)
     saveSession()
-    local copy = {worldIndex = state.worldIndex, phase = state.phase, skipped = {}, pending = state.pending}
+    local copy = {worldIndex = state.worldIndex, phase = state.phase, skipped = {}, pending = state.pending, deferred = {}}
     if state.rows then
         copy.rows = {}
         for _, row in ipairs(state.rows) do
@@ -2493,6 +2519,7 @@ local function savePlantResume(state)
         copy.rowY = state.rowY
     end
     for key, reason in pairs(state.skipped or {}) do copy.skipped[key] = reason end
+    for key, point in pairs(state.deferred or {}) do copy.deferred[key] = {x=point.x,y=point.y,tries=point.tries} end
     writeJSON(PLANT_RESUME_FILE, {version = 1, active = true, userId = ACCOUNT_ID, updatedAt = os.time(),
         config = Core.validate(App.config), profile = App.profile, state = copy})
     App.plantState = state
@@ -2517,6 +2544,15 @@ local function readPlantResume(record)
         and type(state.skipped) == "table", "Invalid saved planting progress.")
     for key, reason in pairs(state.skipped) do
         assert(type(key) == "string" and key:match("^%d+:%d+$") and type(reason) == "string", "Invalid skipped planting tile.")
+    end
+    if state.deferred then
+        assert(type(state.deferred) == "table", "Invalid deferred planting tiles.")
+        for key, point in pairs(state.deferred) do
+            assert(type(point) == "table" and type(point.x) == "number" and point.x == math.floor(point.x)
+                and point.x >= 0 and point.x <= 65535 and type(point.y) == "number" and point.y == math.floor(point.y)
+                and point.y >= 0 and point.y <= 65535 and key == point.x .. ":" .. point.y
+                and (point.tries == 0 or point.tries == 1), "Invalid deferred planting tile.")
+        end
     end
     if state.rows then
         assert(type(state.rows) == "table", "Invalid saved farm rows.")
@@ -2619,25 +2655,83 @@ local function enterPlantWorld(name, state, token)
     takeControls()
     refreshInventory(token)
 end
-local function reconcilePlant(state, token)
-    local point = state.pending
-    if not point then return end
-    worldCheck(point.world, token)
-    local id = App.config.planting.seedId
-    local actual, planted = refreshInventory(token)[id] or 0, 0
-    for _, tile in ipairs(point.tiles or {point}) do
-        local value = tileAt(tile.x, tile.y)
-        assert(value == 0 or value == id,
-            "Cannot reconcile the interrupted seed placement. Check the backpack and tile, then clear saved planting.")
-        if value == id then planted = planted + 1 end
-    end
-    assert(actual == point.before - planted,
-        "Cannot reconcile the interrupted seed placement. Check the backpack and tile, then clear saved planting.")
-    App.stats.planted = App.stats.planted + planted
-    state.pending = nil
-    savePlantResume(state)
+local function deferPlantTile(state, point, reason)
+    local key=point.x .. ":" .. point.y
+    state.deferred=state.deferred or {}
+    local previous=state.deferred[key]
+    state.deferred[key]={x=point.x,y=point.y,tries=previous and previous.tries or 0}
+    state.skipped[key]=reason
 end
-local function plantTile(point, state, token)
+-- Native placement is optimistic. Keep confirmed seeds, retire only this
+-- bounded batch, and defer ordinary refusals without aborting the rotation.
+local function confirmPlantBatch(state, token, save, lastPlant)
+    local pending=state.pending
+    if not pending then return end
+    local name,id=pending.world,App.config.planting.seedId
+    local tiles=pending.tiles or {pending}
+    local hold=takeControls()
+    hold.direction,hold.jump=0,false
+    pause(math.max(0,(lastPlant or 0)+0.2-os.clock()),token)
+    local deadline=os.clock()+App.config.options.actionTimeout
+    while true do
+        worldCheck(name,token)
+        local actual=refreshInventory(token)[id] or 0
+        assert(actual<=pending.before and actual>=pending.before-#tiles,
+            "Seed count changed unexpectedly while planting. Check diagnostics before resuming.")
+        local planted,values=0,{}
+        for index,point in ipairs(tiles) do
+            local value=tileAt(point.x,point.y)
+            assert(value==0 or value==id,"A pending planting tile changed to another item. Check the farm before resuming.")
+            values[index]=value
+            if value==id then planted=planted+1 end
+        end
+        local consistent=actual==pending.before-planted
+        if consistent or os.clock()>=deadline then
+            local stable,settled=true,os.clock()+0.12
+            repeat
+                worldCheck(name,token)
+                for index,point in ipairs(tiles) do
+                    if tileAt(point.x,point.y)~=values[index] then stable=false; break end
+                end
+                if not stable then break end
+                pause(0.03,token)
+            until os.clock()>=settled
+            for index,point in ipairs(tiles) do
+                if tileAt(point.x,point.y)~=values[index] then stable=false; break end
+            end
+            -- A partial batch needs one more authoritative count before it is
+            -- retired. Successful batches retain their normal one-read path.
+            if stable and (not consistent or planted<#tiles) then
+                stable=(refreshInventory(token)[id] or 0)==actual
+            end
+            if stable then
+                local confirmed=math.min(planted,pending.before-actual)
+                local assigned,skipped=0,0
+                for index,point in ipairs(tiles) do
+                    if values[index]==id and assigned<confirmed then assigned=assigned+1
+                    else
+                        deferPlantTile(state,point,"placement not confirmed")
+                        skipped=skipped+1
+                    end
+                end
+                App.stats.planted=App.stats.planted+confirmed
+                state.pending=nil
+                save(state)
+                if skipped>0 then
+                    App.plantingRecovery=name .. ": skipped " .. skipped .. " unconfirmed tiles near " .. pending.x .. ", " .. pending.y
+                    setStatus(App.plantingRecovery .. "; continuing and retrying from below where reachable.")
+                end
+                return actual,skipped==0
+            end
+        end
+        pause(0.15,token)
+    end
+end
+local function reconcilePlant(state, token)
+    if state.pending then confirmPlantBatch(state,token,savePlantResume) end
+end
+local function plantTile(point, state, token, save)
+    save=save or savePlantResume
     return withoutPickups(function()
         local name, id = App.config.planting.worlds[state.worldIndex], App.config.planting.seedId
         local r = worldCheck(name, token)
@@ -2645,25 +2739,49 @@ local function plantTile(point, state, token)
         if not Core.plantingTile(r.world, r.items, point.x, point.y) then return false end
         if not r.handlers.canPlace(r.items[id], point.x, point.y) then return false end
         assert(before > 0, "No planting seeds are left in the backpack.")
-        state.pending = {world = name, x = point.x, y = point.y, before = before}
-        savePlantResume(state)
+        state.pending = {world = name, x = point.x, y = point.y, before = before, tiles={{x=point.x,y=point.y}}}
+        save(state)
         r.handlers.plantSeed(id, point.x, point.y)
-        pause(math.max(0.2, App.config.options.placeDelay), token)
-        local deadline = os.clock() + App.config.options.actionTimeout
-        while true do
-            worldCheck(name, token)
-            local after = refreshInventory(token)[id] or 0
-            assert(after == before or after == before - 1, "Seed count changed unexpectedly while planting. Check diagnostics before resuming.")
-            if after == before - 1 and tileAt(point.x, point.y) == id then break end
-            assert(os.clock() < deadline, "The server did not confirm a planted seed at " .. point.x .. ", " .. point.y .. ".")
-            pause(0.15, token)
-        end
-        settleTile(point.x, point.y, id, 0.12, name, token)
-        App.stats.planted = App.stats.planted + 1
-        state.pending = nil
-        savePlantResume(state)
-        return true
+        local _,confirmed=confirmPlantBatch(state,token,save,os.clock()+math.max(0,App.config.options.placeDelay-0.2))
+        return confirmed
     end)
+end
+local function plantRetryTargets(row,state)
+    local targets={}
+    for _,point in pairs(state.deferred or {}) do
+        local x=math.max(row.left,math.min(row.right,point.x))
+        if point.tries==0 and point.y<row.y and math.abs(point.x-x)<=2.5
+            and math.abs(point.y+0.5-(row.y+1-0.475))<=2.5
+            and Core.plantingTile(runtime().world,runtime().items,point.x,point.y) then table.insert(targets,point) end
+    end
+    table.sort(targets,function(a,b) return a.x*(row.direction or 1)<b.x*(row.direction or 1) end)
+    return targets
+end
+local function retryPlantFromBelow(row,state,token,save)
+    save=save or savePlantResume
+    local name=App.config.planting.worlds[state.worldIndex]
+    local r,attempts=worldCheck(name,token),0
+    local avatar=position()
+    if not avatar.grounded or math.abs(avatar.y-(row.y+1))>0.22 then return attempts end
+    for _,point in ipairs(plantRetryTargets(row,state)) do
+        local anchor=math.max(row.left,math.min(row.right,point.x))
+        if math.abs(avatar.x-(anchor+0.5))<=0.55 then
+            local key=point.x .. ":" .. point.y
+            if not Core.plantingTile(r.world,r.items,point.x,point.y) then state.deferred[key]=nil; save(state)
+            elseif count(App.config.planting.seedId)>0 then
+                point.tries=1
+                save(state) -- One lower-row retry per tile; never loop on a refusal.
+                if r.handlers.canPlace(r.items[App.config.planting.seedId],point.x,point.y) then
+                    attempts=attempts+1
+                    setStatus("Retrying planting at " .. point.x .. ", " .. point.y .. " from below...")
+                    if plantTile(point,state,token,save) then state.skipped[key],state.deferred[key]=nil,nil
+                    else state.skipped[key]="placement refused after lower-row retry" end
+                else state.skipped[key]="lower-row placement not permitted" end
+                save(state)
+            end
+        end
+    end
+    return attempts
 end
 -- Run the native seed helper while walking. Only a small, saved batch may be
 -- optimistic; server inventory plus every tile must agree before more seeds.
@@ -2690,44 +2808,21 @@ local function plantRow(row, reverse, state, token)
         local available = refreshInventory(token)[id] or 0
         local cursor, nextPlant, lastPlant = 1, 0, 0
         local function confirm()
-            local pending = state.pending
-            if not pending then return end
-            local hold = takeControls()
-            hold.direction, hold.jump = 0, false
-            pause(math.max(0, lastPlant + 0.2 - os.clock()), token)
-            local deadline = os.clock() + App.config.options.actionTimeout
-            while true do
-                worldCheck(name, token)
-                local after = refreshInventory(token)[id] or 0
-                assert(after <= pending.before and after >= pending.before - #pending.tiles,
-                    "Seed count changed unexpectedly while planting. Check diagnostics before resuming.")
-                local all = true
-                for _, point in ipairs(pending.tiles) do if tileAt(point.x, point.y) ~= id then all = false end end
-                if all and after == pending.before - #pending.tiles then
-                    -- Observe late foreground corrections once per batch, without
-                    -- an inventory round trip or animation stop at each tile.
-                    local settled = os.clock() + 0.12
-                    repeat
-                        worldCheck(name, token)
-                        for _, point in ipairs(pending.tiles) do
-                            assert(tileAt(point.x, point.y) == id,
-                                "Tile " .. point.x .. ", " .. point.y .. " changed while the action settled. Stopping.")
-                        end
-                        pause(0.03, token)
-                    until os.clock() >= settled
-                    available = after
-                    App.stats.planted = App.stats.planted + #pending.tiles
-                    state.pending = nil
-                    savePlantResume(state)
-                    return
-                end
-                assert(os.clock() < deadline, "The server did not confirm a planted seed batch at " .. pending.x .. ", " .. pending.y .. ".")
-                pause(0.15, token)
-            end
+            if state.pending then available=confirmPlantBatch(state,token,savePlantResume,lastPlant) end
         end
         local function step(avatar)
             checkpoint(token)
             worldCheck(name, token)
+            for _,point in ipairs(plantRetryTargets(row,state)) do
+                local anchor=math.max(row.left,math.min(row.right,point.x))
+                if avatar.grounded and math.abs(avatar.y-(row.y+1))<=0.22
+                    and math.abs(avatar.x-(anchor+0.5))<=0.55 then
+                    confirm()
+                    retryPlantFromBelow(row,state,token)
+                    available=count(id)
+                    break
+                end
+            end
             if state.pending then
                 local corrected = false
                 for _, point in ipairs(state.pending.tiles) do if tileAt(point.x, point.y) ~= id then corrected = true end end
@@ -2746,7 +2841,7 @@ local function plantRow(row, reverse, state, token)
             if not Core.plantingTile(r.world, r.items, point.x, point.y) then cursor = cursor + 1; return true end
             if not r.handlers.canPlace(r.items[id], point.x, point.y) then
                 if math.abs(avatar.x - (point.x + 0.5)) <= 0.55 then
-                    state.skipped[point.x .. ":" .. point.y] = "not permitted"
+                    deferPlantTile(state,point,"not permitted")
                     savePlantResume(state)
                     cursor = cursor + 1
                 end
@@ -2793,50 +2888,11 @@ makeHarvestPlanter = function(token)
     rotation.harvestPlant = state
     local function save() saveRotationResume(rotation) end
     if state.pending then
-        local pending, planted = state.pending, 0
-        local actual = refreshInventory(token)[id] or 0
-        for _, point in ipairs(pending.tiles) do
-            local tile = tileAt(point.x, point.y)
-            assert(tile == 0 or tile == id, "Cannot reconcile interrupted harvest planting. Check inventory and farm tiles.")
-            if tile == id then planted = planted + 1 end
-        end
-        assert(actual == pending.before - planted, "Cannot reconcile interrupted harvest planting. Check inventory and farm tiles.")
-        App.stats.planted = App.stats.planted + planted
-        state.pending = nil
-        save()
+        confirmPlantBatch(state,token,save)
     end
     local available, nextPlant, lastPlant = refreshInventory(token)[id] or 0, 0, 0
     local function confirm()
-        local pending = state.pending
-        if not pending then return end
-        local hold = takeControls()
-        hold.direction, hold.jump = 0, false
-        pause(math.max(0, lastPlant + 0.2 - os.clock()), token)
-        local deadline = os.clock() + App.config.options.actionTimeout
-        while true do
-            worldCheck(name, token)
-            local actual, all = refreshInventory(token)[id] or 0, true
-            assert(actual <= pending.before and actual >= pending.before - #pending.tiles,
-                "Seed count changed unexpectedly during harvest planting. Check inventory before resuming.")
-            for _, point in ipairs(pending.tiles) do if tileAt(point.x, point.y) ~= id then all = false end end
-            if all and actual == pending.before - #pending.tiles then
-                local settled = os.clock() + 0.12
-                repeat
-                    worldCheck(name, token)
-                    for _, point in ipairs(pending.tiles) do
-                        assert(tileAt(point.x, point.y) == id, "A replanted harvest tile changed while settling. Check the farm.")
-                    end
-                    pause(0.03, token)
-                until os.clock() >= settled
-                available = actual
-                App.stats.planted = App.stats.planted + #pending.tiles
-                state.pending = nil
-                save()
-                return
-            end
-            assert(os.clock() < deadline, "The server did not confirm harvest planting at " .. pending.x .. ", " .. pending.y .. ".")
-            pause(0.15, token)
-        end
+        if state.pending then available=confirmPlantBatch(state,token,save,lastPlant) end
     end
     local function seedsLeft()
         return available - (state.pending and #state.pending.tiles or 0)
@@ -2868,6 +2924,16 @@ makeHarvestPlanter = function(token)
     end
     return {plant=plant, finish=confirm, step=function(row, points, countTree)
         worldCheck(name, token)
+        local current=position()
+        for _,point in ipairs(plantRetryTargets(row,state)) do
+            local anchor=math.max(row.left,math.min(row.right,point.x))
+            if current.grounded and math.abs(current.y-(row.y+1))<=0.22 and math.abs(current.x-(anchor+0.5))<=0.55 then
+                confirm()
+                retryPlantFromBelow(row,state,token,save)
+                available=count(id)
+                break
+            end
+        end
         if seedsLeft() == 0 then confirm() end
         if available == 0 then return end -- Finish harvesting; normal replanting handles restocks.
         local avatar = position()
@@ -2938,11 +3004,48 @@ local function runPlant(token, saved, lastWorldIndex)
                 assert(row.y < r.world.h - 1 and row.right < r.world.w, "Saved farm rows no longer fit this world. Clear saved planting and start again.")
             end
             setStatus("Planting " .. r.items[id].name .. " in " .. name .. " (" .. state.worldIndex .. "/" .. #settings.worlds .. ")...")
-            for _, point in ipairs(Core.plantingTiles(r.world, r.items, state.rows)) do
+            local visits={}
+            for index,row in ipairs(state.rows) do
+                row.direction=index%2==1 and 1 or -1
+                -- Even a full/empty lower row may be the approach for an upper
+                -- rejected tile. Determine that work when we reach this row.
+                table.insert(visits,{retryRow=row})
+                for x=row.direction==1 and row.left or row.right,row.direction==1 and row.right or row.left,row.direction do
+                    if Core.plantingTile(r.world,r.items,x,row.y) then table.insert(visits,{x=x,y=row.y}) end
+                end
+            end
+            for _, point in ipairs(visits) do
                 checkpoint(token)
                 worldCheck(name, token)
-                local key = point.x .. ":" .. point.y
-                if not state.skipped[key] and Core.plantingTile(r.world, r.items, point.x, point.y) then
+                local key=not point.retryRow and point.x .. ":" .. point.y
+                if point.retryRow then
+                    local row=point.retryRow
+                    local targets=plantRetryTargets(row,state)
+                    if #targets>0 and not Core.rowHasPlantingSpace(r.world,r.items,row,state.skipped) then
+                        if count(id)==0 then refill=true; break end
+                        local arrived,issue=pcall(function()
+                            local first,last=targets[1],targets[#targets]
+                            moveTo(math.max(row.left,math.min(row.right,first.x)),row.y,name,token)
+                            moveTo(math.max(row.left,math.min(row.right,last.x)),row.y,name,token,function()
+                                retryPlantFromBelow(row,state,token)
+                                return count(id)>0 and #plantRetryTargets(row,state)>0
+                            end)
+                        end)
+                        checkpoint(token)
+                        worldCheck(name,token)
+                        if not arrived then
+                            if state.pending or type(issue)=="table" and issue.recoverable then error(issue,0) end
+                            local text=tostring(issue)
+                            assert(text:find("route",1,true) or text:find("position",1,true) or text:find("support",1,true)
+                                or text:find("platform",1,true) or text:find("timed out",1,true),text)
+                            for _,target in ipairs(targets) do
+                                target.tries=1
+                                state.skipped[target.x .. ":" .. target.y]="lower-row approach unreachable"
+                            end
+                            savePlantResume(state)
+                        end
+                    end
+                elseif not state.skipped[key] and Core.plantingTile(r.world, r.items, point.x, point.y) then
                     if count(id) == 0 then refill = true; break end
                     local permitted = not r.world.areas or type(r.world.areas.canEdit) ~= "function" or r.world.areas.canEdit(point.x, point.y)
                     local arrived, issue = true, nil
@@ -2967,7 +3070,7 @@ local function runPlant(token, saved, lastWorldIndex)
                                     if row.y == point.y then plantRow(row, index % 2 == 0, state, token); break end
                                 end
                             end
-                            if Core.plantingTile(r.world, r.items, point.x, point.y) then moveTo(point.x, point.y, name, token) end
+                            if not state.skipped[key] and Core.plantingTile(r.world, r.items, point.x, point.y) then moveTo(point.x, point.y, name, token) end
                         end)
                     end
                     checkpoint(token)
@@ -2980,9 +3083,11 @@ local function runPlant(token, saved, lastWorldIndex)
                         local text = tostring(issue)
                         assert(text:find("route", 1, true) or text:find("position", 1, true) or text:find("support", 1, true)
                             or text:find("platform", 1, true) or text:find("timed out", 1, true), text)
-                        if Core.plantingTile(r.world, r.items, point.x, point.y) then state.skipped[key] = "unreachable" end
-                    elseif not permitted or (Core.plantingTile(r.world, r.items, point.x, point.y)
-                        and count(id) > 0 and not plantTile(point, state, token)) then state.skipped[key] = "not permitted" end
+                        if Core.plantingTile(r.world, r.items, point.x, point.y) then deferPlantTile(state,point,"unreachable") end
+                    elseif not permitted or (not state.skipped[key] and Core.plantingTile(r.world, r.items, point.x, point.y)
+                        and count(id) > 0 and not plantTile(point, state, token)) then
+                        deferPlantTile(state,point,state.skipped[key] or "not permitted")
+                    end
                     if state.skipped[key] then savePlantResume(state) end
                 end
             end
@@ -2997,7 +3102,7 @@ local function runPlant(token, saved, lastWorldIndex)
                     rotation.readyAt[name] = growing > 0 and not crop and Workspace:GetServerTimeNow() + left or 0
                 end
                 setStatus("Processed " .. name .. ": " .. skipped .. " tiles skipped due to access or route. Moving to the next farm.")
-                state.worldIndex, state.skipped, state.rows, state.rowY = state.worldIndex + 1, {}, nil, nil
+                state.worldIndex, state.skipped, state.rows, state.rowY, state.deferred = state.worldIndex + 1, {}, nil, nil, {}
             end
             savePlantResume(state)
         end
@@ -3308,23 +3413,33 @@ local function runRotation(token, saved)
                     and (not state.transfer or state.transfer.phase ~= "pickupPending" and state.transfer.phase ~= "depositPending"
                         and state.transfer.phase ~= "seedReturnPending"),
                     "A rotation storage request was interrupted. Check the backpack and boxes before resuming. " .. tostring(problem))
-                assert(App.config.options.autoRejoin and type(problem) == "table" and problem.recoverable, tostring(problem))
-                failures = failures + 1
-                assert(failures <= 3, "Rotation recovery failed three times. Check connection and copy diagnostics.")
-                releaseControls()
-                setStatus("Rotation interrupted; returning to the saved phase...")
-                if state.phase == "pnb" or state.phase == "waitPNB" or state.phase == "drainPNB" then
-                    local interruptions = 0
-                    while true do
-                        local recovered, issue = pcall(recoverPNB, problem, token)
-                        if recovered then break end
-                        checkpoint(token)
-                        interruptions = interruptions + 1
-                        assert(interruptions < 3 and type(issue) == "table" and issue.recoverable,
-                            "Rotation PNB recovery failed: " .. tostring(issue))
-                        problem = issue
-                    end
-                else travel(state.phase == "seedDeliver" and p.seedBox.world or settings.worlds[state.worldIndex]) end
+                local moving=transientRouteFault(problem) and App.pending==0
+                    and not (state.plant and state.plant.pending) and not (state.harvestPlant and state.harvestPlant.pending)
+                if moving then
+                    releaseControls()
+                    saveRotationResume(state)
+                    App.navigationRecovery="Retrying rotation phase " .. state.phase .. " after a movement timeout"
+                    setStatus(App.navigationRecovery .. "; trying again in 5s.")
+                    pause(5,token)
+                else
+                    assert(App.config.options.autoRejoin and type(problem) == "table" and problem.recoverable, tostring(problem))
+                    failures = failures + 1
+                    assert(failures <= 3, "Rotation recovery failed three times. Check connection and copy diagnostics.")
+                    releaseControls()
+                    setStatus("Rotation interrupted; returning to the saved phase...")
+                    if state.phase == "pnb" or state.phase == "waitPNB" or state.phase == "drainPNB" then
+                        local interruptions = 0
+                        while true do
+                            local recovered, issue = pcall(recoverPNB, problem, token)
+                            if recovered then break end
+                            checkpoint(token)
+                            interruptions = interruptions + 1
+                            assert(interruptions < 3 and type(issue) == "table" and issue.recoverable,
+                                "Rotation PNB recovery failed: " .. tostring(issue))
+                            problem = issue
+                        end
+                    else travel(state.phase == "seedDeliver" and p.seedBox.world or settings.worlds[state.worldIndex]) end
+                end
             end
         end
     end)
@@ -4553,6 +4668,8 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nHarvest method: " .. App.config.harvesting.method .. "; phase: " .. (App.harvestPhase or "not started")
         .. "\nTrees harvested: " .. App.stats.trees .. "; equipment restore: " .. (App.harvestGearError or "ready")
         .. "\nFarm maturity check: " .. (App.harvestMaturity or "not requested")
+        .. "\nPlanting recovery: " .. (App.plantingRecovery or "not requested")
+        .. "\nNavigation recovery: " .. (App.navigationRecovery or "not requested")
         .. "\nRecovery save: " .. (App.recoverySaveError or "ready")
         .. "\nSession save: " .. (App.sessionSaveError or "ready")
         .. "\nSession restore: " .. (App.sessionRestoreError or "ready")

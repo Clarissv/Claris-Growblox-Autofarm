@@ -2922,6 +2922,29 @@ test("Tractor misses are broken and replanted with Fist from the same lower posi
     assert(below==2 and f.worn==777)
 end)
 
+test("A rejected combined harvest seed retries from the next lower row without stopping collection", function()
+    local f=harvestPlantingFixture(9)
+    for _,y in ipairs({2,4,6}) do for _,x in ipairs({2,7,13}) do f.addTree(x,y) end end
+    f.expectedTrees=9
+    local plant,rejected,retries=f.app.runtime.handlers.plantSeed,false,0
+    f.app.runtime.handlers.plantSeed=function(id,x,y)
+        plant(id,x,y)
+        if x==2 and y==2 then
+            if not rejected then
+                rejected=true
+                f.world.fg[y][x],f.trees[y*f.world.w+x]=0,nil
+                f.serverItems[id]=f.serverItems[id]+1
+            else
+                retries=retries+1
+                assert(math.floor(f.avatar.y-0.01)==4)
+            end
+        end
+    end
+    f.harvest()
+    assert(rejected and retries==1 and f.app.stats.planted==9 and f.app.stats.stashed==90)
+    assert(#f.seedPlants==10 and f.app.rotationState.harvestPlant.pending==nil and f.worn==777)
+end)
+
 test("Dense tree rows harvest and replant through multiple seed batches without Tractor reversals", function()
     local f=harvestPlantingFixture(36)
     for _,y in ipairs({2,4,6}) do for x=2,13 do f.addTree(x,y) end end
@@ -2949,13 +2972,14 @@ test("Denied harvest planting leaves that cleared tile for normal replanting", f
     assert(f.hooks.Core.storageCount(f.boxes[12],955,954)==1)
 end)
 
-test("Unconfirmed harvest seeds pause before collection and retain the saved batch", function()
+test("Unconfirmed harvest seed placements are skipped while harvesting and collection finish", function()
     local f = harvestPlantingFixture(1)
     f.addTree(2,2)
-    f.refuseSeed = true
-    rejects(f.harvest,"server did not confirm harvest planting")
-    assert(f.app.stats.planted==0 and #f.requests==0 and f.worn==777)
-    assert(f.hooks.readRotationResume().state.harvestPlant.pending.before==1)
+    f.refuseSeed,f.expectedTrees = true,1
+    f.harvest()
+    assert(f.app.stats.planted==0 and f.app.stats.stashed==10 and f.worn==777)
+    assert(f.hooks.readRotationResume().state.harvestPlant.pending==nil)
+    assert(f.app.plantingRecovery:find("skipped 1",1,true))
 end)
 
 test("An interrupted harvest seed reconciles even when only growing trees remain", function()
@@ -3939,7 +3963,7 @@ test("A delayed planting inventory reply holds the next batch until all eight se
     assert(delayed and confirmed and #f.plantCalls == 12 and f.app.stats.planted == 12 and f.serverSeeds == 8)
 end)
 
-test("A partially rejected planting batch pauses and resumes only its unaccepted tiles", function()
+test("A partially rejected planting batch keeps accepted seeds and continues past rejected tiles", function()
     local f = plantingFixture(10, 100)
     f.onPlant = function()
         if #f.plantCalls == 3 then
@@ -3948,15 +3972,111 @@ test("A partially rejected planting batch pauses and resumes only its unaccepted
         end
     end
     f.hooks.start("plant")
-    assert(f.app.lastError:find("did not confirm a planted seed", 1, true) and #f.plantCalls == 3)
-    local saved = f.hooks.readPlantResume()
-    assert(#saved.state.pending.tiles == 3 and saved.state.pending.before == 10 and f.app.stats.planted == 0)
-    f.hooks.start("plant", saved)
     assert(not f.app.lastError, f.app.lastError)
-    assert(f.serverSeeds == 3 and f.app.stats.planted == 7 and #f.plantCalls == 8)
+    assert(f.serverSeeds == 4 and f.app.stats.planted == 6 and #f.plantCalls == 7)
     local occurrences = {}
     for _, point in ipairs(f.plantCalls) do occurrences[point.x] = (occurrences[point.x] or 0) + 1 end
-    assert(occurrences[0] == 1 and occurrences[1] == 2 and occurrences[2] == 1)
+    assert(occurrences[0] == 1 and occurrences[1] == 1 and occurrences[2] == 1)
+    assert(f.grids.FARM1[5][1]==0 and f.hooks.readPlantResume()==nil)
+end)
+
+local function rejectedUpperFixture(seeds)
+    local f=zigzagPlantingFixture(seeds or 20)
+    local canPlace=f.app.runtime.handlers.canPlace
+    f.app.runtime.handlers.canPlace=function(item,x,y)
+        if x==2 and y==1 and math.floor(f.avatar.y-0.01)==3 then
+            return f.hooks.Core.plantingTile(f.world,f.app.runtime.items,x,y)
+                and math.abs(f.avatar.x-(x+0.5))<=2.5 and math.abs(y+0.5-(f.avatar.y-0.475))<=2.5
+        end
+        return canPlace(item,x,y)
+    end
+    f.onPlant=function(_,x,y)
+        if x==2 and y==1 then
+            if not f.refusedUpper then
+                f.refusedUpper=true
+                f.grids.FARM1[y][x],f.serverSeeds=0,f.serverSeeds+1
+            else
+                f.lowerRetries=(f.lowerRetries or 0)+1
+                assert(math.floor(f.avatar.y-0.01)==3,"Retry the missed tile from the lower row")
+            end
+        end
+    end
+    return f
+end
+
+test("Rejected upper seeds are retried while planting the next row without returning upward", function()
+    local f=rejectedUpperFixture()
+    f.hooks.start("plant")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(f.lowerRetries==1 and #f.plantCalls==16 and f.app.stats.planted==15 and f.serverSeeds==5)
+    assert(f.grids.FARM1[1][2]==955 and f.hooks.readPlantResume()==nil)
+end)
+
+test("An already full lower row still provides the one retry approach for an upper seed", function()
+    local f=rejectedUpperFixture()
+    for x=1,5 do f.grids.FARM1[3][x]=955 end
+    f.hooks.start("plant")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(f.lowerRetries==1 and #f.plantCalls==11 and f.app.stats.planted==10)
+    assert(f.grids.FARM1[1][2]==955)
+end)
+
+test("Deferred upper tiles survive a seed refill and retain their lower-row retry", function()
+    local f=rejectedUpperFixture(2)
+    local entered=f.onEnter
+    f.onEnter=function(name)
+        if name=="STOCK" then
+            local saved=f.hooks.readPlantResume()
+            assert(saved.state.deferred["2:1"].tries==0 and saved.state.skipped["2:1"])
+        end
+        return entered(name)
+    end
+    f.hooks.start("plant")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(f.withdrawals==1 and f.lowerRetries==1 and #f.plantCalls==16 and f.app.stats.planted==15)
+end)
+
+test("Deferred planting checkpoints preserve coordinates and reject invalid retry counts", function()
+    local f=zigzagPlantingFixture(20)
+    f.hooks.savePlantResume({worldIndex=1,phase="farm",skipped={["2:1"]="placement not confirmed"},
+        deferred={["2:1"]={x=2,y=1,tries=0}}})
+    local saved=f.hooks.readPlantResume()
+    assert(saved.state.deferred["2:1"].x==2 and saved.state.deferred["2:1"].tries==0)
+    saved.state.deferred["2:1"].tries=2
+    f.hooks.savePlantResume(saved.state)
+    rejects(f.hooks.readPlantResume,"Invalid deferred planting tile")
+end)
+
+test("A second refusal from below is skipped without repeatedly spending seeds", function()
+    local f=rejectedUpperFixture()
+    local first=f.onPlant
+    f.onPlant=function(id,x,y)
+        first(id,x,y)
+        if x==2 and y==1 and f.lowerRetries then f.grids.FARM1[y][x],f.serverSeeds=0,f.serverSeeds+1 end
+    end
+    f.hooks.start("plant")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(f.lowerRetries==1 and #f.plantCalls==16 and f.app.stats.planted==14 and f.grids.FARM1[1][2]==0)
+end)
+
+test("A seed count change outside the attempted batch remains a critical failure", function()
+    local f=plantingFixture(10,100)
+    f.onPlant=function(_,x,y) f.serverSeeds=f.serverSeeds-2; f.grids.FARM1[y][x]=0 end
+    f.hooks.start("plant")
+    assert(f.app.lastError:find("Seed count changed unexpectedly",1,true))
+    assert(#f.plantCalls==1 and f.hooks.readPlantResume().state.pending)
+end)
+
+test("A rotation walking timeout replans from the current position and succeeds on its next attempt", function()
+    local f=plantingFixture(10,100)
+    f.app.job,f.app.rotationState="rotation",{phase="plant"}
+    local calls=0
+    f.hooks.moveTo(5,5,"FARM1",1,function()
+        calls=calls+1
+        if calls==1 then error("Returning to the saved position timed out. Check the route.") end
+    end)
+    assert(calls>1 and math.abs(f.avatar.x-5.5)<0.16 and f.app.job=="rotation")
+    assert(f.app.navigationRecovery:find("attempt 2/3",1,true) and #f.plantCalls==0)
 end)
 
 test("A picker interruption preserves and reconciles several outstanding moving seed placements", function()
@@ -3976,7 +4096,7 @@ test("A picker interruption preserves and reconciles several outstanding moving 
     for index, point in ipairs(f.plantCalls) do assert(point.x == index - 1) end
 end)
 
-test("A late foreground rollback during batch settling prevents another seed batch", function()
+test("A late foreground rollback retires its rejected tile and allows the next seed batch", function()
     local f = plantingFixture(20, 100)
     f.world.w = 12
     for y = 0, 7 do for x = 7, 11 do f.grids.FARM1[y][x] = y == 6 and 2 or 0 end end
@@ -3993,8 +4113,9 @@ test("A late foreground rollback during batch settling prevents another seed bat
         end
     end
     f.hooks.start("plant")
-    assert(corrected and f.app.lastError:find("changed while the action settled", 1, true))
-    assert(#f.plantCalls == 8 and f.app.stats.planted == 0 and #f.hooks.readPlantResume().state.pending.tiles == 8)
+    assert(corrected and not f.app.lastError,f.app.lastError)
+    assert(#f.plantCalls == 12 and f.app.stats.planted == 11 and f.hooks.readPlantResume()==nil)
+    assert(f.grids.FARM1[5][0]==0 and f.serverSeeds==9)
 end)
 
 test("A planting inventory timeout retains the batch instead of skipping a tile and spending more seeds", function()
@@ -4245,16 +4366,12 @@ test("Denied planting cells are skipped without consuming seeds or modifying obs
     assert(f.serverSeeds == 4 and table.concat(f.app.logs, "\n"):find("1 tiles skipped", 1, true))
 end)
 
-test("Server seed rejection stops at one attempt and can be safely reconciled before retry", function()
+test("Server seed refusals skip each tile once and leave the rest of the task running", function()
     local f = plantingFixture(10, 100)
     f.rejectPlant = true
     f.hooks.start("plant")
-    assert(f.app.lastError:find("did not confirm a planted seed", 1, true) and #f.plantCalls == 1)
-    local saved = f.hooks.readPlantResume()
-    assert(saved.state.pending.x == 0 and f.serverSeeds == 10 and f.app.stats.planted == 0)
-    f.rejectPlant = false
-    f.hooks.start("plant", saved)
-    assert(not f.app.lastError and f.app.stats.planted == 7 and f.serverSeeds == 3)
+    assert(not f.app.lastError,f.app.lastError)
+    assert(#f.plantCalls==7 and f.serverSeeds==10 and f.app.stats.planted==0 and f.hooks.readPlantResume()==nil)
 end)
 
 test("Stopping immediately after native planting prevents further planting and restores controls", function()
@@ -4321,12 +4438,13 @@ test("Planting checkpoints validate account, expiry, index, and pending placemen
     rejects(function() f.hooks.readPlantResume() end, "six hours")
 end)
 
-test("A consumed seed with missing tile evidence cannot be silently retried", function()
+test("A spent seed with missing tile evidence is logged and deferred without an immediate duplicate", function()
     local f = plantingFixture(9, 100)
     f.app.job, f.app.jobToken = "plant", 1
     local state = {worldIndex = 1, phase = "farm", skipped = {}, pending = {world = "FARM1", x = 0, y = 5, before = 10}}
-    rejects(function() f.hooks.reconcilePlant(state, 1) end, "Cannot reconcile")
-    assert(state.pending and #f.plantCalls == 0)
+    f.hooks.reconcilePlant(state,1)
+    assert(state.pending==nil and state.deferred["0:5"] and #f.plantCalls==0 and f.app.stats.planted==0)
+    assert(f.app.plantingRecovery:find("skipped 1",1,true))
 end)
 
 test("Full-world planting navigation reaches the row through a distant side corridor", function()
@@ -5088,6 +5206,53 @@ test("Full growing farms skip planting with seed stock available and run PNB whi
     assert(#f.plants == 0 and #f.harvests == 0 and f.pnbBlocks == 3)
     assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) == 200)
     assert(#f.entries == 2 and f.entries[1] == "FARM2" and f.entries[2] == "BREAK")
+end)
+
+test("Repeated transient walking timeouts keep rotation active and retry the saved phase after cooldown", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=200,FARM2=200})
+    local plan,calls,cooled=f.hooks.Navigation.plan,0,false
+    f.hooks.Navigation.plan=function(...)
+        calls=calls+1
+        if calls<=3 then error("Returning to the saved position timed out. Check the route.") end
+        return plan(...)
+    end
+    f.afterWait=function()
+        if f.app.navigationRecovery and f.app.navigationRecovery:find("Retrying rotation phase",1,true) then
+            cooled=true
+            assert(f.app.job=="rotation" and f.app.runToggles.rotation.Value)
+            assert(f.hooks.readRotationResume().state.phase=="waitPNB")
+        end
+        if f.pnbBlocks==1 then f.app:stop() end
+    end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(cooled and calls>3 and f.pnbBlocks==1 and #f.harvests==0)
+end)
+
+test("A refused planting tile leaves full rotation active and moves on to farm waiting", function()
+    local f=rotationFixture()
+    local plant,rejected,keptRunning=f.app.runtime.handlers.plantSeed,false,false
+    f.app.runtime.handlers.plantSeed=function(id,x,y)
+        plant(id,x,y)
+        if f.world.name=="FARM" and x==1 and not rejected then
+            rejected=true
+            f.world.fg[y][x],f.treeTimes.FARM[y*f.world.w+x]=0,nil
+            f.serverItems[id]=f.serverItems[id]+1
+        end
+    end
+    f.afterWait=function()
+        if f.app.stats.planted==9 and f.app.status:find("PNB block storage is empty",1,true) then
+            keptRunning=true
+            assert(f.app.job=="rotation" and f.app.runToggles.rotation.Value)
+            assert(f.hooks.readRotationResume().state.phase=="waitPNB")
+            f.app:stop()
+        end
+    end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(rejected and keptRunning and #f.plants==10 and f.app.stats.planted==9)
+    assert(f.grids.FARM[8][1]==0 and #f.harvests==0)
 end)
 
 test("Harvest deadlines interrupt PNB with blocks remaining and the cleared farm is replanted first", function()
