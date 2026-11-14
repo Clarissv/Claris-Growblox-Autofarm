@@ -5,7 +5,7 @@ local Core = {}
 Core.VERSION = 1
 Core.REPO = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/"
 Core.POINTS = { "pnb", "blockBox", "seedBox", "farmBox", "farmDoor", "breakDoor", "plantBox" }
-Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest", "harvestRespawn" }
+Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest", "harvestRespawn", "fpsBooster" }
 Core.LIMITS = {
     placeDelay = { 0.15, 2 }, punchDelay = { 0.22, 2 },
     collectDelay = { 0, 5 }, actionTimeout = { 5, 30 },
@@ -17,7 +17,7 @@ function Core.defaults()
         version = Core.VERSION, blockId = 0, points = {},
         options = { placeDelay = 0.2, punchDelay = 0.24, collectDelay = 0.1,
             actionTimeout = 10, moveTimeout = 30, seedThreshold = 200, antiAFK = true, autoRejoin = true,
-            moveAfterHarvest = false, harvestRespawn = true },
+            moveAfterHarvest = false, harvestRespawn = true, fpsBooster = false },
         webhook = { url = "", enabled = false, intervalMinutes = 5, includeBoxes = true,
             discordId = "", failureAlerts = true },
         planting = {seedId = 0, storageWorld = "", worlds = {}},
@@ -648,7 +648,7 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.26"
+local VERSION = "0.1.27"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -665,6 +665,7 @@ local PLANT_RESUME_FILE = ROOT .. "/plant-resume.json"
 local ROTATION_RESUME_FILE = ROOT .. "/rotation-resume.json"
 local saveRotationResume
 local queueWebhookEvent
+local restoreFPSBooster, pollFPSBooster
 local previousSession = env.ClarisGrowbloxApp
 
 if env.ClarisGrowbloxApp then
@@ -672,6 +673,7 @@ if env.ClarisGrowbloxApp then
     local previous = env.ClarisGrowbloxApp
     previous.alive = false
     previous.token = previous.token + 1
+    if previous.restoreFPSBooster then pcall(previous.restoreFPSBooster) end
     if previous.idleConnection then pcall(function() previous.idleConnection:Disconnect() end) end
     if previous.controls then
         local hold = previous.controls
@@ -732,6 +734,22 @@ local function saveSession()
     if signature == App.sessionSignature then return end
     writeJSON(SESSION_FILE, {version = 1, userId = player.UserId, config = config, profile = profile})
     App.sessionSignature, App.sessionSaveError = signature, nil
+end
+local function saveFPSPreference()
+    saveSession()
+    -- A queued resume reads its own configuration snapshot. Update only this
+    -- visual preference, preserving pending cargo, tile evidence and timestamps.
+    for _, path in ipairs({RESUME_FILE, PNB_RESUME_FILE, PLANT_RESUME_FILE, ROTATION_RESUME_FILE}) do
+        if exists(path) then
+            local record = decode(readfile(path))
+            if type(record) == "table" and record.active and record.userId == player.UserId
+                and record.profile == App.profile then
+                record.config = Core.validate(record.config)
+                record.config.options.fpsBooster = App.config.options.fpsBooster
+                writeJSON(path, record)
+            end
+        end
+    end
 end
 local function restoreSession(previous)
     local record
@@ -1323,7 +1341,9 @@ local function connectGame(options)
         App.connectionError = tostring(result)
         error(App.connectionError, 0)
     end
+    if restoreFPSBooster then restoreFPSBooster() end
     App.runtime = result
+    if pollFPSBooster then pollFPSBooster(true) end
     App.connectionError = nil
     return result
 end
@@ -1331,6 +1351,104 @@ end
 local function runtime()
     assert(App.runtime, App.connectionError or "The script has not attached to Growblox yet. Use Reconnect in Settings.")
     return App.runtime
+end
+-- Growblox's drops are 2D GUI sprites. Keep native frames alive for count,
+-- pickup and world cleanup, but detach loose sprites from the rendered GUI.
+-- Native visibility writes cannot reveal a detached frame; no per-frame hooks
+-- or property-change listeners are needed for thousands of drops.
+local function restoreDropVisual(frame, record)
+    if frame.Parent == nil then frame.Parent = record.parent end
+    if not record.drop.display then
+        if record.drop.inBlock == true then record.drop.inBlock = record.inBlock end
+        if record.pop and record.pop.Scale == 1 then record.pop.Scale = record.scale end
+    end
+end
+restoreFPSBooster = function()
+    local state = App.fpsState
+    App.fpsHidden = 0
+    if not state then return true end
+    local present = {}
+    local ok, drops = pcall(state.world.dropList)
+    if not ok or type(drops) ~= "table" then
+        App.fpsBoosterError = "Could not restore floating visuals: drop list unavailable."
+        return false
+    end
+    for _, drop in pairs(drops) do present[drop] = true end
+    local failed
+    for frame, record in pairs(state.records) do
+        if present[record.drop] and record.drop.frame == frame then
+            -- Removed drops have been destroyed by the native client. Never
+            -- recreate them or restore an old world's removed drop records.
+            local restored, issue = pcall(restoreDropVisual, frame, record)
+            if restored then state.records[frame] = nil else failed = tostring(issue) end
+        else state.records[frame] = nil end
+    end
+    if failed then App.fpsBoosterError = "Could not restore floating visuals: " .. failed; return false end
+    App.fpsState = nil
+    return true
+end
+App.restoreFPSBooster = restoreFPSBooster
+pollFPSBooster = function(force)
+    if not App.alive or not App.config.options.fpsBooster then
+        if restoreFPSBooster() then App.fpsBoosterError = nil end
+        return
+    end
+    local r = App.runtime
+    if not r or type(r.world.dropList) ~= "function" or App.fpsBusy then return end
+    if not force and os.clock() < (App.nextFPSScan or 0) then return end
+    App.fpsBusy = true
+    local ok, issue = pcall(function()
+        local state = App.fpsState
+        if not state or state.world ~= r.world then
+            assert(restoreFPSBooster(), App.fpsBoosterError)
+            state = {world = r.world, records = {}}
+            App.fpsState = state
+        end
+        local drops = r.world.dropList()
+        assert(type(drops) == "table", "Floating drop visuals are unavailable.")
+        local work, lastYield = 0, os.clock()
+        for _, drop in pairs(drops) do
+            work = work + 1
+            if work >= 512 or os.clock() - lastYield >= 0.006 then
+                task.wait()
+                if not App.alive or not App.config.options.fpsBooster or App.runtime ~= r or App.fpsState ~= state then return end
+                work, lastYield = 0, os.clock()
+            end
+            if type(drop) == "table" and type(drop.uid) == "number" and not drop.display and drop.frame then
+                local frame = drop.frame
+                if not state.records[frame] then
+                    local changed, value = pcall(function()
+                        local parent = frame.Parent
+                        if not parent then return end
+                        local pop = drop.pop
+                        local saved = {drop = drop, parent = parent, inBlock = drop.inBlock,
+                            pop = pop, scale = pop and pop.Scale}
+                        state.records[frame] = saved -- Track before mutating so a failure remains reversible.
+                        frame.Parent = nil
+                        drop.inBlock = true -- Native bobbing branch only; not pickup culling/access.
+                        if pop then pop.Scale = 1 end
+                    end)
+                    assert(changed, "Could not reduce floating drop visuals: " .. tostring(value))
+                end
+            end
+        end
+        -- Native pickups can remove/shift rows during the yielded scan. Re-read
+        -- membership before pruning so a missed row cannot lose its restore data.
+        local present, hidden = {}, 0
+        for _, drop in pairs(r.world.dropList()) do if type(drop) == "table" then present[drop] = true end end
+        for frame, record in pairs(state.records) do
+            if not present[record.drop] or record.drop.frame ~= frame then state.records[frame] = nil
+            elseif record.drop.display then
+                restoreDropVisual(frame, record)
+                state.records[frame] = nil
+            else hidden = hidden + 1 end
+        end
+        App.fpsHidden = hidden
+        App.nextFPSScan = os.clock() + 1
+    end)
+    App.fpsBusy = false
+    App.fpsBoosterError = not ok and tostring(issue) or nil
+    if not ok then restoreFPSBooster() end -- Visual failure must not interrupt a farming task.
 end
 local function position()
     local r = runtime()
@@ -3528,6 +3646,7 @@ function App:destroy()
     if not self.alive then return end
     self:stop()
     self.alive = false
+    restoreFPSBooster()
     if self.idleConnection then self.idleConnection:Disconnect(); self.idleConnection = nil end
     if self.window then pcall(function() self.window:Destroy() end) end
     if env.ClarisGrowbloxApp == self then env.ClarisGrowbloxApp = nil end
@@ -4070,6 +4189,7 @@ if env.ClarisGrowbloxTest then
         syncRunToggles = syncRunToggles, setRunningEnabled = setRunningEnabled,
         Navigation = Navigation, navigationMap = navigationMap, moveTo = moveTo, worldCheck = worldCheck,
         recoverPNB = recoverPNB, recoverable = recoverable, installAntiAFK = installAntiAFK,
+        pollFPSBooster = pollFPSBooster, restoreFPSBooster = restoreFPSBooster,
         savePNBResume = savePNBResume, readPNBResume = readPNBResume, refreshPNBCheckpoint = refreshPNBCheckpoint,
         webhookPayload = webhookPayload, setWebhookSetting = setWebhookSetting,
         resetWebhookSchedule = resetWebhookSchedule, sendWebhook = sendWebhook, pollWebhook = pollWebhook,
@@ -4409,6 +4529,7 @@ local function syncUI()
         updatePoints()
         resetWebhookSchedule()
         syncWebhookControls()
+        pollFPSBooster(true)
     end)
     App.syncingUI = previous
     if not ok then error(issue, 0) end
@@ -4638,18 +4759,25 @@ settingsTab:Paragraph({ Title = "Settings", Desc = "These settings are saved sep
 for _, info in ipairs({
     {"antiAFK", "Anti-AFK", "Keep the session active when Roblox detects idle time."},
     {"autoRejoin", "Rejoin world and return to PNB", "Re-enter the saved world from the world picker, then walk and jump back to the breaking spot."},
+    {"fpsBooster", "FPS booster: hide floating drops", "Hide loose blocks, seeds and gems and stop their bobbing. Collection continues; Display Boxes stay visible. Turn Off to restore visuals."},
 }) do
     local key = info[1]
     settingsControls[key] = settingsTab:Toggle({Title = info[2], Desc = info[3], Value = App.config.options[key],
         Callback = function(value)
             if App.syncingUI then return end
-            if App.job or App.configuring or App.pending > 0 then
+            if key ~= "fpsBooster" and (App.job or App.configuring or App.pending > 0) then
                 notify("Stop the task before changing settings.")
                 settingsControls[key]:Set(App.config.options[key], false, false)
                 return
             end
             App.config.options[key] = value
             if key == "antiAFK" and value then installAntiAFK() end
+            if key == "fpsBooster" then
+                pollFPSBooster(true)
+                local ok, issue = pcall(saveFPSPreference)
+                App.fpsSaveError = not ok and tostring(issue) or nil
+                if not ok then notify("Could not save the FPS booster setting: " .. tostring(issue)) end
+            end
         end})
 end
 local sliderInfo = {
@@ -4695,6 +4823,9 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nLoader: " .. (env.ClarisGrowbloxLoaderDebug or "direct script")
         .. "\nLast door: " .. (App.doorReadyDebug or "not used")
         .. "\nAnti-AFK: " .. (App.antiAFKError or "ready")
+        .. "\nFPS booster: " .. (App.config.options.fpsBooster and "On" or "Off")
+        .. "; hidden loose sprites: " .. (App.fpsHidden or 0) .. "; " .. (App.fpsBoosterError or "ready")
+        .. "\nFPS setting save: " .. (App.fpsSaveError or "ready")
         .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
         .. "\nLast refused harvest pickup: " .. (App.lastHarvestRefusal or "none")
         .. "\nHarvest storage return: " .. (App.harvestReturnDebug or "not requested")
@@ -4777,6 +4908,7 @@ task.spawn(function()
             App.recoverySaveError = not ok and tostring(issue) or nil
         end
         pollSession()
+        pollFPSBooster()
         pollWebhook()
         local suffix = "\nProfile: " .. App.profile .. "  |  Blocks broken: " .. App.stats.broken
             .. "  |  Trips: " .. App.stats.trips .. "  |  Blocks moved: " .. App.stats.moved

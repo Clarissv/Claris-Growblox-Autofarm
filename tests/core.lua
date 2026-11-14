@@ -154,6 +154,18 @@ test("Old profiles gain recovery settings and new profiles retain explicit choic
     assert(not saved.options.antiAFK and not saved.options.autoRejoin)
 end)
 
+test("FPS booster is optional in old profiles and portable when enabled", function()
+    local config = setup()
+    config.options.fpsBooster = nil
+    assert(Core.validate(config).options.fpsBooster == false)
+    config.options.fpsBooster = true
+    local record = Core.exportConfig(config, "FPS Farm", "0.1.27")
+    local imported = Core.importConfig(record)
+    assert(imported.options.fpsBooster == true)
+    config.options.fpsBooster = "yes"
+    rejects(function() Core.validate(config) end, "fpsBooster")
+end)
+
 test("Invalid anti-AFK or world-recovery values are rejected", function()
     local config = setup()
     config.options.antiAFK = "yes"

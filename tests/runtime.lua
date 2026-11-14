@@ -1032,6 +1032,210 @@ local function pickupFixture()
     return f
 end
 
+local function attachDropVisual(drop, parent)
+    local values = {Parent = parent, Visible = true, destroyed = false, parentWrites = 0}
+    local frame = setmetatable({}, {
+        __index = function(_, key)
+            if key == "Destroy" then return function()
+                values.destroyed, values.Parent = true, nil
+            end end
+            return values[key]
+        end,
+        __newindex = function(_, key, value)
+            if key == "Parent" then
+                assert(not values.destroyed, "A destroyed drop must never be reparented")
+                values.parentWrites = values.parentWrites + 1
+            end
+            values[key] = value
+        end,
+    })
+    drop.frame, drop.pop = frame, {Scale = 0.35}
+    return frame, values
+end
+
+test("FPS booster hides loose blocks, seeds and gems while preserving pickup data and displays", function()
+    local f, parent = pickupFixture(), {}
+    local original = {}
+    for index, id in ipairs({954, 955, 112, 954}) do
+        local drop = f.addDrop(index, id, 20, 10.5 + index, 8.5)
+        drop.readyAt, drop.refused, drop.culled, drop.armed = 2, 1, index == 1, true
+        if index == 4 then drop.display = {x = 12, y = 8} end
+        attachDropVisual(drop, parent)
+        original[index] = {uid = drop.uid, id = drop.id, n = drop.n, x = drop.x, y = drop.y,
+            readyAt = drop.readyAt, refused = drop.refused, culled = drop.culled, armed = drop.armed}
+    end
+    f.app.config.options.fpsBooster = true
+    f.hooks.pollFPSBooster(true)
+    assert(not f.app.fpsBoosterError and f.app.fpsHidden == 3 and #f.drops == 4 and #f.requests == 0)
+    for index, drop in ipairs(f.drops) do
+        for key, value in pairs(original[index]) do assert(drop[key] == value, "Do not change native pickup data") end
+        drop.frame.Visible = true -- Native visibility writes must not reveal hidden sprites.
+        assert(drop.frame.Parent == (index == 4 and parent or nil))
+        assert(drop.pop.Scale == (index == 4 and 0.35 or 1))
+    end
+    f.app.config.options.fpsBooster = false
+    f.hooks.pollFPSBooster(true)
+    for _, drop in ipairs(f.drops) do assert(drop.frame.Parent == parent and drop.inBlock == nil and drop.pop.Scale == 0.35) end
+    assert(f.app.fpsState == nil and f.app.fpsHidden == 0)
+end)
+
+test("FPS booster catches new drops on its bounded poll without rewriting existing frames", function()
+    local f, parent = pickupFixture(), {}
+    local first = f.addDrop(1, 954, 10)
+    local _, values = attachDropVisual(first, parent)
+    f.app.config.options.fpsBooster = true
+    f.hooks.pollFPSBooster(true)
+    local second = f.addDrop(2, 955, 10)
+    attachDropVisual(second, parent)
+    f.hooks.pollFPSBooster()
+    assert(second.frame.Parent == parent and values.parentWrites == 1)
+    task.wait(1.1)
+    f.hooks.pollFPSBooster()
+    assert(second.frame.Parent == nil and values.parentWrites == 1 and f.app.fpsHidden == 2)
+end)
+
+test("Hidden PNB blocks, seeds and gems still collect in partial batches without resurrecting frames", function()
+    local f, parent = pickupFixture(), {}
+    local frames = {}
+    for index, id in ipairs({954, 955, 112}) do
+        local drop = f.addDrop(index, id, 20)
+        frames[index] = attachDropVisual(drop, parent)
+    end
+    local taken = f.world.dropTaken
+    f.world.dropTaken = function(uid, remaining)
+        taken(uid, remaining)
+        if remaining == 0 then frames[uid]:Destroy() end
+    end
+    f.accept = function(_, want) return math.min(6, want) end
+    f.app.config.options.fpsBooster = true
+    f.hooks.pollFPSBooster(true)
+    f.collect()
+    assert(#f.drops == 0 and #f.requests > 3 and f.inventory:count(954) == 20 and f.inventory:count(955) == 20)
+    assert(f.app.stats.gems == 20 and f.serverGems == 120)
+    f.hooks.pollFPSBooster(true)
+    f.app.config.options.fpsBooster = false
+    f.hooks.pollFPSBooster(true)
+    assert(f.app.fpsState == nil and not f.app.fpsBoosterError)
+    for _, frame in ipairs(frames) do assert(frame.destroyed and frame.Parent == nil) end
+end)
+
+test("A large FPS scan yields and normal Stop retains the graphics setting", function()
+    local f, parent = pickupFixture(), {}
+    for uid = 1, 2000 do attachDropVisual(f.addDrop(uid, 954, 1), parent) end
+    f.app.config.options.fpsBooster = true
+    local before = f.waits or 0
+    f.onWait = function() f.onWait = nil; f.app:stop() end
+    f.hooks.pollFPSBooster(true)
+    assert(f.app.alive and f.app.config.options.fpsBooster and f.app.fpsHidden == 2000)
+    assert((f.waits or 0) - before >= 3 and (f.waits or 0) - before <= 4)
+    assert(#f.drops == 2000 and #f.requests == 0 and f.app.pending == 0)
+end)
+
+test("Unloading during a yielded FPS scan restores every detached frame", function()
+    local f, parent = pickupFixture(), {}
+    for uid = 1, 1200 do attachDropVisual(f.addDrop(uid, 954, 1), parent) end
+    f.app.config.options.fpsBooster = true
+    f.onWait = function() f.onWait = nil; f.app:destroy() end
+    f.hooks.pollFPSBooster(true)
+    assert(not f.app.alive and f.app.fpsState == nil and f.app.fpsHidden == 0)
+    for _, drop in ipairs(f.drops) do assert(drop.frame.Parent == parent and drop.inBlock == nil and drop.pop.Scale == 0.35) end
+end)
+
+test("Native list shifts during FPS polling cannot discard live frame restoration data", function()
+    local f, parent = pickupFixture(), {}
+    for uid = 1, 1025 do attachDropVisual(f.addDrop(uid, 954, 1), parent) end
+    f.app.config.options.fpsBooster = true
+    f.hooks.pollFPSBooster(true)
+    local removed
+    f.onWait = function()
+        f.onWait = nil
+        removed = table.remove(f.drops, 1)
+        removed.frame:Destroy()
+    end
+    f.hooks.pollFPSBooster(true)
+    assert(f.app.fpsHidden == 1024 and #f.drops == 1024)
+    f.app.config.options.fpsBooster = false
+    f.hooks.pollFPSBooster(true)
+    for _, drop in ipairs(f.drops) do assert(drop.frame.Parent == parent and drop.inBlock == nil) end
+    assert(removed.frame.destroyed and removed.frame.Parent == nil and not f.app.fpsBoosterError)
+end)
+
+test("FPS polling restores a loose sprite that becomes a Display Box sprite", function()
+    local f, parent = pickupFixture(), {}
+    local drop = f.addDrop(1, 954, 10)
+    attachDropVisual(drop, parent)
+    f.app.config.options.fpsBooster = true
+    f.hooks.pollFPSBooster(true)
+    drop.display, drop.inBlock = {x = 12, y = 8}, true
+    f.hooks.pollFPSBooster(true)
+    assert(drop.frame.Parent == parent and drop.inBlock and f.app.fpsHidden == 0)
+end)
+
+test("A visual write failure rolls back the booster without stopping farming or making requests", function()
+    local f, parent = pickupFixture(), {}
+    local drop = f.addDrop(1, 954, 10)
+    attachDropVisual(drop, parent)
+    drop.pop = setmetatable({}, {__index = function() return 0.35 end,
+        __newindex = function() error("Scale write denied") end})
+    f.app.config.options.fpsBooster = true
+    f.hooks.pollFPSBooster(true)
+    assert(f.app.fpsBoosterError:find("Scale write denied", 1, true) and f.app.job == "transfer" and f.app.alive)
+    assert(drop.frame.Parent == parent and drop.inBlock == nil and #f.requests == 0 and f.app.pending == 0)
+end)
+
+test("Script reload restores prior drop visuals and preserves the saved booster choice and progress", function()
+    local f, parent = pickupFixture(), {}
+    local drop = f.addDrop(1, 954, 10)
+    attachDropVisual(drop, parent)
+    f.app.config.options.fpsBooster = true
+    f.app.config.planting = {seedId = 955, storageWorld = "STOCK", worlds = {"FARM"}}
+    f.hooks.savePlantResume({worldIndex = 1, phase = "farm", skipped = {}})
+    f.hooks.pollFPSBooster(true)
+    local runtime, next = f.app.runtime, f.reload(true)
+    assert(drop.frame.Parent == parent and drop.inBlock == nil and next.App.config.options.fpsBooster)
+    assert(next.readPlantResume().state.worldIndex == 1)
+    next.App.runtime = runtime
+    next.pollFPSBooster(true)
+    assert(drop.frame.Parent == nil and next.App.fpsHidden == 1)
+    next.App.config.options.fpsBooster = false
+    next.pollFPSBooster(true)
+    assert(drop.frame.Parent == parent and not next.App.fpsBoosterError)
+end)
+
+test("FPS polling follows a same-server world change and restores only the new live drops", function()
+    local f, oldParent, newParent = pickupFixture(), {}, {}
+    local old = f.addDrop(1, 954, 10)
+    attachDropVisual(old, oldParent)
+    f.app.config.options.fpsBooster = true
+    f.hooks.pollFPSBooster(true)
+    old.frame:Destroy()
+    f.drops[1] = nil
+    f.world.name = "NEXT"
+    local current = f.addDrop(2, 955, 10)
+    attachDropVisual(current, newParent)
+    f.hooks.pollFPSBooster(true)
+    assert(current.frame.Parent == nil and f.app.fpsHidden == 1)
+    f.app.config.options.fpsBooster = false
+    f.hooks.pollFPSBooster(true)
+    assert(current.frame.Parent == newParent and old.frame.Parent == nil and not f.app.fpsBoosterError)
+end)
+
+test("An unavailable drop list preserves FPS restore records until cleanup can retry", function()
+    local f, parent = pickupFixture(), {}
+    local drop = f.addDrop(1, 954, 10)
+    attachDropVisual(drop, parent)
+    f.app.config.options.fpsBooster = true
+    f.hooks.pollFPSBooster(true)
+    local getter = f.world.dropList
+    f.world.dropList = function() error("World reload in progress") end
+    f.app.config.options.fpsBooster = false
+    f.hooks.pollFPSBooster(true)
+    assert(f.app.fpsState and f.app.fpsBoosterError and drop.frame.Parent == nil)
+    f.world.dropList = getter
+    f.hooks.pollFPSBooster(true)
+    assert(drop.frame.Parent == parent and f.app.fpsState == nil and not f.app.fpsBoosterError)
+end)
+
 test("Floating PNB drops are claimed by UID without walking or double credit", function()
     local f = pickupFixture()
     f.addDrop(101, 954, 12, 9.3, 7.1)
@@ -3556,6 +3760,29 @@ test("Actual UI startup limits seed entries, renders once, and supports a bounde
     seeds.Value = label
     seeds.Props.Callback(label)
     assert(app.config.planting.seedId == 10001 and app.config.points.farmDoor.world == "FARM")
+end)
+
+test("The FPS toggle applies during an active task and saves its choice without changing that task", function()
+    local f, app, controls = actualUIFixture()
+    local parent, drop = {}, {uid = 1, id = 954, n = 10, x = 5.5, y = 8.5}
+    f.drops[1] = drop
+    attachDropVisual(drop, parent)
+    app.job, app.jobToken, app.pending = "rotation", app.token, 1
+    local checkpoint = {version = 1, active = true, userId = f.player.UserId, profile = app.profile,
+        config = f.hooks.Core.validate(app.config), updatedAt = os.time() - 60,
+        state = {phase = "seedDepositPending", seedCargo = 10, cycle = 2, worldIndex = 1}}
+    f.files["ClarisGrowblox/rotation-resume.json"] = f.services.HttpService:JSONEncode(checkpoint)
+    local token = app.token
+    controls["FPS booster: hide floating drops"]:Set(true)
+    assert(app.config.options.fpsBooster and drop.frame.Parent == nil and app.fpsHidden == 1)
+    local session = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/session.json"])
+    assert(session.config.options.fpsBooster and app.job == "rotation" and app.token == token and app.pending == 1)
+    local restored = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/rotation-resume.json"])
+    assert(restored.config.options.fpsBooster and restored.updatedAt == checkpoint.updatedAt)
+    assert(restored.state.phase == "seedDepositPending" and restored.state.seedCargo == 10 and restored.state.cycle == 2)
+    controls["FPS booster: hide floating drops"]:Set(false)
+    assert(not app.config.options.fpsBooster and drop.frame.Parent == parent and app.job == "rotation" and app.pending == 1)
+    assert(not f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/rotation-resume.json"]).config.options.fpsBooster)
 end)
 
 test("Use PNB seeds updates the real UI after entering farms with Select-only WindUI dropdowns", function()

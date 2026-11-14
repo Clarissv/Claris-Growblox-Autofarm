@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.26.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.27.
+
+Version 0.1.27 adds **Settings → FPS booster: hide floating drops** for worlds with thousands of scattered items. It hides loose block, seed and gem sprites and stops their bobbing/pop visuals while keeping pickup data and Display Box contents available. New drops are handled during a yielded periodic scan. The toggle works during tasks, saves across supported world-change resumes, and restores surviving visuals when switched Off, unloaded or reloaded. Existing profiles default to Off.
 
 Version 0.1.26 speeds up connection discovery by indexing the GC snapshot once and checking only relevant candidates afterward. Lightweight scans retain their six-millisecond CPU budget with fewer forced frame waits. Planting now places seeds while walking each zigzag row, confirms up to eight seeds together, and briefly eases movement when needed to respect placement timing. Every attempted seed is saved before placement; interrupted batches reconcile from the backpack and all saved tiles. Missed or obstructed cells use precise movement as a fallback. These changes apply to standalone Planting and Full Rotation without changing saved setup.
 
@@ -153,6 +155,14 @@ After a release's first load, the loader reuses its validated main script and Wi
 
 An interrupted storage request leaves a `pickupPending`, `depositPending`, or `seedReturnPending` checkpoint. Check the backpack and both boxes before pressing **Clear saved transfer** and starting again. This avoids repeating a storage action whose result was lost. Normal Stop clears the automatic resume checkpoint; restarting starts a fresh task.
 
+## FPS booster for scattered drops
+
+Turn **Settings → FPS booster: hide floating drops** On when a farm has many floating items. Loose blocks, seeds and gems become invisible; their quantities and pickup positions remain available to automation. Display Boxes and the rest of the world stay visible. Harvest still collects the selected blocks and matching seeds; PNB still collects blocks, seeds and nearby gems.
+
+You can switch it while a task runs. The choice saves to the current session and matching saved task checkpoints, so queued world-change resumes retain it. Save your named profile too if you want the same choice when loading that profile; export/import carries the setting. Newly created drops are hidden on the periodic scan, roughly once per second. Normal Stop keeps the booster active. Turn it Off to see loose items for manual play, or unload the script to restore surviving drop visuals.
+
+**Copy diagnostics** includes the booster state, hidden sprite count and any visual/save errors. This reduces drawing and bobbing work; the native client still manages drop records and pickup processing, and the server still loads the world. The FPS gain on your device needs in-game verification.
+
 ## Set up Discord reports
 
 1. In Discord, open the destination channel's settings, choose **Integrations → Webhooks**, create a webhook, and copy its URL.
@@ -225,7 +235,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.26 passes 305 offline checks: 41 configuration/layout/storage tests, 256 generated-runtime tests against mock services/server, six generated-loader tests, and two release checks. New coverage verifies moving placements across a 32-tile row, placement cadence, at most eight inventory reads for that row, saved batches of at most eight seeds, delayed confirmations, partial rejection and safe resume, late tile corrections, inventory timeouts, multi-seed picker interruption, rotation reload recovery, and invalid saved batch evidence. Large discovery fixtures bound repeated scanning and forced frame waits while retaining ownership and ambiguity checks. Earlier rotation scheduling, world-change recovery, UI, webhook, export/import, harvesting, transfer, and navigation checks remain passing. These mocks do not establish live throughput, Discord delivery, clipboard behavior, tractor/server acceptance, Delta frame times, planting reach, route geometry, permissions, or teleport queue behavior.
+Version 0.1.27 passes 318 offline checks: 42 configuration/layout/storage tests, 268 generated-runtime tests against mock services/server, six generated-loader tests, and two release checks. New coverage verifies optional/portable FPS settings, hidden block/seed/gem collection with partial pickups, preserved Display Box and pickup data, new drops, bounded scans, Stop/unload/reload restoration, native list shifts, world changes, visual failures, and toggling during an active task without changing pending checkpoint cargo or timestamps. Earlier connection, moving planting, rotation recovery, UI, webhook, export/import, harvesting, transfer, and navigation checks remain passing. These mocks do not establish live FPS or throughput, Discord delivery, clipboard behavior, tractor/server acceptance, Delta frame times, planting reach, route geometry, permissions, or teleport queue behavior.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 

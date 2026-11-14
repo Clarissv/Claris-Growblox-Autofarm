@@ -1,6 +1,6 @@
 # Full Rotation guide
 
-For **Claris Growblox 0.1.26**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
+For **Claris Growblox 0.1.27**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
 
 The usual flow is **fill planting space → PNB while trees grow → harvest a ready farm → transfer its blocks and seeds → replant that farm → repeat**. Planting and ready harvests take priority over breaking. A full farm skips planting even when seed storage contains thousands of seeds.
 
@@ -155,6 +155,8 @@ From v0.1.26, planting places seeds while walking along that row. It uses the na
 
 Each attempted tile is saved before placement. After an interruption, rotation checks the saved batch against the live tiles and server seed count before continuing. Accepted seeds are counted once, empty unaccepted cells can be retried, and conflicting evidence pauses with a diagnostic. Older single-seed planting checkpoints remain supported. No new setup or toggle is required for moving planting.
 
+For worlds with many scattered drops, enable **Settings → FPS booster: hide floating drops**. It hides loose block, seed and gem sprites and stops their bobbing/pop visuals while automation keeps using their pickup data. Display Boxes remain visible. You can toggle it during rotation; it saves to the session and matching task checkpoints without changing pending cargo or progress, and applies after supported world-change resumes. Save the named profile to retain it when loading that profile or exporting to another device. New drops are hidden on a periodic scan, roughly once per second. Normal Stop keeps the boost active; switching it Off or unloading restores surviving visuals. Harvest's collection scope stays selected blocks and matching seeds; PNB also collects nearby gems. Live FPS improvement depends on the device and native client workload.
+
 - Planting skips rows without empty supported planting tiles.
 - Harvesting skips rows without ripe selected trees or matching drops to collect.
 - The next supported row may be more than one tile below the previous row.
@@ -274,6 +276,8 @@ Accounts can use the same webhook and ping the same Discord user; reports identi
 | Planting hook unavailable before starting | Farming hooks are deferred during the initial connection. They attach when Planting or Full Rotation starts. If task startup itself fails, copy diagnostics. |
 | Game connection still takes time after a reload | v0.1.26 indexes game objects once and reduces forced frame waits. Push the complete rebuilt release and rerun the loader. Copy diagnostics shows discovery time/yields/checks; executor GC/debug calls and world loading still affect startup. |
 | Planting pauses while crossing a row | Short batch-confirmation and timing pauses are expected. Check Delay after placement for a slow saved value. Obstacles or missed cells use precise movement. A failed batch confirmation pauses rather than continuing to spend seeds. |
+| Floating blocks, seeds and gems are invisible | FPS booster hides their visuals. Automation can still collect them. Turn it Off in Settings for manual play; Display Box contents stay visible. |
+| FPS remains low with many drops | Enable FPS booster and check Copy diagnostics for hidden sprite count/errors. Native drop processing and world loading still cost time; the booster does not remove server items. |
 | Missing farm box | Visit the exact named farm and save its reachable harvest box. Check every listed world. |
 | Full farm is not planting | Occupied tiles are intentionally skipped. Growing trees lead to PNB; ripe trees lead to harvest. |
 | Some trees are ripe but the farm is still growing | The maturity wait accounts for remaining matching growing trees too. |
