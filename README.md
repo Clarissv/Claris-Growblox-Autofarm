@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.15.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.16.
+
+Version 0.1.16 fixes Harvest Drops stopping for upper-row blocks while walking on the row below. After the server rejects distant pickup, navigation and collection stops require the native horizontal distance and vertical body overlap. A refusal during a row pass releases that stack for a precise approach instead of consuming all retries while holding off-center. Diagnostics include the rejected pickup's avatar position, distance to the drop, and overlap result. Session restore warnings now distinguish account mismatch from unsupported save schema and appear separately from save failures.
 
 Version 0.1.15 fixes trails of blocks left during a harvest pass. The player holds near a stack until its pickup replies finish and the stack is empty, including partial takes, pending drops, readiness delays, and clusters requiring more than eight requests. A full backpack still returns to storage and resumes collection. Straight row travel is retained between these collection stops. Pickup waiting has its own timeout and does not count as a failed movement step.
 
@@ -78,7 +80,7 @@ For an existing checkout with the GitHub remote configured, upload this rebuilt 
 ```powershell
 Set-Location -LiteralPath 'F:\VSCode\Luau\Claris Growblox Autofarm\logic'
 git add .
-git commit -m "Reduce startup discovery and seed menu work"
+git commit -m "Fix harvest pickup reach and refusal recovery"
 git push
 ```
 
@@ -111,7 +113,7 @@ Existing profiles and saved locations still work. Collect any drops remaining in
 
 Collection reads the current world's loose-drop list and targets only the selected block. It respects drop readiness, retry cooldowns, and backpack capacity. There is no identified server action to move loose drops directly into a Display Box, so collection and verified deposit are separate actions. If distant UID pickups are accepted, the script can stay at the box. If refused, it uses the collision-aware walking/jumping planner to get near the drops and returns to storage as needed. Live pickup reach determines which path is used.
 
-Pickup routes and walking returns to storage search the full world, including distant edge platforms and long open columns. Straight supported walking steps form a single run, with precise stops at destinations, turns, jumps, and landings. When close to a stack, the player holds position through server replies, partial takes, readiness delays, and additional batches until the stack is removed or the backpack fills. Pickup batches still respect cooldowns and capacity. Each harvest movement allows up to 90 seconds of travel; pickup waits have their own action timeout, reset on successful collection. Route search yields and checks for Stop or a world change. Keep the saved box and farm platforms reachable. A failed deposit retains the backpack blocks; an unreachable or repeatedly refused drop stops with its UID and coordinates. Automatic transport begins only after successful collection, including a short empty-list settling check. Expected storage respawns wait for a stable avatar and verify the backpack before depositing; an unexpected world change or respawn can interrupt collection. PNB's automatic rejoin remains specific to Place & Break. Pending accepted pickups still settle after Stop, so wait for requests before restarting collection. Tree cutting, seed collection, and gem collection remain manual for this task.
+Pickup routes and walking returns to storage search the full world, including distant edge platforms and long open columns. Straight supported walking steps form a single run, with precise stops at destinations, turns, jumps, and landings. After a distant pickup refusal, the chosen standing position must overlap the drop vertically and be less than 0.6 tiles away horizontally. When at a stack, the player holds position through server replies, partial takes, readiness delays, and additional batches until the stack is removed or the backpack fills. A refused route pickup leaves the stack for a precise approach before retrying. Pickup batches still respect cooldowns and capacity. Each harvest movement allows up to 90 seconds of travel; pickup waits have their own action timeout, reset on successful collection. Route search yields and checks for Stop or a world change. Keep the saved box and farm platforms reachable. A failed deposit retains the backpack blocks; an unreachable or repeatedly refused drop stops with its UID and coordinates. Automatic transport begins only after successful collection, including a short empty-list settling check. Expected storage respawns wait for a stable avatar and verify the backpack before depositing; an unexpected world change or respawn can interrupt collection. PNB's automatic rejoin remains specific to Place & Break. Pending accepted pickups still settle after Stop, so wait for requests before restarting collection. Tree cutting, seed collection, and gem collection remain manual for this task.
 
 ## Set up Moving Drops
 

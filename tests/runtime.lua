@@ -2144,13 +2144,55 @@ test("Dirt farm navigation descends through an open column beyond eight tiles", 
     assert(descended, "The route must descend a shaft rather than require jumping through dirt")
 end)
 
-test("Harvest pickup can stand two tiles below a floating block within native vertical reach", function()
+test("Extended pickup candidates remain available before server reach is known", function()
     local f = fixture()
     local map = {w = 8, h = 16, solid = function(_, y) return y == 11 end,
         platform = function() return false end}
     local goal, message = f.hooks.Navigation.pickupGoal(map, {x = 4.5, y = 10.999}, {x = 4.5, y = 8.5})
     assert(goal, message)
     assert(goal.x == 4 and goal.y == 10)
+end)
+
+test("Harvest walks onto an upper row instead of retrying its drops from the row below", function()
+    local f = harvestFixture()
+    harvestFloor(f)
+    f.app.runtime.items[102] = {platform = true}
+    for x = 4, 24 do f.world.fg[7][x] = 1 end
+    f.world.fg[8][3], f.world.fg[7][2] = 102, 102
+    local visited = attachPhysics(f, f.hooks.navigationMap(f.app.runtime))
+    f.addDrop(2089, 954, 20, 10.5, 6.5)
+    local refused = 0
+    f.accept = function(drop, want)
+        local overlap = math.abs(drop.x - f.avatar.x) < 0.6
+            and drop.y + 0.3 > f.avatar.y - 0.95 and drop.y - 0.3 < f.avatar.y
+        if not overlap then refused = refused + 1; return 0 end
+        return want
+    end
+    f.harvest()
+    assert(refused == 1, "The initial refusal must trigger movement rather than another lower-row pickup")
+    assert(visited["10:6"] and #f.drops == 0 and f.app.stats.stashed == 20)
+end)
+
+test("A route pickup refusal lets harvest recenter before retrying the stack", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    attachPhysics(f, map)
+    f.addDrop(1, 954, 20, 4.5, 8.5)
+    f.accept = function(drop, want)
+        return math.abs(drop.x - f.avatar.x) < 0.16 and want or 0
+    end
+    f.harvest()
+    assert(#f.drops == 0 and f.app.stats.stashed == 20)
+    assert(#f.requests <= 3, "Refused pickups must not consume three attempts at the same off-center position")
+end)
+
+test("Extended pickup candidates are excluded when native overlap is required", function()
+    local f = fixture()
+    local map = {w = 8, h = 16, solid = function(_, y) return y == 11 end,
+        platform = function() return false end}
+    local goal = f.hooks.Navigation.pickupGoal(map, {x = 4.5, y = 10.999}, {x = 4.5, y = 8.5},
+        {nativeOnly = true})
+    assert(not goal, "A drop two rows above the avatar does not overlap its body")
 end)
 
 test("Harvest pickup route search yields and honors cancellation during a distant detour", function()

@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.15"
+local VERSION = "0.1.16"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -87,8 +87,9 @@ local function restoreSession(previous)
         record = {version = 1, userId = player.UserId, config = previous.config, profile = previous.profile}
     elseif exists(SESSION_FILE) then record = decode(readfile(SESSION_FILE)) end
     if not record then return false end
-    assert(type(record) == "table" and record.version == 1 and record.userId == player.UserId,
-        "The saved session belongs to another account or script version.")
+    assert(type(record) == "table", "The saved session file is invalid.")
+    assert(record.version == 1, "Unsupported saved session schema: " .. tostring(record.version))
+    assert(record.userId == player.UserId, "The saved session belongs to another account.")
     App.config, App.profile = Core.validate(record.config), Core.profileName(record.profile)
     return true
 end
@@ -1050,6 +1051,7 @@ local function takeDropBatch(anchor, targets, attempts, retryAt, eligible, token
         local want = math.floor(math.min(drop.n, room, 65535))
         if want > 0 and present and eligible(drop) then
             local before, grid, uid, id = drop.n, r.world.fg, drop.uid, drop.id
+            local state = position()
             if id ~= 112 then reserved[id] = (reserved[id] or 0) + want end
             attempts[uid] = (attempts[uid] or 0) + 1
             drop.taking = true
@@ -1074,14 +1076,16 @@ local function takeDropBatch(anchor, targets, attempts, retryAt, eligible, token
                 assert(ok, tostring(result))
                 return result
             end)
-            table.insert(jobs, {request = request, uid = uid, id = id})
+            table.insert(jobs, {request = request, uid = uid, id = id,
+                avatarX = state.x, avatarY = state.y, dropX = drop.x, dropY = drop.y})
         end
     end
     local results = {}
     for _, job in ipairs(jobs) do
         local amount = awaitRequest(job.request, deadline, token)
         if amount > 0 then attempts[job.uid] = 0 end
-        table.insert(results, {uid = job.uid, id = job.id, amount = amount})
+        table.insert(results, {uid = job.uid, id = job.id, amount = amount,
+            avatarX = job.avatarX, avatarY = job.avatarY, dropX = job.dropX, dropY = job.dropY})
     end
     return results
 end
@@ -1188,6 +1192,8 @@ local function runHarvest(token)
         refreshInventory(token)
         local storedBefore = App.stats.stashed
         local attempts, retryAt, needsApproach, approached = {}, {}, {}, {}
+        local lastRefusal = {}
+        App.lastHarvestRefusal = nil
         local sweepRow, sweepX, sweepDirection
         local rangeLimited, emptySince = false, nil
         local deadline = os.clock() + App.config.options.actionTimeout
@@ -1197,16 +1203,35 @@ local function runHarvest(token)
                 and type(drop.x) == "number" and type(drop.y) == "number"
         end
         local function near(state, drop)
-            return math.abs(drop.x - state.x) <= 1.25
-                and drop.y >= state.y - 2.5 and drop.y <= state.y + 0.25
+            return Navigation.pickupOverlap(state, drop)
         end
-        local function applyResults(results)
+        local function checkAttempts(drop)
+            if (attempts[drop.uid] or 0) < 3 then return end
+            error("The server refused harvested drop uid " .. drop.uid .. " at " .. drop.x .. ", " .. drop.y
+                .. ". Last pickup: " .. tostring(lastRefusal[drop.uid])
+                .. ". Check pickup reach and access; copy diagnostics.")
+        end
+        local function applyResults(results, fromRoute)
             local accepted = false
             for _, result in ipairs(results) do
                 if result.amount > 0 then
                     accepted, needsApproach[result.uid] = true, nil
                 else
-                    rangeLimited, needsApproach[result.uid] = true, true
+                    rangeLimited = true
+                    local attemptState = {x = result.avatarX, y = result.avatarY}
+                    local attemptDrop = {x = result.dropX, y = result.dropY}
+                    lastRefusal[result.uid] = string.format("avatar %.2f, %.2f; delta %.2f, %.2f; overlap %s",
+                        result.avatarX, result.avatarY, result.dropX - result.avatarX, result.dropY - result.avatarY,
+                        tostring(near(attemptState, attemptDrop)))
+                    App.lastHarvestRefusal = "uid " .. result.uid .. " at " .. result.dropX .. ", " .. result.dropY
+                        .. "; " .. lastRefusal[result.uid]
+                    needsApproach[result.uid] = fromRoute or approached[result.uid] or nil
+                    for _, drop in pairs(r.world.dropList()) do
+                        if drop.uid == result.uid and near(position(), drop) then
+                            needsApproach[result.uid] = true
+                            break
+                        end
+                    end
                 end
                 approached[result.uid] = nil
             end
@@ -1222,7 +1247,8 @@ local function runHarvest(token)
             if r.inventory:room(id) <= 0 then return false end
             local focus, found = {}, false
             for _, drop in pairs(r.world.dropList()) do
-                if selected(drop) and near(state, drop) and math.abs(drop.x - state.x) <= 0.55 then
+                if selected(drop) and not needsApproach[drop.uid] and near(state, drop)
+                    and math.abs(drop.x - state.x) <= 0.55 then
                     focus[drop.uid], found = true, true
                 end
             end
@@ -1239,14 +1265,12 @@ local function runHarvest(token)
                 if r.inventory:room(id) <= 0 then return false end
                 local targets, remaining = {}, false
                 for _, drop in pairs(r.world.dropList()) do
-                    if selected(drop) and near(state, drop) then
+                    if selected(drop) and not needsApproach[drop.uid] and near(state, drop) then
                         if math.abs(drop.x - state.x) <= 0.55 then focus[drop.uid] = true end
                         if focus[drop.uid] then
                             remaining = true
                             retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
-                            assert((attempts[drop.uid] or 0) < 3,
-                                "The server refused harvested drop uid " .. drop.uid .. " at " .. drop.x .. ", " .. drop.y
-                                    .. ". Check pickup reach and access; copy diagnostics.")
+                            checkAttempts(drop)
                             if not drop.pending and not drop.taking
                                 and os.clock() >= math.max(drop.readyAt or 0, retryAt[drop.uid]) then
                                 table.insert(targets, drop)
@@ -1261,8 +1285,10 @@ local function runHarvest(token)
                     local results = takeDropBatch(box, targets, attempts, retryAt, function(drop)
                         return selected(drop) and focus[drop.uid] and not drop.pending and not drop.taking and near(position(), drop)
                     end, token, function(_, _, amount) App.stats.harvested = App.stats.harvested + amount end)
-                    if applyResults(results) then pickupDeadline = os.clock() + App.config.options.actionTimeout
+                    if applyResults(results, true) then pickupDeadline = os.clock() + App.config.options.actionTimeout
                     else pause(0.05, token) end
+                    -- A refusal leaves this UID for a precise approach after
+                    -- the row pass. Do not hold and exhaust retries here.
                 else pause(0.05, token) end
             end
         end
@@ -1355,9 +1381,7 @@ local function runHarvest(token)
                 end
                 local targets, nextDrop = {}, nil
                 for _, drop in ipairs(remaining) do
-                    assert((attempts[drop.uid] or 0) < 3,
-                        "The server refused harvested drop uid " .. drop.uid .. " at " .. drop.x .. ", " .. drop.y
-                            .. ". Check pickup reach and access; copy diagnostics.")
+                    checkAttempts(drop)
                     if ready(drop) then
                         nextDrop = nextDrop or drop
                         if eligible(drop) then table.insert(targets, drop) end
@@ -1367,29 +1391,11 @@ local function runHarvest(token)
                     setStatus("Collecting harvested " .. r.items[id].name .. "... " .. #remaining .. " loose drops remain.")
                     local results = takeDropBatch(box, targets, attempts, retryAt, eligible, token,
                         function(_, _, amount) App.stats.harvested = App.stats.harvested + amount end)
-                    local accepted = false
-                    for _, result in ipairs(results) do
-                        if result.amount > 0 then
-                            accepted = true
-                            needsApproach[result.uid] = nil
-                        else
-                            rangeLimited = true
-                            for _, drop in ipairs(remaining) do
-                                if drop.uid == result.uid then
-                                    needsApproach[result.uid] = near(state, drop) or approached[result.uid] or nil
-                                    break
-                                end
-                            end
-                        end
-                        approached[result.uid] = nil
-                    end
-                    if accepted then
-                        refreshInventory(token) -- One reconciliation for the entire pickup batch.
-                        deadline = os.clock() + App.config.options.actionTimeout
-                    else pause(0.05, token) end
+                    if not applyResults(results) then pause(0.05, token) end
                 elseif rangeLimited and nextDrop and (not near(state, nextDrop) or needsApproach[nextDrop.uid]) then
                     setStatus("Walking to harvested drop uid " .. nextDrop.uid .. "...")
                     local goal, message = Navigation.pickupGoal(navigationMap(r), state, nextDrop, {
+                        nativeOnly = true,
                         step = function() pause(0, token); worldCheck(box.world, token) end,
                     })
                     assert(goal, tostring(message) .. " Drop uid " .. nextDrop.uid .. " at " .. nextDrop.x .. ", " .. nextDrop.y)
@@ -1399,14 +1405,18 @@ local function runHarvest(token)
                     elseif (nextDrop.x - sweepX) * sweepDirection < -0.2 then
                         sweepDirection = -sweepDirection
                     end
-                    local edge = Navigation.rowEnd(navigationMap(r), goal, sweepDirection)
-                    for _, drop in ipairs(remaining) do
-                        local tileX = math.floor(drop.x)
-                        if math.floor(drop.y) == goal.y and (tileX - goal.x) * sweepDirection > 0
-                            and (edge - tileX) * sweepDirection >= 0 then goal.x = tileX end
+                    if not needsApproach[nextDrop.uid] then
+                        local edge = Navigation.rowEnd(navigationMap(r), goal, sweepDirection)
+                        for _, drop in ipairs(remaining) do
+                            local tileX = math.floor(drop.x)
+                            if math.floor(drop.y) == goal.y and (tileX - goal.x) * sweepDirection > 0
+                                and (edge - tileX) * sweepDirection >= 0 then goal.x = tileX end
+                        end
                     end
-                    moveTo(goal.x, goal.y, box.world, token, collectOnRoute)
-                    needsApproach[nextDrop.uid], approached[nextDrop.uid] = nil, true
+                    local finished = moveTo(goal.x, goal.y, box.world, token, collectOnRoute)
+                    if finished ~= false and near(position(), nextDrop) then
+                        needsApproach[nextDrop.uid], approached[nextDrop.uid] = nil, true
+                    end
                     deadline = os.clock() + App.config.options.actionTimeout
                     pause(0.03, token)
                 else
@@ -2734,8 +2744,10 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nConnection error: " .. (App.connectionError or "none")
         .. "\nAnti-AFK: " .. (App.antiAFKError or "ready")
         .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
+        .. "\nLast refused harvest pickup: " .. (App.lastHarvestRefusal or "none")
         .. "\nRecovery save: " .. (App.recoverySaveError or "ready")
-        .. "\nSession save: " .. (App.sessionSaveError or App.sessionRestoreError or "ready")
+        .. "\nSession save: " .. (App.sessionSaveError or "ready")
+        .. "\nSession restore: " .. (App.sessionRestoreError or "ready")
         .. "\nPlanting hook: " .. (App.runtime and App.runtime.handlers.plantSeed and "ready" or "unavailable")
         .. "\nStartup stage: " .. (App.startupStage or "Building interface")
         .. "\nSeed choices rendered: " .. (App.seedChoiceCount or 0)

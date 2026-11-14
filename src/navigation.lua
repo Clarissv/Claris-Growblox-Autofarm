@@ -171,6 +171,13 @@ function Navigation.plan(map, start, goal, options)
     return nil, "No walking/jumping route reaches the saved spot. Check door access and stepping platforms."
 end
 
+function Navigation.pickupOverlap(state, drop)
+    -- Native loose-drop collection tests horizontal distance and body overlap.
+    -- state.y is the avatar's feet, not the center of its standing tile.
+    return math.abs(drop.x - state.x) < 0.6
+        and drop.y + 0.3 > state.y - 0.95 and drop.y - 0.3 < state.y
+end
+
 function Navigation.pickupGoal(map, state, drop, options)
     options = options or {}
     local search = {fullWorld = true, maxNodes = math.min(12000, map.w * map.h), step = options.step}
@@ -182,6 +189,7 @@ function Navigation.pickupGoal(map, state, drop, options)
             if x >= 0 and x < map.w and y >= 0 and y < map.h - 1
                 and math.abs(drop.x - (x + 0.5)) <= 1.25
                 and drop.y >= y - 1.5 and drop.y <= y + 1.25
+                and (not options.nativeOnly or Navigation.pickupOverlap({x = x + 0.5, y = y + 1}, drop))
                 and not map.solid(x, y) and not (map.danger and map.danger(x, y))
                 and not (map.danger and map.danger(x, y + 1))
                 and (map.solid(x, y + 1) or (map.platform and map.platform(x, y + 1))) then
