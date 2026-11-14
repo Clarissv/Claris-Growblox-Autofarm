@@ -191,16 +191,37 @@ function Core.plantingTile(world, items, x, y)
     return below ~= nil and (below.solid == true or below.platform == true)
 end
 
-function Core.plantingTiles(world, items)
-    local tiles, rows = {}, 0
+function Core.farmRows(world, items)
+    local rows = {}
     for y = 0, world.h - 2 do
-        local row = {}
+        local row = {y = y, count = 0}
         for x = 0, world.w - 1 do
-            if Core.plantingTile(world, items, x, y) then table.insert(row, {x = x, y = y}) end
+            local below = items[world.fg[y + 1] and world.fg[y + 1][x] or 0]
+            if below and (below.solid == true or below.platform == true) then
+                local tile = items[world.fg[y] and world.fg[y][x] or 0]
+                if not tile or not tile.solid or tile.kind == "seed" then
+                    row.left, row.right, row.count = row.left or x, x, row.count + 1
+                end
+            end
         end
-        if #row > 0 then
-            rows = rows + 1
-            for n = 1, #row do table.insert(tiles, row[rows % 2 == 1 and n or #row - n + 1]) end
+        if row.count > 0 then table.insert(rows, row) end
+    end
+    local wide = {}
+    for _, row in ipairs(rows) do if row.count >= 3 then table.insert(wide, row) end end
+    -- A farm with long rows can also contain individual boxes or stepping stones.
+    -- Those supports do not constitute another farm row or reverse its direction.
+    if #wide >= 2 then rows = wide end
+    for index, row in ipairs(rows) do row.direction = index % 2 == 1 and 1 or -1 end
+    return rows
+end
+
+function Core.plantingTiles(world, items, rows)
+    local tiles = {}
+    for index, row in ipairs(rows or Core.farmRows(world, items)) do
+        local direction = index % 2 == 1 and 1 or -1
+        local first, last = direction == 1 and row.left or row.right, direction == 1 and row.right or row.left
+        for x = first, last, direction do
+            if Core.plantingTile(world, items, x, row.y) then table.insert(tiles, {x = x, y = row.y}) end
         end
     end
     return tiles

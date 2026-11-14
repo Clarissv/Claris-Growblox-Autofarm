@@ -304,4 +304,31 @@ test("Supported planting rows alternate direction despite unequal row spacing", 
     assert(tiles[4].y == 3 and tiles[4].x == 2 and tiles[6].x == 0)
 end)
 
+test("A filled upper row does not reverse the next row after a seed refill", function()
+    local world = {w = 5, h = 6, fg = {}}
+    local items = {[0] = {}, [2] = {solid = true}, [955] = {kind = "seed"}}
+    for y = 0, 5 do world.fg[y] = {}; for x = 0, 4 do world.fg[y][x] = 0 end end
+    for x = 0, 4 do world.fg[1][x], world.fg[4][x] = 2, 2 end
+    local rows = Core.farmRows(world, items)
+    for x = 0, 4 do world.fg[0][x] = 955 end
+    world.fg[3][4] = 955
+    local tiles = Core.plantingTiles(world, items, rows)
+    assert(#tiles == 4 and tiles[1].y == 3 and tiles[1].x == 3 and tiles[4].x == 0)
+    assert(Core.plantingTiles(world, items)[1].x == 3)
+end)
+
+test("Solid walls and isolated box roofs do not reverse long farm rows", function()
+    local world = {w = 7, h = 8, fg = {}}
+    local items = {[0] = {}, [2] = {solid = true}, [1422] = {solid = true, display = true}}
+    for y = 0, 7 do world.fg[y] = {}; for x = 0, 6 do world.fg[y][x] = 0 end end
+    for x = 1, 5 do world.fg[2][x], world.fg[6][x] = 2, 2 end
+    for y = 0, 6 do world.fg[y][0] = 2 end
+    world.fg[4][6] = 1422
+    local rows = Core.farmRows(world, items)
+    assert(#rows == 2 and rows[1].y == 1 and rows[2].y == 5)
+    assert(rows[1].left == 1 and rows[2].direction == -1)
+    local tiles = Core.plantingTiles(world, items, rows)
+    assert(#tiles == 10 and tiles[1].x == 1 and tiles[6].x == 5 and tiles[6].y == 5)
+end)
+
 return string.format("%d configuration/layout/storage tests passed", passed)

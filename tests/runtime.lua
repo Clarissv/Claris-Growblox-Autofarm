@@ -1963,6 +1963,55 @@ test("Straight walking segments merge without merging turns, jumps, or falls", f
     assert(#route == 6 and route[1].x == 3)
 end)
 
+test("The movement follower descends one farm row around its edge platform", function()
+    for _, side in ipairs({-1, 1}) do
+        local f = fixture()
+        f.world.w, f.world.h = 12, 10
+        local map = {w = 12, h = 10,
+            solid = function(x, y) return y == 9 or (y == 3 or y == 5 or y == 7) and x >= 2 and x <= 9 end,
+            platform = function(x, y) return (x == 1 or x == 10) and (y == 3 or y == 5 or y == 7) end}
+        f.app.runtime.body.solidAt = map.solid
+        f.app.runtime.items[102] = {platform = true}
+        f.world.fg = {}
+        for y = 0, 9 do
+            f.world.fg[y] = {}
+            for x = 0, 11 do f.world.fg[y][x] = map.platform(x, y) and 102 or map.solid(x, y) and 2 or 0 end
+        end
+        local x = side == -1 and 1 or 10
+        f.avatar.x, f.avatar.y, f.app.job = x + 0.5, 2.999, "harvest"
+        local route, issue = f.hooks.Navigation.plan(map, {x = x, y = 2}, {x = x, y = 4}, {fullWorld = true})
+        assert(route and #route == 1 and route[1].drop, issue or "A platform descent must be one direct edge")
+        local visited = attachPhysics(f, map)
+        f.hooks.moveTo(x, 4, "BREAK", 1)
+        assert(visited[x .. ":4"] and math.abs(f.avatar.x - (x + 0.5)) < 0.16)
+        assert(f.avatar.y < 5.1, "The descent must land on the next row instead of falling to the bottom")
+    end
+end)
+
+test("Stopping during a platform descent cancels steering and restores the native controls", function()
+    local f = fixture()
+    f.world.w, f.world.h = 12, 10
+    f.app.runtime.items[102] = {platform = true}
+    local map = {w = 12, h = 10,
+        solid = function(x, y) return y == 9 or (y == 3 or y == 5) and x >= 2 and x <= 9 end,
+        platform = function(x, y) return (x == 1 or x == 10) and (y == 3 or y == 5) end}
+    f.app.runtime.body.solidAt, f.world.fg = map.solid, {}
+    for y = 0, 9 do
+        f.world.fg[y] = {}
+        for x = 0, 11 do f.world.fg[y][x] = map.platform(x, y) and 102 or map.solid(x, y) and 2 or 0 end
+    end
+    f.avatar.x, f.avatar.y, f.app.job = 1.5, 2.999, "harvest"
+    local dir, jump = f.controls.dir, f.controls.jumping
+    attachPhysics(f, map)
+    local physics, stopped = f.onWait, false
+    f.onWait = function(dt)
+        physics(dt)
+        if f.avatar.y > 3.02 then stopped = true; f.app:stop() end
+    end
+    rejects(function() f.hooks.moveTo(1, 4, "BREAK", 1) end, "Stopped")
+    assert(stopped and f.app.controls == nil and f.controls.dir == dir and f.controls.jumping == jump)
+end)
+
 test("A long straight movement keeps heading without braking and reversing at each tile", function()
     local f = fixture()
     local map = {w=30,h=20,solid=function(_,y) return y>=9 end,platform=function() return false end}
@@ -2277,8 +2326,71 @@ test("Harvest walks onto an upper row instead of retrying its drops from the row
         return want
     end
     f.harvest()
-    assert(refused == 1, "The initial refusal must trigger movement rather than another lower-row pickup")
+    assert(refused == 0, "The farm route must reach the upper row before requesting its drops")
     assert(visited["10:6"] and #f.drops == 0 and f.app.stats.stashed == 20)
+end)
+
+local function zigzagHarvestFixture()
+    local f = harvestFixture()
+    f.world.w, f.world.h = 16, 11
+    harvestFloor(f)
+    f.app.runtime.items[102] = {platform = true}
+    for _, y in ipairs({3, 5, 7}) do
+        for x = 1, 14 do f.world.fg[y][x] = (x == 1 or x == 14) and 102 or 2 end
+    end
+    f.app.runtime.body.solidAt = function(x, y)
+        if x < 0 or x >= f.world.w or y >= f.world.h then return true end
+        local item = f.app.runtime.items[f.world.fg[y] and f.world.fg[y][x] or 0]
+        return item and item.solid == true or false
+    end
+    f.visited = attachPhysics(f, f.hooks.navigationMap(f.app.runtime))
+    f.accepted, f.respawns = {}, 0
+    f.accept = function(drop, want)
+        assert(f.hooks.Navigation.pickupOverlap(f.avatar, drop), "Farm pickups must overlap the avatar on the correct row")
+        f.accepted[#f.accepted + 1] = drop.uid
+        return want
+    end
+    f.app.runtime.respawn = function()
+        assert(f.app.pending == 1)
+        f.respawns = f.respawns + 1
+        f.avatar.x, f.avatar.y, f.avatar.vx, f.avatar.vy = 10.5, 8.999, 0, 0
+    end
+    return f
+end
+
+test("Harvest follows top-left zigzag rows and lands at both platform edges", function()
+    local f = zigzagHarvestFixture()
+    for row = 1, 3 do
+        for column, x in ipairs({2, 7, 13}) do f.addDrop(row * 10 + column, 954, 5, x + 0.5, row * 2 + 0.5) end
+    end
+    f.harvest()
+    assert(table.concat(f.accepted, ",") == "11,12,13,23,22,21,31,32,33", table.concat(f.accepted, ","))
+    for _, tile in ipairs({"1:2", "14:2", "14:4", "1:4", "1:6", "14:6"}) do
+        assert(f.visited[tile], "The zigzag must visit " .. tile)
+    end
+    assert(#f.drops == 0 and f.app.stats.stashed == 45 and f.respawns == 1)
+end)
+
+test("A full harvest backpack returns to its current row after respawn without skipping a partial stack", function()
+    local f = zigzagHarvestFixture()
+    f.addDrop(11, 954, 10, 2.5, 2.5)
+    f.addDrop(12, 954, 250, 7.5, 2.5)
+    f.addDrop(13, 954, 10, 13.5, 2.5)
+    f.addDrop(21, 954, 10, 2.5, 4.5)
+    f.addDrop(23, 954, 10, 13.5, 4.5)
+    f.harvest()
+    assert(table.concat(f.accepted, ",") == "11,12,12,13,23,21", table.concat(f.accepted, ","))
+    assert(#f.drops == 0 and f.app.stats.stashed == 290 and f.respawns == 2)
+    assert(f.deposits[1] == 200 and f.deposits[2] == 90 and f.app.pending == 0)
+end)
+
+test("An empty upper harvest row retains the next row's right-to-left direction", function()
+    local f = zigzagHarvestFixture()
+    f.addDrop(21, 954, 10, 2.5, 4.5)
+    f.addDrop(23, 954, 10, 13.5, 4.5)
+    f.harvest()
+    assert(table.concat(f.accepted, ",") == "23,21")
+    assert(f.visited["1:2"] and f.visited["14:2"] and f.visited["14:4"])
 end)
 
 test("A route pickup refusal lets harvest recenter before retrying the stack", function()
@@ -2580,6 +2692,81 @@ local function plantingFixture(seedCount, stockCount, worlds)
     installToggles(f)
     return f
 end
+
+local function zigzagPlantingFixture(seeds, worlds)
+    local f = plantingFixture(seeds, 100, worlds)
+    f.app.runtime.items[102] = {platform = true}
+    local grid = f.grids.FARM1
+    for y = 0, 7 do
+        for x = 0, 6 do
+            grid[y][x] = (y == 2 or y == 4 or y == 6) and x >= 1 and x <= 5
+                and ((x == 1 or x == 5) and 102 or 2) or 0
+        end
+    end
+    f.avatar.x, f.avatar.y = 3.5, 5.999
+    f.controls.dir, f.controls.jumping = function() return 0 end, function() return false end
+    f.onEnter = function(name)
+        if name == "FARM1" then f.avatar.x, f.avatar.y = 3.5, 5.999 end
+        return true
+    end
+    return f
+end
+
+test("Planting follows both platform turns and retains zigzag order after a completed row refill", function()
+    local f = zigzagPlantingFixture(5, {"FARM1", "FARM2"})
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(#f.plantCalls == 22 and f.withdrawals == 1)
+    for index, point in ipairs(f.plantCalls) do
+        if index <= 15 then
+            local row, column = math.floor((index - 1) / 5) + 1, (index - 1) % 5 + 1
+            assert(point.y == row * 2 - 1 and point.x == (row % 2 == 1 and column or 6 - column),
+                "Wrong zigzag placement at " .. index .. ": " .. point.x .. ", " .. point.y)
+        else assert(point.world == "FARM2" and point.x == index - 16, "A new farm must restart from the left") end
+    end
+end)
+
+test("A planting picker interruption after the top row preserves the next row direction", function()
+    local f = zigzagPlantingFixture(20)
+    f.onPlant = function()
+        if #f.plantCalls == 5 then f.onPlant = nil; f.world.name, f.avatar.active = "", false end
+    end
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(#f.plantCalls == 15 and f.plantCalls[6].x == 5 and f.plantCalls[6].y == 3)
+    assert(f.plantCalls[11].x == 1 and f.plantCalls[11].y == 5)
+end)
+
+test("An occupied solid edge does not prevent planting the rest of its row", function()
+    local f = zigzagPlantingFixture(20)
+    f.grids.FARM1[1][1] = 2
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(#f.plantCalls == 14 and f.plantCalls[1].x == 2 and f.plantCalls[1].y == 1)
+    assert(f.plantCalls[5].x == 5 and f.plantCalls[5].y == 3 and f.grids.FARM1[1][1] == 2)
+end)
+
+test("Saved planting rows survive reload and reject changed order or an unrelated row cursor", function()
+    local f = zigzagPlantingFixture(20)
+    local rows = f.hooks.Core.farmRows(f.world, f.app.runtime.items)
+    f.hooks.savePlantResume({worldIndex = 1, phase = "farm", skipped = {}, rows = rows, rowY = 1})
+    rows[1].left = 4
+    local next = f.reload()
+    local saved = next.readPlantResume()
+    assert(saved.state.rows[1].left == 1 and #saved.state.rows == 3 and saved.state.rowY == 1)
+    saved.state.rows[2].y = 1
+    next.savePlantResume(saved.state)
+    rejects(next.readPlantResume, "farm row order")
+    saved.state.rows[2].y, saved.state.rowY = 3, 2
+    next.savePlantResume(saved.state)
+    rejects(next.readPlantResume, "planting row")
+    saved.state.rowY, saved.state.rows = nil, {[2] = saved.state.rows[2]}
+    next.savePlantResume(saved.state)
+    -- The public writer canonicalizes arrays; damaged persisted arrays must still reject.
+    local record = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/plant-resume.json"])
+    record.state.rows = {[2] = {y = 3, left = 1, right = 5}}
+    rejects(next.readPlantResume, "farm row list")
+end)
 
 test("Planting walks to empty supported cells while skipping doors, vents, trees, and floating corners", function()
     local f = plantingFixture(20, 100)

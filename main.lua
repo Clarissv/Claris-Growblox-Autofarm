@@ -193,16 +193,37 @@ function Core.plantingTile(world, items, x, y)
     return below ~= nil and (below.solid == true or below.platform == true)
 end
 
-function Core.plantingTiles(world, items)
-    local tiles, rows = {}, 0
+function Core.farmRows(world, items)
+    local rows = {}
     for y = 0, world.h - 2 do
-        local row = {}
+        local row = {y = y, count = 0}
         for x = 0, world.w - 1 do
-            if Core.plantingTile(world, items, x, y) then table.insert(row, {x = x, y = y}) end
+            local below = items[world.fg[y + 1] and world.fg[y + 1][x] or 0]
+            if below and (below.solid == true or below.platform == true) then
+                local tile = items[world.fg[y] and world.fg[y][x] or 0]
+                if not tile or not tile.solid or tile.kind == "seed" then
+                    row.left, row.right, row.count = row.left or x, x, row.count + 1
+                end
+            end
         end
-        if #row > 0 then
-            rows = rows + 1
-            for n = 1, #row do table.insert(tiles, row[rows % 2 == 1 and n or #row - n + 1]) end
+        if row.count > 0 then table.insert(rows, row) end
+    end
+    local wide = {}
+    for _, row in ipairs(rows) do if row.count >= 3 then table.insert(wide, row) end end
+    -- A farm with long rows can also contain individual boxes or stepping stones.
+    -- Those supports do not constitute another farm row or reverse its direction.
+    if #wide >= 2 then rows = wide end
+    for index, row in ipairs(rows) do row.direction = index % 2 == 1 and 1 or -1 end
+    return rows
+end
+
+function Core.plantingTiles(world, items, rows)
+    local tiles = {}
+    for index, row in ipairs(rows or Core.farmRows(world, items)) do
+        local direction = index % 2 == 1 and 1 or -1
+        local first, last = direction == 1 and row.left or row.right, direction == 1 and row.right or row.left
+        for x = first, last, direction do
+            if Core.plantingTile(world, items, x, row.y) then table.insert(tiles, {x = x, y = row.y}) end
         end
     end
     return tiles
@@ -256,12 +277,23 @@ function Navigation.steer(dx, vx, braking)
     return dx > 0 and 1 or -1
 end
 
+function Navigation.dropSteer(state, step)
+    local target = step.x + 0.5
+    if state.y <= step.fromY + 1.02 then
+        target = step.outsideX
+        local side = step.outsideX > step.fromX + 0.5 and 1 or -1
+        -- Leave the edge slowly enough to reverse in the air before the next row.
+        if (state.vx or 0) * side > 1.4 then return 0 end
+    end
+    return Navigation.steer(target - state.x, state.vx or 0, state.grounded and 48 or 17)
+end
+
 function Navigation.straightRuns(route)
     local runs = {}
     for _, step in ipairs(route) do
         local last = runs[#runs]
         local direction = step.x - step.fromX
-        if last and not last.jump and not step.jump and step.y == step.fromY
+        if last and not last.jump and not step.jump and not last.drop and not step.drop and step.y == step.fromY
             and last.y == last.fromY and last.y == step.y and last.x == step.fromX
             and last.x - last.fromX == direction * #last.edges
             and math.abs(direction) == 1 then
@@ -269,7 +301,7 @@ function Navigation.straightRuns(route)
             table.insert(last.edges, step)
         else
             table.insert(runs, {x = step.x, y = step.y, fromX = step.fromX, fromY = step.fromY,
-                jump = step.jump, duration = step.duration, edges = {step}})
+                jump = step.jump, drop = step.drop, outsideX = step.outsideX, duration = step.duration, edges = {step}})
         end
     end
     return runs
@@ -366,6 +398,40 @@ function Navigation.plan(map, start, goal, options)
             if feet > maxY + 2 then return nil end
         end
     end
+    local function platformDrop(from, to, side)
+        local x, feet, vx, vy = from.x + 0.5, from.y + 1, 0, 0
+        local outsideX, targetX = x + side * 0.9, to.x + 0.5
+        local grounded, landed, dt, direction = true, false, 0.005, 0
+        local waypoint = {x = to.x, fromX = from.x, fromY = from.y, outsideX = outsideX}
+        for step = 1, math.ceil((3 + (to.y - from.y) / 24) / dt) do
+            if (step - 1) % 5 == 0 then
+                direction = Navigation.dropSteer({x = x, y = feet, vx = vx, grounded = grounded}, waypoint)
+            end
+            local desired = direction * speed
+            local acceleration = direction == 0 and (grounded and 48 or 17) or (grounded and 36 or 22)
+            if vx < desired then vx = math.min(desired, vx + acceleration * dt)
+            else vx = math.max(desired, vx - acceleration * dt) end
+            local nextX = x + vx * dt
+            if fits(nextX, feet) then x = nextX else vx = 0 end
+            vy = math.min(24, vy + gravity * dt)
+            local nextFeet, supported = feet + vy * dt, false
+            for row = math.ceil(feet - 0.001), math.floor(nextFeet + 0.001) do
+                if support(math.floor(x - 0.299), row) or support(math.floor(x + 0.299), row) then
+                    if row ~= from.y + 1 and row ~= to.y + 1 then return nil end
+                    feet, vy, supported = row - 0.001, 0, true
+                    if row == to.y + 1 then landed = true end
+                    break
+                end
+            end
+            grounded = supported
+            if not supported then
+                if not fits(x, nextFeet) then return nil end
+                feet = nextFeet
+            end
+            if landed and math.abs(x - targetX) < 0.16 and math.abs(vx) < 0.8 then return step * dt, outsideX end
+            if feet > to.y + 1.3 then return nil end
+        end
+    end
     local function estimate(x, y) return (math.abs(x - goal.x) + math.abs(y - goal.y) * 0.6) / speed end
     local initial = {x = start.x, y = start.y, cost = 0, score = estimate(start.x, start.y)}
     local open, best, closed = {initial}, {[key(start.x, start.y)] = initial}, {}
@@ -380,6 +446,7 @@ function Navigation.plan(map, start, goal, options)
                 local route = {}
                 while node.parent do
                     table.insert(route, 1, {x = node.x, y = node.y, jump = node.jump,
+                        drop = node.drop, outsideX = node.outsideX,
                         fromX = node.parent.x, fromY = node.parent.y, duration = node.duration})
                     node = node.parent
                 end
@@ -387,21 +454,34 @@ function Navigation.plan(map, start, goal, options)
             end
             closed[nodeKey], expansions = true, expansions + 1
             if options.step and expansions % 64 == 0 then options.step() end
-            local function offer(x, y, jumping)
+            local function offer(x, y, jumping, dropSide)
                 if not standable(x, y) then return end
                 local destinationKey = key(x, y)
                 local edgeKey = nodeKey .. ":" .. destinationKey .. ":" .. tostring(jumping)
                 if closed[destinationKey] or (options.banned and options.banned[edgeKey]) then return end
-                local duration
-                if not jumping and y == node.y then duration = 1 / speed
+                local duration, outsideX
+                if dropSide then duration, outsideX = platformDrop(node, {x = x, y = y}, dropSide)
+                elseif not jumping and y == node.y then duration = 1 / speed
                 else duration = travel(node, {x = x, y = y}, jumping) end
                 if not duration then return end
                 local cost = node.cost + duration + (jumping and 0.12 or 0)
                 if not best[destinationKey] or cost < best[destinationKey].cost then
                     local nextNode = {x = x, y = y, cost = cost, score = cost + estimate(x, y),
-                        parent = node, jump = jumping, duration = duration}
+                        parent = node, jump = jumping, drop = dropSide ~= nil, outsideX = outsideX, duration = duration}
                     best[destinationKey] = nextNode
                     table.insert(open, nextNode)
+                end
+            end
+            if map.platform and map.platform(node.x, node.y + 1) and not solid(node.x, node.y + 1) then
+                for _, side in ipairs({-1, 1}) do
+                    local outside = node.x + side
+                    if outside >= 0 and outside < map.w and not support(outside, node.y + 1)
+                        and not solid(outside, node.y) and not danger(outside, node.y) then
+                        for y = node.y + 1, maxY do
+                            if standable(node.x, y) then offer(node.x, y, false, side); break end
+                            if solid(node.x, y) then break end
+                        end
+                    end
                 end
             end
             for _, dx in ipairs({-1, 1}) do
@@ -461,7 +541,7 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.18"
+local VERSION = "0.1.19"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -1265,8 +1345,8 @@ local function moveTo(x, y, worldName, token, onStep)
                     hold.direction, hold.jump = 0, false
                     movedAt = os.clock()
                 else
-                    hold.direction = Navigation.steer(waypoint.x + 0.5 - state.x, state.vx or 0,
-                        state.grounded and 48 or 17)
+                    hold.direction = waypoint.drop and Navigation.dropSteer(state, waypoint)
+                        or Navigation.steer(waypoint.x + 0.5 - state.x, state.vx or 0, state.grounded and 48 or 17)
                     if waypoint.jump and not launchAt and state.grounded then launchAt = os.clock() end
                     if launchAt and not state.grounded then airborne = true end
                     hold.jump = launchAt ~= nil and ((not airborne and os.clock() - launchAt < 0.2)
@@ -1703,6 +1783,7 @@ local function runHarvest(token)
         local lastRefusal = {}
         App.lastHarvestRefusal = nil
         local sweepRow, sweepX, sweepDirection
+        local farmRows, farmRowsByY, activeFarmRow, restrictRoute = {}, {}, nil, false
         local rangeLimited, emptySince = false, nil
         local deadline = os.clock() + App.config.options.actionTimeout
         local function selected(drop)
@@ -1712,6 +1793,23 @@ local function runHarvest(token)
         end
         local function near(state, drop)
             return Navigation.pickupOverlap(state, drop)
+        end
+        local function farmRowFor(drop)
+            local closest, distance
+            local y = math.floor(drop.y)
+            for candidateY = y - 1, y + 1 do
+                local index = farmRowsByY[candidateY]
+                local row = index and farmRows[index]
+                if row and drop.x >= row.left - 0.1 and drop.x <= row.right + 1.1
+                    and near({x = drop.x, y = row.y + 1}, drop) then
+                    local delta = math.abs(drop.y - (row.y + 0.5))
+                    if not distance or delta < distance then closest, distance = index, delta end
+                end
+            end
+            return closest
+        end
+        local function onActiveRow(drop)
+            return not restrictRoute or farmRowFor(drop) == activeFarmRow
         end
         local function checkAttempts(drop)
             if (attempts[drop.uid] or 0) < 3 then return end
@@ -1755,7 +1853,7 @@ local function runHarvest(token)
             if r.inventory:room(id) <= 0 then return false end
             local focus, found = {}, false
             for _, drop in pairs(r.world.dropList()) do
-                if selected(drop) and not needsApproach[drop.uid] and near(state, drop)
+                if selected(drop) and near(state, drop) and onActiveRow(drop) and not needsApproach[drop.uid]
                     and math.abs(drop.x - state.x) <= 0.55 then
                     focus[drop.uid], found = true, true
                 end
@@ -1773,7 +1871,7 @@ local function runHarvest(token)
                 if r.inventory:room(id) <= 0 then return false end
                 local targets, remaining = {}, false
                 for _, drop in pairs(r.world.dropList()) do
-                    if selected(drop) and not needsApproach[drop.uid] and near(state, drop) then
+                    if selected(drop) and near(state, drop) and onActiveRow(drop) and not needsApproach[drop.uid] then
                         if math.abs(drop.x - state.x) <= 0.55 then focus[drop.uid] = true end
                         if focus[drop.uid] then
                             remaining = true
@@ -1791,7 +1889,8 @@ local function runHarvest(token)
                     "Nearby harvested stacks did not finish collecting. Check pending drops and copy diagnostics.")
                 if #targets > 0 then
                     local results = takeDropBatch(box, targets, attempts, retryAt, function(drop)
-                        return selected(drop) and focus[drop.uid] and not drop.pending and not drop.taking and near(position(), drop)
+                        return selected(drop) and onActiveRow(drop) and focus[drop.uid]
+                            and not drop.pending and not drop.taking and near(position(), drop)
                     end, token, function(_, _, amount) App.stats.harvested = App.stats.harvested + amount end)
                     if applyResults(results, true) then pickupDeadline = os.clock() + App.config.options.actionTimeout
                     else pause(0.05, token) end
@@ -1858,6 +1957,93 @@ local function runHarvest(token)
             deadline = os.clock() + App.config.options.actionTimeout
         end
         stash() -- Includes the selected blocks already filling the backpack.
+        -- Wide supported rows are the farm, rather than a storage box's roof.
+        -- Retain every row in this snapshot, including rows without loose drops.
+        do
+            local map = navigationMap(r)
+            for _, row in ipairs(Core.farmRows(r.world, r.items)) do
+                local left, right, count
+                count = 0
+                for x = row.left, row.right do
+                    if (map.solid(x, row.y + 1) or map.platform(x, row.y + 1))
+                        and not map.solid(x, row.y) and not map.danger(x, row.y) and not map.danger(x, row.y + 1) then
+                        left, right, count = left or x, x, count + 1
+                    end
+                end
+                if count >= 3 then
+                    table.insert(farmRows, {y = row.y, left = left, right = right})
+                    farmRowsByY[row.y] = #farmRows
+                end
+            end
+        end
+        if #farmRows >= 2 then
+            local lastRow = 0
+            for _, drop in pairs(r.world.dropList()) do
+                if selected(drop) then lastRow = math.max(lastRow, farmRowFor(drop) or 0) end
+            end
+            restrictRoute, rangeLimited = lastRow > 0, lastRow > 0
+            for index = 1, lastRow do
+                activeFarmRow = index
+                local row, direction = farmRows[index], index % 2 == 1 and 1 or -1
+                local entry, exit = direction == 1 and row.left or row.right, direction == 1 and row.right or row.left
+                setStatus("Collecting farm row " .. index .. "/" .. lastRow .. " at " .. row.y .. "...")
+                moveTo(entry, row.y, box.world, token)
+                local swept = false
+                while true do
+                    worldCheck(box.world, token)
+                    if r.inventory:room(id) <= 0 then
+                        assert(count(id) > 0, "Your backpack has no room for the harvested block. Free a slot before collecting.")
+                        local saved = position()
+                        stash()
+                        moveTo(math.floor(saved.x), math.floor(saved.y - 0.01), box.world, token)
+                    end
+                    if not swept then
+                        swept = moveTo(exit, row.y, box.world, token, collectOnRoute) ~= false
+                        deadline = os.clock() + App.config.options.actionTimeout
+                    end
+                    if swept then
+                        local remaining = {}
+                        for _, drop in pairs(r.world.dropList()) do
+                            if selected(drop) and onActiveRow(drop) then
+                                retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
+                                table.insert(remaining, drop)
+                            end
+                        end
+                        if #remaining == 0 then break end
+                        table.sort(remaining, function(a, b)
+                            return a.x == b.x and a.uid < b.uid or a.x * direction < b.x * direction
+                        end)
+                        local drop, state = remaining[1], position()
+                        checkAttempts(drop)
+                        if not near(state, drop) or needsApproach[drop.uid] then
+                            local goal, message = Navigation.pickupGoal(navigationMap(r), state, drop, {
+                                nativeOnly = true, step = function() pause(0, token); worldCheck(box.world, token) end,
+                            })
+                            assert(goal, tostring(message) .. " Drop uid " .. drop.uid .. " at " .. drop.x .. ", " .. drop.y)
+                            local finished = moveTo(goal.x, goal.y, box.world, token, collectOnRoute)
+                            if finished ~= false and near(position(), drop) then
+                                needsApproach[drop.uid], approached[drop.uid] = nil, true
+                            end
+                            deadline = os.clock() + App.config.options.actionTimeout
+                        elseif not drop.pending and not drop.taking and os.clock() >= math.max(drop.readyAt or 0, retryAt[drop.uid]) then
+                            local results = takeDropBatch(box, remaining, attempts, retryAt, function(candidate)
+                                return selected(candidate) and onActiveRow(candidate) and not needsApproach[candidate.uid]
+                                    and not candidate.pending and not candidate.taking and near(position(), candidate)
+                                    and os.clock() >= math.max(candidate.readyAt or 0, retryAt[candidate.uid] or 0)
+                            end, token, function(_, _, amount) App.stats.harvested = App.stats.harvested + amount end)
+                            applyResults(results, true)
+                            pause(0.03, token)
+                        else
+                            assert(os.clock() < deadline, "Harvested drops did not become ready. Check pending pickups and copy diagnostics.")
+                            pause(0.05, token)
+                        end
+                    end
+                end
+                -- Cleanup approaches and storage trips may have left the exit.
+                moveTo(exit, row.y, box.world, token, collectOnRoute)
+            end
+            activeFarmRow, restrictRoute = nil, false
+        end
         while true do
             worldCheck(box.world, token)
             local state = position()
@@ -2210,6 +2396,13 @@ end
 local function savePlantResume(state)
     saveSession()
     local copy = {worldIndex = state.worldIndex, phase = state.phase, skipped = {}, pending = state.pending}
+    if state.rows then
+        copy.rows = {}
+        for _, row in ipairs(state.rows) do
+            table.insert(copy.rows, {y = row.y, left = row.left, right = row.right})
+        end
+        copy.rowY = state.rowY
+    end
     for key, reason in pairs(state.skipped or {}) do copy.skipped[key] = reason end
     writeJSON(PLANT_RESUME_FILE, {version = 1, active = true, userId = player.UserId, updatedAt = os.time(),
         config = Core.validate(App.config), profile = App.profile, state = copy})
@@ -2230,6 +2423,28 @@ local function readPlantResume()
     for key, reason in pairs(state.skipped) do
         assert(type(key) == "string" and key:match("^%d+:%d+$") and type(reason) == "string", "Invalid skipped planting tile.")
     end
+    if state.rows then
+        assert(type(state.rows) == "table", "Invalid saved farm rows.")
+        for key in pairs(state.rows) do
+            assert(type(key) == "number" and key == math.floor(key) and key >= 1 and key <= #state.rows,
+                "Invalid saved farm row list.")
+        end
+        local previous = -1
+        for _, row in ipairs(state.rows) do
+            assert(type(row) == "table", "Invalid saved farm row.")
+            for _, key in ipairs({"y", "left", "right"}) do
+                assert(type(row[key]) == "number" and row[key] == math.floor(row[key])
+                    and row[key] >= 0 and row[key] <= 65535, "Invalid saved farm row.")
+            end
+            assert(row.y > previous and row.left <= row.right, "Invalid saved farm row order.")
+            previous = row.y
+        end
+        if state.rowY ~= nil then
+            local found = false
+            for _, row in ipairs(state.rows) do if row.y == state.rowY then found = true end end
+            assert(found, "Invalid saved planting row.")
+        end
+    else assert(state.rowY == nil, "Missing saved farm rows.") end
     if state.pending then
         local point = state.pending
         assert(state.phase == "farm" and point.world == record.config.planting.worlds[state.worldIndex], "Invalid pending seed world.")
@@ -2351,8 +2566,12 @@ local function runPlant(token, saved)
         enterPlantWorld(name, state, token)
         reconcilePlant(state, token)
         local r, refill = runtime(), false
+        if not state.rows then state.rows = Core.farmRows(r.world, r.items); savePlantResume(state) end
+        for _, row in ipairs(state.rows) do
+            assert(row.y < r.world.h - 1 and row.right < r.world.w, "Saved farm rows no longer fit this world. Clear saved planting and start again.")
+        end
         setStatus("Planting " .. r.items[id].name .. " in " .. name .. " (" .. state.worldIndex .. "/" .. #settings.worlds .. ")...")
-        for _, point in ipairs(Core.plantingTiles(r.world, r.items)) do
+        for _, point in ipairs(Core.plantingTiles(r.world, r.items, state.rows)) do
             checkpoint(token)
             worldCheck(name, token)
             local key = point.x .. ":" .. point.y
@@ -2360,7 +2579,27 @@ local function runPlant(token, saved)
                 if count(id) == 0 then refill = true; break end
                 local permitted = not r.world.areas or type(r.world.areas.canEdit) ~= "function" or r.world.areas.canEdit(point.x, point.y)
                 local arrived, issue = true, nil
-                if permitted then arrived, issue = pcall(moveTo, point.x, point.y, name, token) end
+                if permitted then
+                    arrived, issue = pcall(function()
+                        if state.rowY ~= point.y then
+                            for index, row in ipairs(state.rows) do
+                                local direction = index % 2 == 1 and 1 or -1
+                                if row.y == state.rowY then
+                                    moveTo(direction == 1 and row.right or row.left, row.y, name, token)
+                                end
+                            end
+                            for index, row in ipairs(state.rows) do
+                                if row.y == point.y then
+                                    moveTo(index % 2 == 1 and row.left or row.right, row.y, name, token)
+                                    break
+                                end
+                            end
+                            state.rowY = point.y
+                            savePlantResume(state)
+                        end
+                        moveTo(point.x, point.y, name, token)
+                    end)
+                end
                 checkpoint(token)
                 worldCheck(name, token)
                 if not arrived then
@@ -2379,7 +2618,7 @@ local function runPlant(token, saved)
             local skipped = 0
             for _ in pairs(state.skipped) do skipped = skipped + 1 end
             setStatus("Processed " .. name .. ": " .. skipped .. " tiles skipped due to access or route. Moving to the next farm.")
-            state.worldIndex, state.skipped = state.worldIndex + 1, {}
+            state.worldIndex, state.skipped, state.rows, state.rowY = state.worldIndex + 1, {}, nil, nil
         end
         savePlantResume(state)
     end
@@ -2975,7 +3214,7 @@ App.runToggles.transfer = transferTab:Toggle({ Title = "Moving Drops", Value = f
 local selectedProfile, profileNameInput, profileDropdown = nil, nil, nil
 local settingsControls = {}
 ui.harvestStatus = harvestTab:Paragraph({ Title = "Status", Desc = App.status })
-harvestTab:Paragraph({ Title = "Collect harvested blocks", Desc = "Use the block selected on Place & Break. Collect its floating drops throughout the farm world and empty the backpack into Farm storage automatically. Harvest the trees first, then turn this On." })
+harvestTab:Paragraph({ Title = "Collect harvested blocks", Desc = "Harvest the trees first. Collect the block selected on Place & Break from the top-left farm row, alternating left-to-right and right-to-left down the supported rows. Empty the backpack into Farm storage automatically." })
 ui.harvestPoint = harvestTab:Paragraph({ Title = "Farm storage", Desc = pointText("farmBox") })
 harvestTab:Button({ Title = "Save Farm storage", Desc = "Stand beside the farm world's Display Box.",
     Callback = uiAction(function() captureNearby("farmBox", "box") end) })
@@ -3040,7 +3279,7 @@ local function changePlantSetting(key, value)
     if not ok then notify(tostring(message)) end
 end
 ui.plantStatus = plantTab:Paragraph({ Title = "Status", Desc = App.status })
-plantTab:Paragraph({ Title = "Fill dirt farms with seeds", Desc = "Plant the selected seed on empty tiles with solid ground or a platform below. Doors, vents, existing trees, and floating tiles are skipped. Refill from the saved seed Display Box, then continue through your farm world list." })
+plantTab:Paragraph({ Title = "Fill dirt farms with seeds", Desc = "Start at the top-left supported farm row and alternate left-to-right and right-to-left down the farm. Skip occupied, floating, and denied tiles. Refill from the saved seed Display Box and resume the same row direction, then continue through your farm world list." })
 App.syncingPlantUI = true
 plantControls.search = plantTab:Input({ Title = "Find seed by name or ID", Value = "", Placeholder = "e.g. Sugar Cane or 955",
     Callback = function(value)

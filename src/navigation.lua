@@ -7,12 +7,23 @@ function Navigation.steer(dx, vx, braking)
     return dx > 0 and 1 or -1
 end
 
+function Navigation.dropSteer(state, step)
+    local target = step.x + 0.5
+    if state.y <= step.fromY + 1.02 then
+        target = step.outsideX
+        local side = step.outsideX > step.fromX + 0.5 and 1 or -1
+        -- Leave the edge slowly enough to reverse in the air before the next row.
+        if (state.vx or 0) * side > 1.4 then return 0 end
+    end
+    return Navigation.steer(target - state.x, state.vx or 0, state.grounded and 48 or 17)
+end
+
 function Navigation.straightRuns(route)
     local runs = {}
     for _, step in ipairs(route) do
         local last = runs[#runs]
         local direction = step.x - step.fromX
-        if last and not last.jump and not step.jump and step.y == step.fromY
+        if last and not last.jump and not step.jump and not last.drop and not step.drop and step.y == step.fromY
             and last.y == last.fromY and last.y == step.y and last.x == step.fromX
             and last.x - last.fromX == direction * #last.edges
             and math.abs(direction) == 1 then
@@ -20,7 +31,7 @@ function Navigation.straightRuns(route)
             table.insert(last.edges, step)
         else
             table.insert(runs, {x = step.x, y = step.y, fromX = step.fromX, fromY = step.fromY,
-                jump = step.jump, duration = step.duration, edges = {step}})
+                jump = step.jump, drop = step.drop, outsideX = step.outsideX, duration = step.duration, edges = {step}})
         end
     end
     return runs
@@ -117,6 +128,40 @@ function Navigation.plan(map, start, goal, options)
             if feet > maxY + 2 then return nil end
         end
     end
+    local function platformDrop(from, to, side)
+        local x, feet, vx, vy = from.x + 0.5, from.y + 1, 0, 0
+        local outsideX, targetX = x + side * 0.9, to.x + 0.5
+        local grounded, landed, dt, direction = true, false, 0.005, 0
+        local waypoint = {x = to.x, fromX = from.x, fromY = from.y, outsideX = outsideX}
+        for step = 1, math.ceil((3 + (to.y - from.y) / 24) / dt) do
+            if (step - 1) % 5 == 0 then
+                direction = Navigation.dropSteer({x = x, y = feet, vx = vx, grounded = grounded}, waypoint)
+            end
+            local desired = direction * speed
+            local acceleration = direction == 0 and (grounded and 48 or 17) or (grounded and 36 or 22)
+            if vx < desired then vx = math.min(desired, vx + acceleration * dt)
+            else vx = math.max(desired, vx - acceleration * dt) end
+            local nextX = x + vx * dt
+            if fits(nextX, feet) then x = nextX else vx = 0 end
+            vy = math.min(24, vy + gravity * dt)
+            local nextFeet, supported = feet + vy * dt, false
+            for row = math.ceil(feet - 0.001), math.floor(nextFeet + 0.001) do
+                if support(math.floor(x - 0.299), row) or support(math.floor(x + 0.299), row) then
+                    if row ~= from.y + 1 and row ~= to.y + 1 then return nil end
+                    feet, vy, supported = row - 0.001, 0, true
+                    if row == to.y + 1 then landed = true end
+                    break
+                end
+            end
+            grounded = supported
+            if not supported then
+                if not fits(x, nextFeet) then return nil end
+                feet = nextFeet
+            end
+            if landed and math.abs(x - targetX) < 0.16 and math.abs(vx) < 0.8 then return step * dt, outsideX end
+            if feet > to.y + 1.3 then return nil end
+        end
+    end
     local function estimate(x, y) return (math.abs(x - goal.x) + math.abs(y - goal.y) * 0.6) / speed end
     local initial = {x = start.x, y = start.y, cost = 0, score = estimate(start.x, start.y)}
     local open, best, closed = {initial}, {[key(start.x, start.y)] = initial}, {}
@@ -131,6 +176,7 @@ function Navigation.plan(map, start, goal, options)
                 local route = {}
                 while node.parent do
                     table.insert(route, 1, {x = node.x, y = node.y, jump = node.jump,
+                        drop = node.drop, outsideX = node.outsideX,
                         fromX = node.parent.x, fromY = node.parent.y, duration = node.duration})
                     node = node.parent
                 end
@@ -138,21 +184,34 @@ function Navigation.plan(map, start, goal, options)
             end
             closed[nodeKey], expansions = true, expansions + 1
             if options.step and expansions % 64 == 0 then options.step() end
-            local function offer(x, y, jumping)
+            local function offer(x, y, jumping, dropSide)
                 if not standable(x, y) then return end
                 local destinationKey = key(x, y)
                 local edgeKey = nodeKey .. ":" .. destinationKey .. ":" .. tostring(jumping)
                 if closed[destinationKey] or (options.banned and options.banned[edgeKey]) then return end
-                local duration
-                if not jumping and y == node.y then duration = 1 / speed
+                local duration, outsideX
+                if dropSide then duration, outsideX = platformDrop(node, {x = x, y = y}, dropSide)
+                elseif not jumping and y == node.y then duration = 1 / speed
                 else duration = travel(node, {x = x, y = y}, jumping) end
                 if not duration then return end
                 local cost = node.cost + duration + (jumping and 0.12 or 0)
                 if not best[destinationKey] or cost < best[destinationKey].cost then
                     local nextNode = {x = x, y = y, cost = cost, score = cost + estimate(x, y),
-                        parent = node, jump = jumping, duration = duration}
+                        parent = node, jump = jumping, drop = dropSide ~= nil, outsideX = outsideX, duration = duration}
                     best[destinationKey] = nextNode
                     table.insert(open, nextNode)
+                end
+            end
+            if map.platform and map.platform(node.x, node.y + 1) and not solid(node.x, node.y + 1) then
+                for _, side in ipairs({-1, 1}) do
+                    local outside = node.x + side
+                    if outside >= 0 and outside < map.w and not support(outside, node.y + 1)
+                        and not solid(outside, node.y) and not danger(outside, node.y) then
+                        for y = node.y + 1, maxY do
+                            if standable(node.x, y) then offer(node.x, y, false, side); break end
+                            if solid(node.x, y) then break end
+                        end
+                    end
                 end
             end
             for _, dx in ipairs({-1, 1}) do

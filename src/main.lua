@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.18"
+local VERSION = "0.1.19"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -805,8 +805,8 @@ local function moveTo(x, y, worldName, token, onStep)
                     hold.direction, hold.jump = 0, false
                     movedAt = os.clock()
                 else
-                    hold.direction = Navigation.steer(waypoint.x + 0.5 - state.x, state.vx or 0,
-                        state.grounded and 48 or 17)
+                    hold.direction = waypoint.drop and Navigation.dropSteer(state, waypoint)
+                        or Navigation.steer(waypoint.x + 0.5 - state.x, state.vx or 0, state.grounded and 48 or 17)
                     if waypoint.jump and not launchAt and state.grounded then launchAt = os.clock() end
                     if launchAt and not state.grounded then airborne = true end
                     hold.jump = launchAt ~= nil and ((not airborne and os.clock() - launchAt < 0.2)
@@ -1243,6 +1243,7 @@ local function runHarvest(token)
         local lastRefusal = {}
         App.lastHarvestRefusal = nil
         local sweepRow, sweepX, sweepDirection
+        local farmRows, farmRowsByY, activeFarmRow, restrictRoute = {}, {}, nil, false
         local rangeLimited, emptySince = false, nil
         local deadline = os.clock() + App.config.options.actionTimeout
         local function selected(drop)
@@ -1252,6 +1253,23 @@ local function runHarvest(token)
         end
         local function near(state, drop)
             return Navigation.pickupOverlap(state, drop)
+        end
+        local function farmRowFor(drop)
+            local closest, distance
+            local y = math.floor(drop.y)
+            for candidateY = y - 1, y + 1 do
+                local index = farmRowsByY[candidateY]
+                local row = index and farmRows[index]
+                if row and drop.x >= row.left - 0.1 and drop.x <= row.right + 1.1
+                    and near({x = drop.x, y = row.y + 1}, drop) then
+                    local delta = math.abs(drop.y - (row.y + 0.5))
+                    if not distance or delta < distance then closest, distance = index, delta end
+                end
+            end
+            return closest
+        end
+        local function onActiveRow(drop)
+            return not restrictRoute or farmRowFor(drop) == activeFarmRow
         end
         local function checkAttempts(drop)
             if (attempts[drop.uid] or 0) < 3 then return end
@@ -1295,7 +1313,7 @@ local function runHarvest(token)
             if r.inventory:room(id) <= 0 then return false end
             local focus, found = {}, false
             for _, drop in pairs(r.world.dropList()) do
-                if selected(drop) and not needsApproach[drop.uid] and near(state, drop)
+                if selected(drop) and near(state, drop) and onActiveRow(drop) and not needsApproach[drop.uid]
                     and math.abs(drop.x - state.x) <= 0.55 then
                     focus[drop.uid], found = true, true
                 end
@@ -1313,7 +1331,7 @@ local function runHarvest(token)
                 if r.inventory:room(id) <= 0 then return false end
                 local targets, remaining = {}, false
                 for _, drop in pairs(r.world.dropList()) do
-                    if selected(drop) and not needsApproach[drop.uid] and near(state, drop) then
+                    if selected(drop) and near(state, drop) and onActiveRow(drop) and not needsApproach[drop.uid] then
                         if math.abs(drop.x - state.x) <= 0.55 then focus[drop.uid] = true end
                         if focus[drop.uid] then
                             remaining = true
@@ -1331,7 +1349,8 @@ local function runHarvest(token)
                     "Nearby harvested stacks did not finish collecting. Check pending drops and copy diagnostics.")
                 if #targets > 0 then
                     local results = takeDropBatch(box, targets, attempts, retryAt, function(drop)
-                        return selected(drop) and focus[drop.uid] and not drop.pending and not drop.taking and near(position(), drop)
+                        return selected(drop) and onActiveRow(drop) and focus[drop.uid]
+                            and not drop.pending and not drop.taking and near(position(), drop)
                     end, token, function(_, _, amount) App.stats.harvested = App.stats.harvested + amount end)
                     if applyResults(results, true) then pickupDeadline = os.clock() + App.config.options.actionTimeout
                     else pause(0.05, token) end
@@ -1398,6 +1417,93 @@ local function runHarvest(token)
             deadline = os.clock() + App.config.options.actionTimeout
         end
         stash() -- Includes the selected blocks already filling the backpack.
+        -- Wide supported rows are the farm, rather than a storage box's roof.
+        -- Retain every row in this snapshot, including rows without loose drops.
+        do
+            local map = navigationMap(r)
+            for _, row in ipairs(Core.farmRows(r.world, r.items)) do
+                local left, right, count
+                count = 0
+                for x = row.left, row.right do
+                    if (map.solid(x, row.y + 1) or map.platform(x, row.y + 1))
+                        and not map.solid(x, row.y) and not map.danger(x, row.y) and not map.danger(x, row.y + 1) then
+                        left, right, count = left or x, x, count + 1
+                    end
+                end
+                if count >= 3 then
+                    table.insert(farmRows, {y = row.y, left = left, right = right})
+                    farmRowsByY[row.y] = #farmRows
+                end
+            end
+        end
+        if #farmRows >= 2 then
+            local lastRow = 0
+            for _, drop in pairs(r.world.dropList()) do
+                if selected(drop) then lastRow = math.max(lastRow, farmRowFor(drop) or 0) end
+            end
+            restrictRoute, rangeLimited = lastRow > 0, lastRow > 0
+            for index = 1, lastRow do
+                activeFarmRow = index
+                local row, direction = farmRows[index], index % 2 == 1 and 1 or -1
+                local entry, exit = direction == 1 and row.left or row.right, direction == 1 and row.right or row.left
+                setStatus("Collecting farm row " .. index .. "/" .. lastRow .. " at " .. row.y .. "...")
+                moveTo(entry, row.y, box.world, token)
+                local swept = false
+                while true do
+                    worldCheck(box.world, token)
+                    if r.inventory:room(id) <= 0 then
+                        assert(count(id) > 0, "Your backpack has no room for the harvested block. Free a slot before collecting.")
+                        local saved = position()
+                        stash()
+                        moveTo(math.floor(saved.x), math.floor(saved.y - 0.01), box.world, token)
+                    end
+                    if not swept then
+                        swept = moveTo(exit, row.y, box.world, token, collectOnRoute) ~= false
+                        deadline = os.clock() + App.config.options.actionTimeout
+                    end
+                    if swept then
+                        local remaining = {}
+                        for _, drop in pairs(r.world.dropList()) do
+                            if selected(drop) and onActiveRow(drop) then
+                                retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
+                                table.insert(remaining, drop)
+                            end
+                        end
+                        if #remaining == 0 then break end
+                        table.sort(remaining, function(a, b)
+                            return a.x == b.x and a.uid < b.uid or a.x * direction < b.x * direction
+                        end)
+                        local drop, state = remaining[1], position()
+                        checkAttempts(drop)
+                        if not near(state, drop) or needsApproach[drop.uid] then
+                            local goal, message = Navigation.pickupGoal(navigationMap(r), state, drop, {
+                                nativeOnly = true, step = function() pause(0, token); worldCheck(box.world, token) end,
+                            })
+                            assert(goal, tostring(message) .. " Drop uid " .. drop.uid .. " at " .. drop.x .. ", " .. drop.y)
+                            local finished = moveTo(goal.x, goal.y, box.world, token, collectOnRoute)
+                            if finished ~= false and near(position(), drop) then
+                                needsApproach[drop.uid], approached[drop.uid] = nil, true
+                            end
+                            deadline = os.clock() + App.config.options.actionTimeout
+                        elseif not drop.pending and not drop.taking and os.clock() >= math.max(drop.readyAt or 0, retryAt[drop.uid]) then
+                            local results = takeDropBatch(box, remaining, attempts, retryAt, function(candidate)
+                                return selected(candidate) and onActiveRow(candidate) and not needsApproach[candidate.uid]
+                                    and not candidate.pending and not candidate.taking and near(position(), candidate)
+                                    and os.clock() >= math.max(candidate.readyAt or 0, retryAt[candidate.uid] or 0)
+                            end, token, function(_, _, amount) App.stats.harvested = App.stats.harvested + amount end)
+                            applyResults(results, true)
+                            pause(0.03, token)
+                        else
+                            assert(os.clock() < deadline, "Harvested drops did not become ready. Check pending pickups and copy diagnostics.")
+                            pause(0.05, token)
+                        end
+                    end
+                end
+                -- Cleanup approaches and storage trips may have left the exit.
+                moveTo(exit, row.y, box.world, token, collectOnRoute)
+            end
+            activeFarmRow, restrictRoute = nil, false
+        end
         while true do
             worldCheck(box.world, token)
             local state = position()
@@ -1750,6 +1856,13 @@ end
 local function savePlantResume(state)
     saveSession()
     local copy = {worldIndex = state.worldIndex, phase = state.phase, skipped = {}, pending = state.pending}
+    if state.rows then
+        copy.rows = {}
+        for _, row in ipairs(state.rows) do
+            table.insert(copy.rows, {y = row.y, left = row.left, right = row.right})
+        end
+        copy.rowY = state.rowY
+    end
     for key, reason in pairs(state.skipped or {}) do copy.skipped[key] = reason end
     writeJSON(PLANT_RESUME_FILE, {version = 1, active = true, userId = player.UserId, updatedAt = os.time(),
         config = Core.validate(App.config), profile = App.profile, state = copy})
@@ -1770,6 +1883,28 @@ local function readPlantResume()
     for key, reason in pairs(state.skipped) do
         assert(type(key) == "string" and key:match("^%d+:%d+$") and type(reason) == "string", "Invalid skipped planting tile.")
     end
+    if state.rows then
+        assert(type(state.rows) == "table", "Invalid saved farm rows.")
+        for key in pairs(state.rows) do
+            assert(type(key) == "number" and key == math.floor(key) and key >= 1 and key <= #state.rows,
+                "Invalid saved farm row list.")
+        end
+        local previous = -1
+        for _, row in ipairs(state.rows) do
+            assert(type(row) == "table", "Invalid saved farm row.")
+            for _, key in ipairs({"y", "left", "right"}) do
+                assert(type(row[key]) == "number" and row[key] == math.floor(row[key])
+                    and row[key] >= 0 and row[key] <= 65535, "Invalid saved farm row.")
+            end
+            assert(row.y > previous and row.left <= row.right, "Invalid saved farm row order.")
+            previous = row.y
+        end
+        if state.rowY ~= nil then
+            local found = false
+            for _, row in ipairs(state.rows) do if row.y == state.rowY then found = true end end
+            assert(found, "Invalid saved planting row.")
+        end
+    else assert(state.rowY == nil, "Missing saved farm rows.") end
     if state.pending then
         local point = state.pending
         assert(state.phase == "farm" and point.world == record.config.planting.worlds[state.worldIndex], "Invalid pending seed world.")
@@ -1891,8 +2026,12 @@ local function runPlant(token, saved)
         enterPlantWorld(name, state, token)
         reconcilePlant(state, token)
         local r, refill = runtime(), false
+        if not state.rows then state.rows = Core.farmRows(r.world, r.items); savePlantResume(state) end
+        for _, row in ipairs(state.rows) do
+            assert(row.y < r.world.h - 1 and row.right < r.world.w, "Saved farm rows no longer fit this world. Clear saved planting and start again.")
+        end
         setStatus("Planting " .. r.items[id].name .. " in " .. name .. " (" .. state.worldIndex .. "/" .. #settings.worlds .. ")...")
-        for _, point in ipairs(Core.plantingTiles(r.world, r.items)) do
+        for _, point in ipairs(Core.plantingTiles(r.world, r.items, state.rows)) do
             checkpoint(token)
             worldCheck(name, token)
             local key = point.x .. ":" .. point.y
@@ -1900,7 +2039,27 @@ local function runPlant(token, saved)
                 if count(id) == 0 then refill = true; break end
                 local permitted = not r.world.areas or type(r.world.areas.canEdit) ~= "function" or r.world.areas.canEdit(point.x, point.y)
                 local arrived, issue = true, nil
-                if permitted then arrived, issue = pcall(moveTo, point.x, point.y, name, token) end
+                if permitted then
+                    arrived, issue = pcall(function()
+                        if state.rowY ~= point.y then
+                            for index, row in ipairs(state.rows) do
+                                local direction = index % 2 == 1 and 1 or -1
+                                if row.y == state.rowY then
+                                    moveTo(direction == 1 and row.right or row.left, row.y, name, token)
+                                end
+                            end
+                            for index, row in ipairs(state.rows) do
+                                if row.y == point.y then
+                                    moveTo(index % 2 == 1 and row.left or row.right, row.y, name, token)
+                                    break
+                                end
+                            end
+                            state.rowY = point.y
+                            savePlantResume(state)
+                        end
+                        moveTo(point.x, point.y, name, token)
+                    end)
+                end
                 checkpoint(token)
                 worldCheck(name, token)
                 if not arrived then
@@ -1919,7 +2078,7 @@ local function runPlant(token, saved)
             local skipped = 0
             for _ in pairs(state.skipped) do skipped = skipped + 1 end
             setStatus("Processed " .. name .. ": " .. skipped .. " tiles skipped due to access or route. Moving to the next farm.")
-            state.worldIndex, state.skipped = state.worldIndex + 1, {}
+            state.worldIndex, state.skipped, state.rows, state.rowY = state.worldIndex + 1, {}, nil, nil
         end
         savePlantResume(state)
     end
@@ -2515,7 +2674,7 @@ App.runToggles.transfer = transferTab:Toggle({ Title = "Moving Drops", Value = f
 local selectedProfile, profileNameInput, profileDropdown = nil, nil, nil
 local settingsControls = {}
 ui.harvestStatus = harvestTab:Paragraph({ Title = "Status", Desc = App.status })
-harvestTab:Paragraph({ Title = "Collect harvested blocks", Desc = "Use the block selected on Place & Break. Collect its floating drops throughout the farm world and empty the backpack into Farm storage automatically. Harvest the trees first, then turn this On." })
+harvestTab:Paragraph({ Title = "Collect harvested blocks", Desc = "Harvest the trees first. Collect the block selected on Place & Break from the top-left farm row, alternating left-to-right and right-to-left down the supported rows. Empty the backpack into Farm storage automatically." })
 ui.harvestPoint = harvestTab:Paragraph({ Title = "Farm storage", Desc = pointText("farmBox") })
 harvestTab:Button({ Title = "Save Farm storage", Desc = "Stand beside the farm world's Display Box.",
     Callback = uiAction(function() captureNearby("farmBox", "box") end) })
@@ -2580,7 +2739,7 @@ local function changePlantSetting(key, value)
     if not ok then notify(tostring(message)) end
 end
 ui.plantStatus = plantTab:Paragraph({ Title = "Status", Desc = App.status })
-plantTab:Paragraph({ Title = "Fill dirt farms with seeds", Desc = "Plant the selected seed on empty tiles with solid ground or a platform below. Doors, vents, existing trees, and floating tiles are skipped. Refill from the saved seed Display Box, then continue through your farm world list." })
+plantTab:Paragraph({ Title = "Fill dirt farms with seeds", Desc = "Start at the top-left supported farm row and alternate left-to-right and right-to-left down the farm. Skip occupied, floating, and denied tiles. Refill from the saved seed Display Box and resume the same row direction, then continue through your farm world list." })
 App.syncingPlantUI = true
 plantControls.search = plantTab:Input({ Title = "Find seed by name or ID", Value = "", Placeholder = "e.g. Sugar Cane or 955",
     Callback = function(value)
