@@ -3845,4 +3845,120 @@ test("Rotation recovery files preserve progress independently and reject account
     rejects(f.hooks.readRotationResume,"rotation phase")
 end)
 
+test("Export includes unsaved settings and all farm locations without exporting running-task state", function()
+    local f=rotationFixture()
+    f.app.profile="Emulator Farms"
+    f.app.config.harvesting.method="tractor"
+    f.app.config.options.collectDelay=0.7
+    f.app.job,f.app.pending="rotation",2
+    f.app.rotationState={phase="transfer",cargo=100}
+    local text,record=f.hooks.exportConfiguration()
+    assert(f.services.HttpService:JSONDecode(text) == record and record.profile == "Emulator Farms")
+    assert(record.config.options.collectDelay == 0.7 and record.config.rotation.farms.FARM2.world == "FARM2")
+    assert(record.userId == nil and record.state == nil and record.active == nil)
+    assert(f.app.job == "rotation" and f.app.pending == 2 and next(f.files) == nil)
+    writefile=nil
+    assert(f.hooks.exportConfiguration())
+end)
+
+test("Export files preserve the portable format and back up a previous export", function()
+    local f=fixture()
+    local _,record=f.hooks.exportConfiguration()
+    local path=f.hooks.saveConfigExport(record)
+    assert(path == "ClarisGrowblox/exports/Default.json")
+    local saved=f.services.HttpService:JSONDecode(f.files[path])
+    assert(saved.format == "ClarisGrowbloxConfig" and saved.config.blockId == 954)
+    f.app.config.options.collectDelay=0.8
+    local _,nextRecord=f.hooks.exportConfiguration()
+    assert(f.hooks.saveConfigExport(nextRecord) == path)
+    assert(f.services.HttpService:JSONDecode(f.files[path .. ".bak"]).config.options.collectDelay == 0.1)
+end)
+
+test("Import on another account persists the whole setup locally and clears old task checkpoints without starting", function()
+    local source=rotationFixture()
+    source.app.profile="Emulator Farms"
+    source.app.config.harvesting.method="tractor"
+    source.app.config.webhook.url="https://discord.com/api/webhooks/123/mock_token"
+    source.app.config.webhook.enabled=true
+    local _,record=source.hooks.exportConfiguration()
+    local f=fixture()
+    f.player.UserId=5678
+    f.app.job,f.app.jobToken=nil,nil
+    for _,name in ipairs({"resume","pnb-resume","plant-resume","rotation-resume"}) do
+        f.files["ClarisGrowblox/" .. name .. ".json"]="old local checkpoint"
+    end
+    f.app.resume,f.app.plantState,f.app.rotationState={cargo=100},{pending=true},{phase="pnb"}
+    local text=f.services.HttpService:JSONEncode(record)
+    assert(f.hooks.importConfiguration(text,"Cloud Phone Farms") == "Cloud Phone Farms")
+    assert(f.app.config.rotation.farms.FARM2.x == 0 and f.app.config.harvesting.method == "tractor")
+    assert(f.app.config.webhook.url == source.app.config.webhook.url and f.app.config.webhook.enabled)
+    assert(f.app.job == nil and f.app.resume == nil and f.app.plantState == nil and f.app.rotationState == nil)
+    assert(f.world.name == "BREAK" and f.avatar.x == 13.5 and f.pickups == 0)
+    assert(f.files["ClarisGrowblox/resume.json"] == nil and f.files["ClarisGrowblox/rotation-resume.json"] == nil)
+    local profile=f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/profiles/Cloud Phone Farms.json"])
+    local session=f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/session.json"])
+    assert(profile.planting.worlds[2] == "FARM2" and session.userId == 5678 and session.profile == "Cloud Phone Farms")
+    local nextApp=f.reload().App
+    assert(nextApp.profile == "Cloud Phone Farms" and nextApp.config.rotation.farms.FARM2.world == "FARM2")
+    assert(nextApp.config.points.pnb.x == 10 and nextApp.config.points.plantBox.world == "BREAK" and nextApp.job == nil)
+end)
+
+test("Malformed pasted JSON and recovery records cannot change the current setup or checkpoints", function()
+    local f=fixture()
+    f.app.job=nil
+    local config=f.app.config
+    f.files["ClarisGrowblox/resume.json"]="old checkpoint"
+    rejects(function() f.hooks.importConfiguration("loadstring(game:HttpGet('example'))()") end,"Invalid configuration JSON")
+    rejects(function() f.hooks.importConfiguration(string.rep("x",131073)) end,"too large")
+    local recovery=f.services.HttpService:JSONEncode({version=1,userId=123,config=config,phase="deliver",cargo=200})
+    rejects(function() f.hooks.importConfiguration(recovery) end,"recovery files")
+    assert(f.app.config == config and f.app.profile == "Default" and f.files["ClarisGrowblox/resume.json"] == "old checkpoint")
+    assert(f.files["ClarisGrowblox/session.json"] == nil)
+end)
+
+test("Import refuses a running task or outstanding request before writing files", function()
+    local f=fixture()
+    local text=f.hooks.exportConfiguration()
+    rejects(function() f.hooks.importConfiguration(text) end,"Stop the current task")
+    f.app.job,f.app.pending=nil,1
+    rejects(function() f.hooks.importConfiguration(text) end,"pending requests")
+    assert(next(f.files) == nil and f.app.config.blockId == 954)
+end)
+
+test("A failed import save retains the previous profile, session, and recovery state", function()
+    local f=fixture()
+    f.app.job=nil
+    local profilePath="ClarisGrowblox/profiles/Default.json"
+    f.files[profilePath]="previous profile"
+    f.hooks.saveSession()
+    local priorSession=f.files["ClarisGrowblox/session.json"]
+    f.files["ClarisGrowblox/resume.json"]="prior cargo"
+    local oldConfig=f.app.config
+    local _,record=f.hooks.exportConfiguration()
+    record.config.blockId=628
+    local text=f.services.HttpService:JSONEncode(record)
+    local write=writefile
+    writefile=function(path,value)
+        if path == "ClarisGrowblox/session.json.pending" then error("disk full") end
+        return write(path,value)
+    end
+    rejects(function() f.hooks.importConfiguration(text) end,"disk full")
+    assert(f.app.config == oldConfig and f.app.config.blockId == 954)
+    assert(f.files[profilePath] == "previous profile" and f.files["ClarisGrowblox/session.json"] == priorSession)
+    assert(f.files["ClarisGrowblox/resume.json"] == "prior cargo")
+end)
+
+test("Import backs up an existing named profile and accepts a saved profile file", function()
+    local f=fixture()
+    f.app.job=nil
+    local path="ClarisGrowblox/profiles/Cloud Phone.json"
+    f.files[path]="previous cloud setup"
+    local config=f.hooks.Core.validate(f.app.config)
+    config.options.collectDelay=0.9
+    local text=f.services.HttpService:JSONEncode(config)
+    f.hooks.importConfiguration(text,"Cloud Phone")
+    assert(f.files[path .. ".bak"] == "previous cloud setup" and f.app.profile == "Cloud Phone")
+    assert(f.app.config.options.collectDelay == 0.9 and f.app.config.rotation.farms.FARM.x == 20)
+end)
+
 return string.format("%d actual-script runtime tests passed (mock services/server)", passed)

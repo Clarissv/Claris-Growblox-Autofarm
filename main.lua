@@ -173,6 +173,29 @@ function Core.grid(anchor)
     return result
 end
 
+function Core.exportConfig(config, profile, scriptVersion)
+    return {format = "ClarisGrowbloxConfig", version = 1, scriptVersion = scriptVersion,
+        profile = Core.profileName(profile), config = Core.validate(config)}
+end
+
+function Core.importConfig(record, name)
+    assert(type(record) == "table", "Paste an exported configuration or saved profile JSON.")
+    local config, profile
+    if record.format ~= nil then
+        assert(record.format == "ClarisGrowbloxConfig" and record.version == 1,
+            "Unsupported configuration export. Export again using the current script.")
+        config, profile = Core.validate(record.config), Core.profileName(record.profile)
+    else
+        assert(record.config == nil, "Import a configuration export or profile file; task recovery files cannot be imported.")
+        config, profile = Core.validate(record), "Imported Farm"
+    end
+    if name ~= nil then
+        assert(type(name) == "string", "Enter a profile name.")
+        if name:match("%S") then profile = Core.profileName(name) end
+    end
+    return config, profile
+end
+
 function Core.seedId(items, blockId)
     local item = items[blockId]
     assert(item, "Selected block is missing from the current game data.")
@@ -608,7 +631,7 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.21"
+local VERSION = "0.1.22"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -3566,6 +3589,56 @@ local function seedChoices(query)
     return labels, lookup, selected, #candidates > #labels
 end
 
+local function exportConfiguration()
+    local record = Core.exportConfig(App.config, App.profile, VERSION)
+    return encode(record), record
+end
+local function saveConfigExport(record)
+    filesystem()
+    local directory = ROOT .. "/exports"
+    if not isfolder(directory) then makefolder(directory) end
+    local path = directory .. "/" .. Core.profileName(record.profile) .. ".json"
+    writeJSON(path, record)
+    return path
+end
+local function importConfiguration(text, name)
+    assert(App.alive and not App.job and App.pending == 0,
+        "Stop the current task and wait for pending requests before importing a configuration.")
+    assert(type(text) == "string" and text:match("%S"), "Paste the exported configuration first.")
+    assert(#text <= 131072, "Configuration text is too large. Paste only the exported JSON.")
+    local decoded, record = pcall(decode, text)
+    assert(decoded and type(record) == "table", "Invalid configuration JSON. Copy the complete export and paste it again.")
+    local config, profile = Core.importConfig(record, name)
+    local path = PROFILE_DIR .. "/" .. profile .. ".json"
+    local prior = {[path] = exists(path) and readfile(path) or false,
+        [SESSION_FILE] = exists(SESSION_FILE) and readfile(SESSION_FILE) or false}
+    local session = {version = 1, userId = player.UserId, config = config, profile = profile}
+    local signature = encode({config = config, profile = profile})
+    local saved, problem = pcall(function()
+        writeJSON(path, config)
+        writeJSON(SESSION_FILE, session)
+    end)
+    if not saved then
+        for target, previous in pairs(prior) do
+            pcall(function()
+                if previous then writefile(target, previous)
+                elseif exists(target) and type(delfile) == "function" then delfile(target) end
+            end)
+        end
+        error("Could not save the imported configuration: " .. tostring(problem), 0)
+    end
+    -- Import settings only. Old local cargo and progress must not resume under this setup.
+    clearResume()
+    clearPNBResume()
+    clearPlantResume()
+    clearRotationResume()
+    App.config, App.profile = config, profile
+    App.sessionSignature, App.sessionSaveError, App.sessionRestoreError = signature, nil, nil
+    resetWebhookSchedule()
+    setStatus("Imported and saved profile: " .. profile .. ". Check locations, then start your task.")
+    return profile
+end
+
 local sessionOK, sessionProblem = pcall(restoreSession, previousSession)
 App.sessionRestoreError = not sessionOK and tostring(sessionProblem) or nil
 previousSession = nil
@@ -3587,6 +3660,7 @@ if env.ClarisGrowbloxTest then
         runTreeHarvest = runTreeHarvest, treeGrowthHooks = treeGrowthHooks,
         runRotation = runRotation, readRotationResume = readRotationResume, saveRotationResume = saveRotationResume,
         clearRotationResume = clearRotationResume,
+        exportConfiguration = exportConfiguration, saveConfigExport = saveConfigExport, importConfiguration = importConfiguration,
         saveSession = saveSession, restoreSession = restoreSession, pollSession = pollSession,
         runPlant = runPlant, plantTile = plantTile, enterPlantWorld = enterPlantWorld,
         readPlantResume = readPlantResume, savePlantResume = savePlantResume, clearPlantResume = clearPlantResume,
@@ -3968,6 +4042,52 @@ profileTab:Button({ Title = "Delete selected profile", Callback = uiAction(funct
     listProfiles()
     setStatus("Deleted profile: " .. name)
 end) })
+
+do
+    profileTab:Paragraph({ Title = "Transfer a configuration", Desc = "Copy your setup from an emulator to a cloud phone or another account. Includes saved places, all farm boxes, the world list, harvesting method, timing, and webhook settings. Import saves a local profile and keeps farming Off. Check each account's locations and world access before starting." })
+    local configText = profileTab:Input({ Title = "Configuration text", Type = "Textarea", Value = "",
+        Placeholder = "Export on the source device, then paste the full JSON here on the destination.",
+        ClearTextOnFocus = false, Callback = function() end })
+    local importName = profileTab:Input({ Title = "Import as profile (optional)", Value = "",
+        Placeholder = "Blank keeps the exported profile name", ClearTextOnFocus = false, Callback = function() end })
+    local filePath = profileTab:Input({ Title = "Configuration file path", Value = ROOT .. "/exports/" .. App.profile .. ".json",
+        Desc = "For a copied export file instead of pasted text.", ClearTextOnFocus = false, Callback = function() end })
+    profileTab:Button({ Title = "Export config", Desc = "Show export text, copy it to the clipboard, and save an export file when available.",
+        Callback = function()
+            task.spawn(function()
+                local ok, problem = pcall(function()
+                    local text, record = exportConfiguration()
+                    configText:Set(text)
+                    local copy = setclipboard or toclipboard
+                    local copied = type(copy) == "function" and pcall(copy, text)
+                    local saved, path = pcall(saveConfigExport, record)
+                    if saved then filePath:Set(path) end
+                    setStatus("Exported " .. record.profile .. (copied and "; copied to clipboard." or "; copy the Configuration text field.")
+                        .. (saved and (" File: " .. path) or " Export file unavailable; use the text."))
+                    notify(copied and "Configuration copied. Paste it on your other device." or "Export ready in Configuration text. Copy it to your other device.")
+                end)
+                if not ok then setStatus(tostring(problem)); notify(tostring(problem)) end
+            end)
+        end })
+    local function importText(text)
+        local name = importConfiguration(text, importName.Value)
+        selectedProfile = name
+        syncUI()
+        local listed, issue = pcall(listProfiles)
+        if not listed then notify("Profile imported and saved; profile list refresh failed: " .. tostring(issue)) end
+    end
+    profileTab:Button({ Title = "Import config", Desc = "Stop your task, paste Configuration text, then import. An existing profile with the same name is backed up.",
+        Callback = uiAction(function() importText(configText.Value) end) })
+    profileTab:Button({ Title = "Import config file", Desc = "Read the copied JSON file at Configuration file path and save its setup here.",
+        Callback = uiAction(function()
+            local path = filePath.Value
+            assert(type(path) == "string" and path:match("%S") and #path <= 512, "Enter the copied configuration file path.")
+            assert(exists(path), "Configuration file was not found. Copy it to this device or paste the export text.")
+            local text = readfile(path)
+            importText(text)
+            configText:Set(text)
+        end) })
+end
 
 rotationTab:Paragraph({ Title = "Plant, harvest, break, repeat", Desc = "Use the full Planting farm list. Plant all farms, wait for trees to mature, harvest with Fist or Dear John Tractor, transport blocks to PNB, return harvested seeds to planting stock, and repeat. Rotation enters saved worlds directly; it does not need linked doors." })
 ui.rotationFarms = rotationTab:Paragraph({ Title = "Farm storage saved per world", Desc = "Visit every listed farm, stand beside its Display Box, and save it here. Harvest Drops and Moving Drops save buttons also remember each world." })

@@ -171,6 +171,29 @@ function Core.grid(anchor)
     return result
 end
 
+function Core.exportConfig(config, profile, scriptVersion)
+    return {format = "ClarisGrowbloxConfig", version = 1, scriptVersion = scriptVersion,
+        profile = Core.profileName(profile), config = Core.validate(config)}
+end
+
+function Core.importConfig(record, name)
+    assert(type(record) == "table", "Paste an exported configuration or saved profile JSON.")
+    local config, profile
+    if record.format ~= nil then
+        assert(record.format == "ClarisGrowbloxConfig" and record.version == 1,
+            "Unsupported configuration export. Export again using the current script.")
+        config, profile = Core.validate(record.config), Core.profileName(record.profile)
+    else
+        assert(record.config == nil, "Import a configuration export or profile file; task recovery files cannot be imported.")
+        config, profile = Core.validate(record), "Imported Farm"
+    end
+    if name ~= nil then
+        assert(type(name) == "string", "Enter a profile name.")
+        if name:match("%S") then profile = Core.profileName(name) end
+    end
+    return config, profile
+end
+
 function Core.seedId(items, blockId)
     local item = items[blockId]
     assert(item, "Selected block is missing from the current game data.")

@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.21.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.22.
+
+Version 0.1.22 adds **Configurations → Export config / Import config** for emulator-to-cloud-phone and multi-account setup. Export copies the current settings, saved locations, full farm list, per-world harvest boxes, and harvesting method into portable JSON. It also saves an export file when Delta file functions are available. Import validates the text, saves a named profile and account-bound session on the destination device, and keeps farming Off. Exported setups contain settings only; running cargo/progress stays local to its account. Saved profile JSON files can also be imported.
 
 Version 0.1.21 adds tree harvesting with **Fist** and **Dear John Tractor**. It breaks ripe trees before collecting matching blocks and seeds into the same Farm Display Box, preserves top-down zigzag direction, and skips empty or growing rows. Planting checks live row space before positioning and suspends harvesting vehicles during planting travel. Moving Drops now accepts a mixed block/seed Farm box, keeps up to 200 seeds between block trips, and returns held seeds to that box when all blocks have moved. **Full Rotation** plants the entire Planting world list, waits for maturity, harvests and processes each farm through PNB, returns seeds to planting stock, and repeats with saved progress across world changes.
 
@@ -118,7 +120,7 @@ Existing profiles and saved locations still work. Collect any drops remaining in
 
 1. On **Place & Break**, select the harvested block, such as Sugar Cane. The same selected block applies to Harvest Drops and Moving Drops.
 2. In the farm world, stand beside a Display Box for the selected block and its seed and use **Harvest Drops → Save Farm storage**. The location is shared with **Moving Drops → Farm storage**, so an existing saved box works. Save your profile after setup.
-3. Choose **Harvest method ? Fist** or **Dear John Tractor**, then turn **Collect harvest** On. Ripe trees are broken first; growing trees stay planted. Matching loose blocks and seeds, including those already held, are then collected and stored in the same box. **Respawn to Farm storage** defaults to On; keep it enabled when the respawn door is near the box or turn it Off to walk back.
+3. Choose **Harvest method → Fist** or **Dear John Tractor**, then turn **Collect harvest** On. Ripe trees are broken first; growing trees stay planted. Matching loose blocks and seeds, including those already held, are then collected and stored in the same box. **Respawn to Farm storage** defaults to On; keep it enabled when the respawn door is near the box or turn it Off to walk back.
 4. Enable **Start Moving Drops after collection** before starting if you want automatic transport. Both linked doors and the destination block box must already be saved. This option is saved per profile and defaults to Off for older profiles. When collection finishes, Collect harvest turns Off and Moving Drops turns On for the transfer. With the option Off, you can start Moving Drops manually afterward.
 5. Turn the active task toggle Off to stop. The status shows collection, movement, and storage progress; collected/stashed session totals also appear in Discord reports.
 
@@ -176,6 +178,17 @@ Planting saves its farm index before world changes and tracks interrupted seed a
 
 See [README-ROTATION.md](README-ROTATION.md) for setup, the complete cycle, saved progress, and recovery instructions.
 
+## Export from an emulator and import on a cloud phone
+
+1. On the source device, open **Configurations → Export config**. This exports the current setup, including changes not yet saved under a named profile. Exporting works while farming runs. Copy the exported text from the clipboard or the **Configuration text** field to your destination device.
+2. Run v0.1.22 on the destination device and stop any active task. Open **Configurations**, paste the complete export into **Configuration text**, and optionally enter **Import as profile**. Leaving the name blank keeps the exported profile name.
+3. Press **Import config**. The setup is applied and saved locally as that profile, and the session is saved for the destination account. You do not need another Save profile step. Existing profiles with the same name get a `.bak` backup.
+4. Check saved locations, seed/block selection, and the farm list, then turn on the task you want. Import keeps tasks Off and clears previous local task-recovery checkpoints; it does not move inventory or transfer an in-progress trip from another device.
+
+For file transfer, Export config also saves `ClarisGrowblox/exports/<profile>.json` when file functions are available. Copy that file to the destination device, enter its local path in **Configuration file path**, and press **Import config file**. Existing `ClarisGrowblox/profiles/<name>.json` profile files work too. If clipboard or file access is unavailable, the exported text remains in the Configuration text field. Exports include saved webhook settings and the webhook URL.
+
+Configs are portable between Roblox accounts, but saved locations still refer to the original world's tiles. For another account, save its PNB spot and matching left/right boxes, press **Full Rotation → Use PNB seeds for planting**, assign its farm list, and save the harvest box in each assigned farm. Save the result under that account's profile name. Moving the character alone does not update coordinates. Each account needs access to its worlds and its own tractor for Tractor mode. Simultaneous accounts should use separate assigned farms and storage; the script has no shared-work coordination. Update linked doors too if using standalone Moving Drops.
+
 ## Configuration files
 
 Profiles are saved in Delta's local `ClarisGrowblox/profiles/<name>.json` files. Saving again under a different name creates another profile. Loading a profile changes the script's selected block, saved locations, and settings; it does not move the player.
@@ -202,7 +215,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.21 passes 256 offline checks: 36 configuration/layout/storage tests, 212 generated-runtime tests against mock services/server, six generated-loader tests, and two release checks. Coverage includes Fist/Tractor harvesting before pickup, row skipping, gear restoration, seeds exceeding stack capacity, mixed transfers and seed returns, two full rotations over two farms, saved transfer recovery, planting/PNB picker interruptions, and ambiguous storage checkpoints. These mocks do not establish live speed, tractor/server acceptance, Delta frame times, planting reach, route geometry, permissions, teleport queue behavior, or Discord delivery.
+Version 0.1.22 passes 266 offline checks: 39 configuration/layout/storage tests, 219 generated-runtime tests against mock services/server, six generated-loader tests, and two release checks. New coverage verifies portable export fields, saved-profile imports, account-independent setup with destination-account session persistence, rollback on import save failure, profile backups, invalid JSON/version/recovery-file rejection, and running-task import guards. Prior harvesting, rotation, transfer, navigation, and recovery checks remain passing. These mocks do not establish live clipboard behavior, tractor/server acceptance, Delta frame times, planting reach, route geometry, permissions, teleport queue behavior, or Discord delivery.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 

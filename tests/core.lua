@@ -396,4 +396,43 @@ test("Full rotation requires matching planting seeds, shared PNB seed storage, a
     rejects(function() Core.checkSetup(config,"rotation",items) end,"PNB seed box")
 end)
 
+test("Portable exports retain all setup fields and round trip independently of device or account", function()
+    local config=setup()
+    config.planting={seedId=955,storageWorld="BREAK",worlds={"FARM","FARM2"}}
+    config.harvesting.method="tractor"
+    config.rotation.farms.FARM2={world="FARM2",x=7,y=8,standX=6,standY=8}
+    local record=Core.exportConfig(config,"Emulator Farms","0.1.22")
+    assert(record.format == "ClarisGrowbloxConfig" and record.version == 1)
+    assert(record.userId == nil and record.state == nil and record.cargo == nil and record.active == nil)
+    local imported,name=Core.importConfig(record)
+    assert(name == "Emulator Farms" and imported.harvesting.method == "tractor")
+    assert(imported.planting.worlds[2] == "FARM2" and imported.rotation.farms.FARM2.x == 7)
+    imported.rotation.farms.FARM2.x=1
+    assert(record.config.rotation.farms.FARM2.x == 7 and config.rotation.farms.FARM2.x == 7)
+end)
+
+test("Configuration imports accept saved profile JSON and optional profile names", function()
+    local config=setup()
+    config.harvesting,config.rotation=nil,nil
+    local imported,name=Core.importConfig(config)
+    assert(name == "Imported Farm" and imported.harvesting.method == "fist" and imported.rotation.farms.FARM.x == 20)
+    local record=Core.exportConfig(config,"Source","0.1.22")
+    local _,renamed=Core.importConfig(record," Cloud Phone ")
+    assert(renamed == "Cloud Phone")
+    local _,unchanged=Core.importConfig(record,"  ")
+    assert(unchanged == "Source")
+    rejects(function() Core.importConfig(record,"../Other") end,"1-48")
+end)
+
+test("Configuration imports reject foreign exports, unsupported versions, recovery records, and damaged settings", function()
+    local record=Core.exportConfig(setup(),"Source","0.1.22")
+    record.format="OtherApp"
+    rejects(function() Core.importConfig(record) end,"Unsupported configuration export")
+    record.format,record.version="ClarisGrowbloxConfig",2
+    rejects(function() Core.importConfig(record) end,"Unsupported configuration export")
+    rejects(function() Core.importConfig({version=1,userId=123,config=setup(),phase="deliver",cargo=200}) end,"recovery files")
+    record.version,record.config.blockId=1,-1
+    rejects(function() Core.importConfig(record) end,"block ID")
+end)
+
 return string.format("%d configuration/layout/storage tests passed", passed)

@@ -1,8 +1,8 @@
 # Full Rotation guide
 
-For Claris Growblox 0.1.21. This runs **Planting ? Harvesting ? Place & Break ? repeat** across every world in your Planting list.
+For Claris Growblox 0.1.22. This runs **Planting → Harvesting → Place & Break → repeat** across every world in your Planting list.
 
-Use a reachable Display Box in each farm and keep the side platforms clear. In the breaking world, keep the usual layout: **Seed box ? Empty tile ? PNB spot ? Empty tile ? Block box**. The Farm boxes hold matching blocks and seeds together; the two PNB boxes remain separate.
+Use a reachable Display Box in each farm and keep the side platforms clear. In the breaking world, keep the usual layout: **Seed box — Empty tile — PNB spot — Empty tile — Block box**. The Farm boxes hold matching blocks and seeds together; the two PNB boxes remain separate.
 
 1. Save the PNB spot and its left seed / right block Display Boxes on **Place & Break**, and select the block to farm.
 2. On **Planting**, enter the complete farm world list in order.
@@ -22,3 +22,7 @@ Rotation saves the current phase, farm, cycle, planting progress, transfer cargo
 If setup reports a missing farm box, visit that exact world and save its box. If it reports a seed mismatch, use **Use PNB seeds for planting** again after selecting the correct block. If the tractor is missing or another crop is planted in the farm, choose **Fist** or correct the farm/equipment setup. For refused pickups or unreachable rows, use **Settings ? Copy diagnostics**.
 
 Saved checkpoints expire six hours after their last update. The script refreshes them while running, so this does not limit a rotation to six hours. Session counters reset when the script reloads.
+
+To copy this setup from an emulator to a cloud phone, use **Configurations → Export config**, paste the exported text on the destination device, and press **Import config**. See the [configuration transfer instructions](README.md#export-from-an-emulator-and-import-on-a-cloud-phone) for the file option and profile naming. Import saves settings and keeps the task Off; running progress is not transferred.
+
+For multiple accounts, import the setup and then save each account's own PNB spot and matching boxes. Press **Use PNB seeds for planting**, set that account's assigned farm list, and save its harvest boxes. Moving the account to a different layout alone does not change saved coordinates. Give simultaneous accounts separate farms and storage because the script does not coordinate shared work. Each account needs world access and its own tractor when using Tractor mode.
