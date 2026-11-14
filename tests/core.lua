@@ -368,6 +368,18 @@ test("Ripe trees follow physical row direction while growing trees and other cro
     assert(Core.hasTrees(world, 955) and not Core.hasTrees(world, 123))
 end)
 
+test("Harvest replanting defaults Off and survives profile export/import", function()
+    local config = setup()
+    config.options.harvestPlanting = nil
+    assert(Core.validate(config).options.harvestPlanting == false)
+    config.options.harvestPlanting = true
+    local record = Core.exportConfig(config, "Rotation", "0.1.31")
+    local imported = Core.importConfig(record)
+    assert(imported.options.harvestPlanting == true)
+    config.options.harvestPlanting = "yes"
+    rejects(function() Core.validate(config) end, "harvestPlanting")
+end)
+
 test("Planting row space excludes occupied, unsupported, and previously skipped cells", function()
     local world = {w = 4, h = 3, fg = {[0] = {[0]=955,[1]=0,[2]=0,[3]=0}, [1] = {[0]=2,[1]=2,[2]=0,[3]=2}}}
     local items = {[2]={solid=true}}

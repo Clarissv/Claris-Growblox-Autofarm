@@ -1,6 +1,6 @@
 # Full Rotation guide
 
-For **Claris Growblox 0.1.30**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
+For **Claris Growblox 0.1.31**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
 
 The usual flow is **fill planting space → PNB while trees grow → harvest a ready farm → transfer its blocks and seeds → replant that farm → repeat**. Planting and ready harvests normally take priority over breaking. When the planting seed supply is exhausted, rotation finishes the full PNB block stock first. A full farm skips planting even when seed storage contains thousands of seeds.
 
@@ -11,6 +11,7 @@ The usual flow is **fill planting space → PNB while trees grow → harvest a r
 - [Set the planting seed and farm list](#set-the-planting-seed-and-farm-list)
 - [Save each farm's harvest box](#save-each-farms-harvest-box)
 - [Choose Fist or Dear John Tractor](#choose-fist-or-dear-john-tractor)
+- [Replant during harvest](#replant-during-harvest)
 - [Save configuration and start](#save-configuration-and-start)
 - [Task priority and examples](#task-priority-and-examples)
 - [Routes, drops, and storage](#routes-drops-and-storage)
@@ -93,11 +94,29 @@ Choose the harvesting method on **Harvest Drops** before starting rotation.
 | Method | Behavior | Requirements |
 | --- | --- | --- |
 | **Fist** | Walks supported rows and hits ripe selected trees before collecting their drops. | Tile access and a reachable route. |
-| **Dear John Tractor** | Equips the tractor for the harvesting pass and drives over ripe trees using its native harvesting action. | Your own tractor available to equip, reachable rows, and a farm containing only the selected crop. |
+| **Dear John Tractor** | Drives each row once using native harvesting, then clears missed ripe trees with Fist from a reachable lower position. | Your own tractor available to equip, reachable rows, Fist hooks, and a farm containing only the selected crop. |
 
 Tractor mode rejects a farm containing another seed type because the vehicle can harvest other crops it touches. Choose Fist if other crops are present; rotation still targets the selected crop.
 
-The script removes harvesting equipment for planting, travel, and collection, and restores previous footwear when its equipment scope ends. Keep side platforms and row paths accessible.
+From v0.1.31, the Tractor continues to the end of a row when it misses trees. On the next reachable lower row it briefly removes the Tractor and punches the missed trees above, then continues forward. An otherwise empty lower row can be visited for cleanup. If no lower position is reachable, it uses Fist on the original row with the Tractor off. Growing trees stay planted. This behavior applies to standalone harvesting and Full Rotation without another toggle.
+
+The script removes the Tractor for Fist cleanup, travel, collection and standalone planting, and restores previous footwear when its equipment scope ends. Refill trips and the return to an unfinished row use normal walking speed, including when a world load restores worn equipment. The Tractor equips only after reaching the harvesting row entry. Combined harvest planting keeps it equipped while planting behind it. Keep side platforms and row paths accessible.
+
+## Replant during harvest
+
+Enable **Full Rotation → Replant during harvest** while tasks are stopped, then **Configurations → Save profile / Save as**. Choose Fist or Dear John Tractor on Harvest Drops. This option defaults to Off for existing profiles and applies to Full Rotation; standalone harvesting still breaks trees before collecting drops.
+
+With this setting On:
+
+1. Before a ready farm's harvest, rotation fills available backpack seed room from the saved left PNB seed box. If the box is empty, it uses any carried seeds and still completes harvesting.
+2. The Tractor follows the same top-left zigzag pass and plants cleared supported tiles behind it while moving. It gives harvested tiles a short confirmation window and observes the placement delay. Growing trees are skipped by native Tractor harvesting.
+3. Missed trees are punched from below where reachable. The script immediately plants that cleared upper tile from the same standing position if seeds are available and native placement allows it. It leaves a denied or unreachable placement for the later replant step. Fist mode also replants after each confirmed harvest.
+4. Carried seeds running out ends combined planting for this pass. Harvesting continues forward and finishes its missed-tree cleanup before collecting blocks, seeds and gems. It does not leave the row for a storage refill.
+5. Collected blocks, seeds and any unused carried seeds go into the farm box. Rotation transfers blocks to PNB and returns seeds to PNB seed storage as usual. Its normal replant step refills automatically and plants any remaining empty spaces, skipping trees already replanted during harvest.
+
+For example, with 600 ripe trees and 200 carried seeds, up to 200 cleared positions can be replanted during harvesting. Rotation harvests the remaining trees, collects/transfers the drops, then refills and plants the remaining spaces automatically. With enough carried seeds to fill the farm, the later replant scan skips its occupied spaces.
+
+This setting is saved in the profile, export/import and rotation checkpoint. Seed batches contain at most eight placements and are saved before each attempt. After an interruption, rotation reconciles the seed count and farm tiles before continuing. Unconfirmed seed placements or an interrupted storage withdrawal pause with diagnostics. Live speed depends on the client, placement reach and game response time; batch confirmations, Fist cleanup and row turns can still require short stops.
 
 ## Save configuration and start
 
@@ -127,7 +146,7 @@ A fresh run begins with a planting pass over the full list. It fills empty suppo
 | Full farms with ripe trees and planting seeds available | Skips occupied tiles and processes ready harvests before breaking existing PNB stock. |
 | Empty supported planting spaces with seeds available | Fills them during the initial planting pass, before the harvest/wait flow. |
 | A farm becomes ready during normal PNB | Finishes the current block and pickups, stores unused inventory, then leaves for harvest. |
-| A farm has been harvested | Transfers its blocks/seeds and replants that farm before more PNB. |
+| A farm has been harvested | Transfers its blocks/seeds and replants remaining empty spaces before more PNB. With Replant during harvest On, some or all tiles were already replanted during the harvest pass. |
 | A later farm matures first | Uses maturity deadlines to choose it instead of waiting at an earlier growing farm. |
 | PNB blocks run out while trees grow | Waits in the breaking world for harvest due or new blocks, without repeated growing-farm visits. |
 | Planting backpack and seed storage run out | Enters `drainPNB`: breaks all remaining PNB blocks, stores produced seeds, then resumes planting/harvesting. Ripe farms wait during this drain. |

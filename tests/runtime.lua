@@ -2704,13 +2704,16 @@ local function treeHarvestFixture(method)
         assert(f.app.controls and f.app.controls.pausePickup, "Tree harvesting must suppress automatic pickups")
         assert(f.world.fg[y][x] == 955 and f.app.runtime.treeRipe(x, y, 955))
         if f.refuseTree then return end
-        f.treeActions[#f.treeActions + 1] = {x = x, y = y, tractor = tractor}
+        if tractor and f.tractorMissed and f.tractorMissed[y*f.world.w+x] then return end
+        if not tractor and f.fistRefused then return end
+        f.treeActions[#f.treeActions + 1] = {x = x, y = y, tractor = tractor, avatarX=f.avatar.x, avatarY=f.avatar.y}
         f.world.fg[y][x], f.trees[y * f.world.w + x] = 0, nil
         f.addDrop(100 + #f.treeActions, 954, 10, x + 0.5, y + 0.5)
     end
     f.app.runtime.handlers = {hit = function(x, y)
         assert(f.worn ~= 898, "Fist must remove the automatic harvesting vehicle first")
-        assert(f.avatar.grounded and math.abs(f.avatar.x - (x + 0.5)) < 0.16)
+        assert(f.avatar.grounded and math.abs(f.avatar.x - (x + 0.5)) <= 2.5
+            and math.abs(y + 0.5 - (f.avatar.y - 0.475)) <= 2.5, "Fist must stay within native reach")
         f.hits = (f.hits or 0) + 1
         return destroy(x, y, false)
     end}
@@ -2840,6 +2843,284 @@ test("Tractor harvests by native walking, removes it between rows, and restores 
         end
     end
     assert(equips == 3 and f.world.riding == nil)
+end)
+
+local function requireForwardTractorPass(f)
+    local physics = f.onWait
+    f.onWait = function(dt)
+        if f.world.riding and f.world.riding.harvest and f.controls.dir() ~= 0 then
+            local y = math.floor(f.avatar.y-0.01)
+            local direction = y == 4 and -1 or 1
+            assert(f.controls.dir() == direction, "Tractor must not reverse along a row to revisit misses")
+        end
+        physics(dt)
+    end
+end
+
+local function harvestPlantingFixture(seeds)
+    local f = treeHarvestFixture("tractor")
+    f.app.config.options.harvestPlanting = true
+    f.app.config.planting = {seedId=955, storageWorld="BREAK", worlds={"FARM"}}
+    f.app.config.rotation.farms.FARM = f.app.config.points.farmBox
+    f.app.rotationState = {phase="harvest", worldIndex=1, cycle=1, work=0, seedCargo=0}
+    f.app.job = "rotation"
+    f.inventory:add(955, seeds)
+    f.serverItems[955], f.seedPlants = seeds, {}
+    f.app.runtime.handlers.canPlace = function(_, x, y)
+        return not (f.deniedPlants and f.deniedPlants[y*f.world.w+x])
+            and f.avatar.grounded and math.abs(f.avatar.x - (x+0.5)) <= 2.5
+            and math.abs(y+0.5-(f.avatar.y-0.475)) <= 2.5
+    end
+    f.app.runtime.handlers.plantSeed = function(id, x, y)
+        assert(id == 955 and f.world.fg[y][x] == 0 and f.serverItems[id] > 0)
+        assert(f.app.controls.pausePickup, "Harvest planting must keep automatic pickups suspended")
+        local saved = f.hooks.readRotationResume()
+        local pending = saved.state.harvestPlant.pending
+        local last = pending.tiles[#pending.tiles]
+        assert(saved.state.phase == "harvest" and last.x == x and last.y == y,
+            "The rotation must persist each harvest seed before planting")
+        f.seedPlants[#f.seedPlants+1] = {x=x,y=y,avatarY=f.avatar.y,
+            moving=math.abs(f.avatar.vx) > 0.8 and f.controls.dir() ~= 0,
+            tractor=f.world.riding and f.world.riding.harvest or false}
+        f.addTree(x,y,false)
+        f.inventory:remove(id,1)
+        if not f.refuseSeed then f.serverItems[id] = f.serverItems[id]-1 end
+    end
+    requireForwardTractorPass(f)
+    return f
+end
+
+test("Rotation replants cleared trees while the Tractor keeps its forward zigzag pass", function()
+    local f = harvestPlantingFixture(9)
+    for _,y in ipairs({2,4,6}) do for _,x in ipairs({2,7,13}) do f.addTree(x,y) end end
+    f.expectedTrees = 9
+    f.harvest()
+    assert(f.app.stats.trees==9 and f.app.stats.planted==9 and #f.seedPlants==9 and f.app.stats.stashed==90)
+    local moving = 0
+    for _,point in ipairs(f.seedPlants) do
+        assert(point.tractor and math.floor(point.avatarY-0.01)==point.y)
+        if point.moving then moving = moving+1 end
+        assert(f.world.fg[point.y][point.x]==955 and not f.app.runtime.treeRipe(point.x,point.y,955))
+    end
+    assert(moving>=6, "Replanting should share the Tractor movement")
+    assert(f.app.rotationState.harvestPlant.pending==nil and f.worn==777)
+end)
+
+test("Tractor misses are broken and replanted with Fist from the same lower position", function()
+    local f = harvestPlantingFixture(9)
+    for _,y in ipairs({2,4,6}) do for _,x in ipairs({2,7,13}) do f.addTree(x,y) end end
+    f.tractorMissed,f.expectedTrees = {[2*f.world.w+7]=true,[6*f.world.w+7]=true},9
+    f.harvest()
+    assert(f.hits==2 and f.app.stats.trees==9 and f.app.stats.planted==9 and f.app.stats.stashed==90)
+    local below = 0
+    for _,point in ipairs(f.seedPlants) do
+        if point.x==7 and (point.y==2 or point.y==6) then
+            below = below+1
+            assert(not point.tractor and math.floor(point.avatarY-0.01)==point.y+2,
+                "Do not return to the upper row to replant a cleaned tree")
+        end
+    end
+    assert(below==2 and f.worn==777)
+end)
+
+test("Dense tree rows harvest and replant through multiple seed batches without Tractor reversals", function()
+    local f=harvestPlantingFixture(36)
+    for _,y in ipairs({2,4,6}) do for x=2,13 do f.addTree(x,y) end end
+    f.expectedTrees=36
+    f.harvest()
+    assert(f.app.stats.trees==36 and f.app.stats.planted==36 and #f.seedPlants==36 and f.app.stats.stashed==360)
+    assert(f.app.rotationState.harvestPlant.pending==nil and f.worn==777)
+end)
+
+test("Running out of harvest planting seeds finishes harvesting without interrupting the row", function()
+    local f = harvestPlantingFixture(2)
+    for _,y in ipairs({2,4,6}) do for _,x in ipairs({2,7,13}) do f.addTree(x,y) end end
+    f.expectedTrees = 9
+    f.harvest()
+    assert(f.app.stats.trees==9 and f.app.stats.planted==2 and #f.seedPlants==2 and f.app.stats.stashed==90)
+    assert(f.world.fg[6][13]==0 and f.serverItems[955]==0 and f.worn==777)
+end)
+
+test("Denied harvest planting leaves that cleared tile for normal replanting", function()
+    local f = harvestPlantingFixture(3)
+    for _,x in ipairs({2,7,13}) do f.addTree(x,2) end
+    f.deniedPlants,f.expectedTrees = {[2*f.world.w+7]=true},3
+    f.harvest()
+    assert(f.app.stats.planted==2 and f.app.stats.trees==3 and f.world.fg[2][7]==0)
+    assert(f.hooks.Core.storageCount(f.boxes[12],955,954)==1)
+end)
+
+test("Unconfirmed harvest seeds pause before collection and retain the saved batch", function()
+    local f = harvestPlantingFixture(1)
+    f.addTree(2,2)
+    f.refuseSeed = true
+    rejects(f.harvest,"server did not confirm harvest planting")
+    assert(f.app.stats.planted==0 and #f.requests==0 and f.worn==777)
+    assert(f.hooks.readRotationResume().state.harvestPlant.pending.before==1)
+end)
+
+test("An interrupted harvest seed reconciles even when only growing trees remain", function()
+    local f = harvestPlantingFixture(2)
+    f.addTree(2,2,false)
+    f.app.rotationState.harvestPlant={worldIndex=1,phase="farm",skipped={},
+        pending={world="FARM",x=2,y=2,before=3,tiles={{x=2,y=2}}}}
+    f.harvest()
+    assert(f.app.stats.planted==1 and #f.seedPlants==0 and #f.treeActions==0)
+    assert(f.hooks.readRotationResume().state.harvestPlant.pending==nil)
+end)
+
+test("Stop during harvest planting restores footwear and leaves later trees untouched", function()
+    local f = harvestPlantingFixture(3)
+    for _,x in ipairs({2,7,13}) do f.addTree(x,2) end
+    local plant = f.app.runtime.handlers.plantSeed
+    f.app.runtime.handlers.plantSeed = function(id,x,y) plant(id,x,y); f.app:stop() end
+    rejects(f.harvest,"Stopped")
+    assert(#f.seedPlants==1 and f.world.fg[2][7]==955 and #f.requests==0 and f.worn==777)
+end)
+
+test("Tractor finishes each forward row and clears sparse misses with Fist from lower rows", function()
+    local f = treeHarvestFixture("tractor")
+    for _,y in ipairs({2,4,6}) do for _,x in ipairs({2,7,13}) do f.addTree(x,y) end end
+    f.tractorMissed = {[2*f.world.w+7]=true,[6*f.world.w+7]=true}
+    f.expectedTrees = 9
+    requireForwardTractorPass(f)
+    f.harvest()
+    assert(f.hits == 2 and #f.treeActions == 9 and f.app.stats.trees == 9 and f.app.stats.stashed == 90)
+    for _,point in ipairs(f.treeActions) do
+        if not point.tractor then
+            assert(point.x == 7 and math.floor(point.avatarY-0.01) == point.y+2,
+                "Missed trees should be punched from the next lower row")
+        end
+    end
+    assert(f.worn == 777 and f.app.pending == 0)
+end)
+
+test("Resumed Tractor harvesting walks to its work row before equipping the vehicle", function()
+    local f=treeHarvestFixture("tractor")
+    f.worn,f.world.riding=898,{harvest=true,speed=3.6}
+    for _,x in ipairs({2,7,13}) do f.addTree(x,4) end
+    f.expectedTrees=3
+    local wear=f.app.runtime.harvestGear.wear
+    f.app.runtime.harvestGear.wear=function(id)
+        wear(id)
+        if f.worn==898 and f.app.harvestPhase=="Breaking ripe trees" then
+            assert(math.abs(f.avatar.x-14.5)<0.16 and math.abs(f.avatar.y-5)<0.22,
+                "Equip Tractor only after reaching the row entry")
+        end
+    end
+    local physics=f.onWait
+    f.onWait=function(dt)
+        if f.controls.dir()~=0 and f.world.riding and f.world.riding.harvest then
+            assert(math.floor(f.avatar.y-0.01)==4,
+                "Return travel must use walking speed; Tractor is only for the harvest pass at "
+                    .. f.avatar.x .. ", " .. f.avatar.y .. "; phase " .. tostring(f.app.harvestPhase))
+        end
+        physics(dt)
+    end
+    f.harvest()
+    assert(f.app.stats.trees==3 and f.app.stats.stashed==30 and f.worn==898)
+end)
+
+test("An empty lower row clears Tractor misses with Fist without equipping the vehicle", function()
+    local f = treeHarvestFixture("tractor")
+    for _,x in ipairs({2,7,13}) do f.addTree(x,2) end
+    f.tractorMissed,f.expectedTrees = {[2*f.world.w+7]=true},3
+    requireForwardTractorPass(f)
+    f.harvest()
+    assert(f.hits == 1 and f.app.stats.trees == 3 and f.app.stats.stashed == 30)
+    for _,action in ipairs(f.wearActions) do
+        if action.worn == 898 then assert(math.floor(action.y-0.01) == 2) end
+    end
+    local point=f.treeActions[#f.treeActions]
+    assert(not point.tractor and point.y==2 and math.floor(point.avatarY-0.01)==4)
+end)
+
+test("The lowest Tractor row uses the supported bottom floor for Fist cleanup", function()
+    local f = treeHarvestFixture("tractor")
+    for _,x in ipairs({2,7,13}) do f.addTree(x,6) end
+    f.tractorMissed,f.expectedTrees = {[6*f.world.w+7]=true},3
+    requireForwardTractorPass(f)
+    f.harvest()
+    assert(f.hits==1 and f.app.stats.trees==3 and f.app.stats.stashed==30)
+    for _,point in ipairs(f.treeActions) do
+        if not point.tractor then assert(point.y==6 and math.floor(point.avatarY-0.01)==8) end
+    end
+end)
+
+test("Tractor misses use a normal Fist approach when no lower standing position exists", function()
+    local f = treeHarvestFixture("tractor")
+    f.world.h = 8
+    f.world.fg[6][0],f.boxes[0] = 1422,{}
+    f.app.config.points.farmBox = {world="FARM",x=0,y=6,standX=1,standY=6}
+    f.avatar.x,f.avatar.y=1.5,6.999
+    local server=f.server
+    f.server=function(name,x,y,id,unused,unused2,n)
+        if name~="DisplayItem" then return server(name,x,y,id,unused,unused2,n) end
+        assert(x==0 and y==6 and id==954 and f.serverItems[id]>=n)
+        f.serverItems[id]=f.serverItems[id]-n
+        f.boxes[0]={{954,f.hooks.Core.itemCount(f.boxes[0],954)+n}}
+        f.deposits[#f.deposits+1]=n
+        return true
+    end
+    f.app.config.options.harvestRespawn=false
+    for _,x in ipairs({2,7,13}) do f.addTree(x,6) end
+    f.tractorMissed,f.expectedTrees = {[6*f.world.w+7]=true},3
+    requireForwardTractorPass(f)
+    f.harvest()
+    assert(f.hits==1 and f.app.stats.trees==3 and f.app.stats.stashed==30)
+    for _,point in ipairs(f.treeActions) do
+        if not point.tractor then assert(math.floor(point.avatarY-0.01)==6) end
+    end
+    assert(f.worn==777)
+end)
+
+test("Refused Fist cleanup pauses Tractor harvesting before collecting any drops", function()
+    local f=treeHarvestFixture("tractor")
+    for _,x in ipairs({2,7,13}) do f.addTree(x,2) end
+    f.tractorMissed,f.fistRefused={[2*f.world.w+7]=true},true
+    requireForwardTractorPass(f)
+    rejects(f.harvest,"Fist did not harvest the missed tree")
+    assert(f.hits==3 and #f.treeActions==2 and f.world.fg[2][7]==955)
+    assert(#f.requests==0 and f.worn==777 and f.app.stats.trees==2)
+end)
+
+test("Stop during Fist cleanup prevents more Tractor passes and restores previous footwear", function()
+    local f=treeHarvestFixture("tractor")
+    for _,y in ipairs({2,4}) do for _,x in ipairs({2,7,13}) do f.addTree(x,y) end end
+    f.tractorMissed={[2*f.world.w+7]=true}
+    local hit=f.app.runtime.handlers.hit
+    f.app.runtime.handlers.hit=function(x,y)
+        hit(x,y)
+        f.app:stop()
+    end
+    requireForwardTractorPass(f)
+    rejects(f.harvest,"Stopped")
+    assert(f.hits==1 and #f.requests==0 and f.worn==777 and f.app.controls==nil)
+    assert(f.world.fg[4][2]==955, "Lower-row trees after the cleanup position must stay untouched after Stop")
+end)
+
+test("Changed missed trees are never punched as another crop during Tractor cleanup", function()
+    local f=treeHarvestFixture("tractor")
+    for _,x in ipairs({2,7,13}) do f.addTree(x,2) end
+    f.tractorMissed={[2*f.world.w+7]=true}
+    local physics=f.onWait
+    f.onWait=function(dt)
+        physics(dt)
+        if f.avatar.y>4 and #f.treeActions==2 then f.world.fg[2][7]=627 end
+    end
+    rejects(f.harvest,"missed tree was replaced")
+    assert(not f.hits and f.world.fg[2][7]==627 and #f.requests==0 and f.worn==777)
+end)
+
+test("Growing trees remain planted while nearby Tractor misses are cleared from below", function()
+    local f=treeHarvestFixture("tractor")
+    for _,x in ipairs({2,7,13}) do f.addTree(x,2) end
+    f.addTree(5,2,false)
+    f.tractorMissed,f.expectedTrees={[2*f.world.w+7]=true},3
+    requireForwardTractorPass(f)
+    f.harvest()
+    assert(f.hits==1 and f.world.fg[2][5]==955 and f.app.stats.trees==3 and f.app.stats.stashed==30)
+    assert(f.worn==777)
 end)
 
 test("Growing trees alone do not cause harvest movement or punches", function()
@@ -3814,6 +4095,33 @@ test("Planting removes a harvesting tractor so occupied trees remain intact duri
     for x = 1, 5 do assert(f.grids.FARM1[1][x] == 955) end
 end)
 
+test("Refill world loads remove a restored Tractor before returning to the unfinished planting row", function()
+    local f=wideZigzagPlantingFixture(2)
+    f.app.runtime.harvestGear={feet=function() return f.worn end,wear=function(id)
+        if f.worn==id then f.worn=nil else f.worn=id end
+        f.world.riding=f.worn==898 and {harvest=true,speed=3.6} or nil
+    end}
+    f.worn,f.world.riding=898,{harvest=true,speed=3.6}
+    local enter=f.onEnter
+    f.onEnter=function(name)
+        enter(name)
+        f.worn,f.world.riding=898,{harvest=true,speed=3.6} -- Simulate worn ride restoration on arrival.
+        return true
+    end
+    local physics=f.onWait
+    f.onWait=function(dt)
+        if f.controls.dir()~=0 or f.controls.jumping() then
+            assert(f.worn~=898 and not f.world.riding,
+                "Storage approaches and return-to-row travel must keep the Tractor off")
+        end
+        physics(dt)
+    end
+    f.onPlant=function() assert(f.worn~=898) end
+    f.hooks.start("plant")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(#f.plantCalls==96 and f.withdrawals==1 and f.worn==898)
+end)
+
 test("An occupied solid edge does not prevent planting the rest of its row", function()
     local f = zigzagPlantingFixture(20)
     f.grids.FARM1[1][1] = 2
@@ -4203,6 +4511,7 @@ end)
 test("Actual UI imports, loads, and resets profiles with the supported harvest dropdown method", function()
     local f, app, controls, workers = actualUIFixture()
     app.config.harvesting.method = "tractor"
+    app.config.options.harvestPlanting = true
     app.config.planting.worlds = {"FARM1", "FARM2"}
     local record = f.hooks.Core.exportConfig(app.config, "Portable UI", "0.1.25")
     controls["Configuration text"].Value = f.services.HttpService:JSONEncode(record)
@@ -4210,19 +4519,39 @@ test("Actual UI imports, loads, and resets profiles with the supported harvest d
     workers[3]()
     assert(app.profile == "Portable UI" and controls["Harvest method"].Value == "Dear John Tractor" and not app.syncingUI)
     assert(f.files["ClarisGrowblox/accounts/1234/profiles/Portable UI.json"] and app.job == nil)
+    assert(controls["Replant during harvest"].Value and app.config.options.harvestPlanting)
     -- The fixture codec stores tables by reference; snapshot the saved JSON as
     -- real serialization does before changing the live configuration.
     f.encoded[f.files["ClarisGrowblox/accounts/1234/profiles/Portable UI.json"]] = f.hooks.Core.validate(app.config)
     controls["Harvest method"].Props.Callback("Fist")
+    controls["Replant during harvest"]:Set(false)
     assert(app.config.harvesting.method == "fist")
     controls["Saved profiles"].Props.Callback("Portable UI")
     controls["Load selected profile"].Props.Callback()
     workers[4]()
     assert(app.config.harvesting.method == "tractor" and controls["Harvest method"].Value == "Dear John Tractor")
+    assert(controls["Replant during harvest"].Value and app.config.options.harvestPlanting)
     assert(controls["Dirt farm worlds (in order)"].Value == "FARM1, FARM2" and not app.syncingUI)
     controls["New empty configuration"].Props.Callback()
     workers[5]()
     assert(app.profile == "New Farm" and controls["Harvest method"].Value == "Fist" and not app.syncingUI)
+    assert(not controls["Replant during harvest"].Value and not app.config.options.harvestPlanting)
+end)
+
+test("Harvest replanting toggle preserves active rotation and honors UI synchronization", function()
+    local f, app, controls = actualUIFixture()
+    local toggle = controls["Replant during harvest"]
+    toggle:Set(true)
+    assert(app.config.options.harvestPlanting)
+    local session = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/accounts/1234/session.json"])
+    assert(session.config.options.harvestPlanting)
+    app.job = "rotation"
+    toggle:Set(false)
+    assert(app.config.options.harvestPlanting and toggle.Value and not app.syncingUI)
+    app.syncingUI = true
+    toggle:Set(false)
+    assert(app.config.options.harvestPlanting and app.syncingUI)
+    app.syncingUI = false
 end)
 
 test("Changing harvest method during a task restores the dropdown using Select without changing config", function()
@@ -4607,6 +4936,76 @@ local function fillGrowingFarms(f, readyIn)
         end
     end
 end
+
+test("Combined rotation loads PNB seeds and replants both ripe farms during harvest before breaking", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=0,FARM2=0})
+    f.app.config.options.harvestPlanting=true
+    local plant=f.app.runtime.handlers.plantSeed
+    f.app.runtime.handlers.plantSeed=function(id,x,y)
+        assert(f.app.rotationState.phase=="harvest" and f.pnbBlocks==0,
+            "Cleared ripe farms should replant in their harvest pass before PNB")
+        assert(f.serverItems[id]>0 and f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955)==0,
+            "Stock should be loaded from the PNB box before harvesting")
+        plant(id,x,y)
+    end
+    f.afterWait=function() if f.app.stats.cycles==1 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(#f.harvests==10 and #f.plants==10 and f.app.stats.planted==10 and f.pnbBlocks==0)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12],954)==410)
+end)
+
+test("An interrupted harvest stock withdrawal never retries its storage request on resume", function()
+    local f=rotationFixture()
+    f.app.config.options.harvestPlanting=true
+    f.hooks.saveRotationResume({phase="harvestPickupPending",worldIndex=1,cycle=1,work=0,seedCargo=0})
+    local saved=f.hooks.readRotationResume()
+    f.server=function() error("No server request may run for ambiguous harvest stock") end
+    f.hooks.start("rotation",saved)
+    assert(f.app.lastError:find("harvest seed withdrawal was interrupted",1,true))
+    assert(#f.entries==0 and #f.plants==0 and #f.harvests==0)
+end)
+
+test("Combined rotation automatically refills and replants the spaces left after carried seeds run out", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=0,FARM2=0})
+    f.worldBoxes.BREAK[8]={{955,3}}
+    f.app.config.options.harvestPlanting=true
+    local plant,phases=f.app.runtime.handlers.plantSeed,{}
+    f.app.runtime.handlers.plantSeed=function(id,x,y)
+        assert(f.pnbBlocks==0)
+        phases[#phases+1]=f.app.rotationState.phase
+        plant(id,x,y)
+    end
+    f.afterWait=function() if f.app.stats.cycles==1 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    local combined,refilled=0,0
+    for _,phase in ipairs(phases) do
+        if phase=="harvest" then combined=combined+1
+        elseif phase=="replant" then refilled=refilled+1 end
+    end
+    assert(combined==6 and refilled==4 and #f.harvests==10 and f.app.stats.planted==10)
+end)
+
+test("Harvest stock world-change checkpoints retain the combined setting and farm target", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=0,FARM2=0})
+    f.app.config.options.harvestPlanting=true
+    f.env.ClarisGrowbloxLoaderURL="https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/loader.lua"
+    local queued,enter={},f.world.enter
+    queue_on_teleport=function(code) queued[#queued+1]=code end
+    f.world.enter=function(name) enter(name); return true,nil,true end
+    f.afterWait=function() if f.app.teleporting then f.app.alive=false end end
+    f.hooks.saveRotationResume({phase="harvestStock",worldIndex=2,cycle=1,work=0,seedCargo=0})
+    f.hooks.start("rotation",f.hooks.readRotationResume())
+    assert(#queued==1 and queued[1]:find("ClarisGrowbloxAutoResume = true",1,true))
+    local next=f.reload()
+    local saved=next.readRotationResume()
+    assert(saved.state.phase=="harvestStock" and saved.state.worldIndex==2 and saved.config.options.harvestPlanting)
+    queue_on_teleport=nil
+end)
 
 test("Full growing farms skip planting with seed stock available and run PNB while waiting", function()
     local f=rotationFixture()
