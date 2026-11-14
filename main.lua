@@ -648,7 +648,7 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.25"
+local VERSION = "0.1.26"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -819,13 +819,14 @@ local function bounded(fn, seconds, token, ...)
 end
 
 local function newScan()
-    return {values = {}, names = {}, work = 0, yields = 0, reads = 0, lastYield = os.clock()}
+    return {values = {}, names = {}, work = 0, steps = 0, yields = 0, reads = 0, lastYield = os.clock()}
 end
 local function scanStep(scan, stage)
     assert(App.alive, "This script was unloaded during discovery.")
     App.startupStage = stage
     scan.work = scan.work + 1
-    if scan.work >= 2048 or os.clock() - scan.lastYield >= 0.006 then
+    scan.steps = scan.steps + 1
+    if scan.work >= 8192 or os.clock() - scan.lastYield >= 0.006 then
         task.wait()
         assert(App.alive, "This script was unloaded during discovery.")
         scan.work, scan.lastYield, scan.yields = 0, os.clock(), scan.yields + 1
@@ -1062,7 +1063,7 @@ local function resolveItems(world, objects, registry, scan)
         end
     end
     table.insert(App.discoveryReport, "Registry item lookup: " .. registryIssue)
-    for _, object in pairs(objects) do
+    for _, object in pairs(scan.tables or objects) do
         scanStep(scan, "Finding item definitions")
         consider(object, "GC item definitions")
     end
@@ -1139,12 +1140,22 @@ local function discover(options)
     task.wait() -- Let the window render before taking the executor's GC snapshot.
     assert(App.alive, "This script was unloaded during discovery.")
     local objects = getgc(true)
-    local registry, registrySource = resolveRegistry(objects, scan)
-    App.discoveryReport = { "Registry: " .. registrySource }
-    local worlds, physics, controls = {}, {}, {}
+    local registry, registrySource = resolveRegistry({}, scan)
+    local registryKey = ReplicatedStorage:GetAttribute("Qz")
+    local worlds, physics, controls, huds, backpacks, menus, entries = {}, {}, {}, {}, {}, {}, {}
+    scan.tables, scan.functions = {}, {}
     for _, object in pairs(objects) do
-        scanStep(scan, "Finding world and controls")
+        scanStep(scan, "Indexing world and controls")
         if type(object) == "table" then
+            table.insert(scan.tables, object)
+            if not registry then
+                local map = registryMap(object, scan)
+                if map then registry, registrySource = map, "GC module map"
+                elseif registryKey ~= nil then
+                    map = registryMap(rawget(object, registryKey), scan)
+                    if map then registry, registrySource = map, "GC shared table" end
+                end
+            end
             if type(rawget(object, "backpackNow")) == "function"
                 and type(rawget(object, "displayPut")) == "function"
                 and type(rawget(object, "useDoor")) == "function"
@@ -1164,15 +1175,26 @@ local function discover(options)
                 and type(rawget(object, "edit")) == "function" then
                 table.insert(controls, object)
             end
+            if type(rawget(object, "setGems")) == "function" and type(rawget(object, "addGems")) == "function"
+                and type(rawget(object, "setWorld")) == "function" and type(rawget(object, "isTyping")) == "function" then
+                table.insert(huds, object)
+            end
+            if inventoryObject(object) then table.insert(backpacks, object) end
+            if type(rawget(object, "respawn")) == "function" then table.insert(menus, object) end
+        elseif type(object) == "function" then
+            table.insert(scan.functions, object)
+            if functionName(object, scan) == "enter" then table.insert(entries, object) end
         end
     end
+    objects = nil -- Do not retain the unfiltered GC snapshot between attachment stages.
+    App.discoveryReport = { "Registry: " .. registrySource }
     table.insert(App.discoveryReport, "World tables: " .. #worlds .. "; avatar controllers: "
         .. #physics .. "; touch controls: " .. #controls)
     assert(#worlds == 1, "Could not identify one active Growblox world table (found " .. #worlds .. ").")
     local world = worlds[1]
     local issues = {}
     local gemHud
-    for _, candidate in pairs(objects) do
+    for _, candidate in ipairs(huds) do
         scanStep(scan, "Finding player HUD")
         if type(candidate) == "table" and type(rawget(candidate, "setGems")) == "function"
             and type(rawget(candidate, "addGems")) == "function"
@@ -1208,7 +1230,7 @@ local function discover(options)
         if ok and type(snapshot) == "table" then
             local counts = {}
             for _, slot in pairs(snapshot) do counts[slot[1]] = (counts[slot[1]] or 0) + slot[2] end
-            for _, candidate in pairs(objects) do
+            for _, candidate in ipairs(backpacks) do
                 scanStep(scan, "Finding backpack")
                 if inventoryObject(candidate) then
                     local identical, seen = true, {}
@@ -1244,7 +1266,7 @@ local function discover(options)
     local handlers, ambiguousHandlers = {}, {}
     scan.owned = {}
     if not scan.transferOnly then
-        for _, object in pairs(objects) do
+        for _, object in ipairs(scan.functions) do
             scanStep(scan, "Finding game handlers")
             if type(object) == "function" and owns(object, world, scan) then
                 table.insert(scan.owned, object)
@@ -1263,15 +1285,15 @@ local function discover(options)
             if not handlers[name] then table.insert(issues, "Missing farming handler: " .. name) end
         end
     end
-    local items, itemSource = resolveItems(world, objects, registry, scan)
-    local respawn, respawnSource = findRespawn(world, objects, scan)
+    local items, itemSource = resolveItems(world, scan.functions, registry, scan)
+    local respawn, respawnSource = findRespawn(world, menus, scan)
     local treeRipe, harvestGear, treeRemaining
     if not scan.transferOnly then treeRipe, harvestGear, treeRemaining = treeGrowthHooks(world, items, handlers, scan) end
     table.insert(App.discoveryReport, "Item definitions: " .. itemSource)
     local runtime = { world = world, body = body, controls = controls[1], inventory = inventory,
         items = items, handlers = handlers, issues = issues,
         readInventoryView = readInventoryView, ready = #issues == 0, gemHud = gemHud,
-        picker = findWorldPicker(world, objects, scan), farmingDeferred = scan.transferOnly,
+        picker = findWorldPicker(world, entries, scan), farmingDeferred = scan.transferOnly,
         respawn = respawn, respawnSource = respawnSource,
         treeRipe = treeRipe, harvestGear = harvestGear, treeRemaining = treeRemaining }
     table.insert(App.discoveryReport, "Inventory: " .. (readInventoryView and "readable snapshot" or "live backpack"))
@@ -1285,9 +1307,10 @@ local function discover(options)
     table.insert(App.discoveryReport, "Tree growth hook: " .. (runtime.treeRipe and "ready" or scan.transferOnly and "deferred" or "unavailable"))
     table.insert(App.discoveryReport, "Harvest equipment: " .. (harvestGear and "ready" or scan.transferOnly and "deferred" or "unavailable"))
     App.startupStage = "Attached"
-    App.discoveryPerformance = {yields = scan.yields, upvalueReads = scan.reads, seconds = os.clock() - startedAt}
+    App.discoveryPerformance = {yields = scan.yields, upvalueReads = scan.reads, steps = scan.steps,
+        tables = #scan.tables, functions = #scan.functions, seconds = os.clock() - startedAt}
     table.insert(App.discoveryReport, "Discovery: " .. scan.yields .. " frame yields; " .. scan.reads
-        .. " function upvalue reads; " .. string.format("%.2fs", App.discoveryPerformance.seconds))
+        .. " function upvalue reads; " .. scan.steps .. " indexed checks; " .. string.format("%.2fs", App.discoveryPerformance.seconds))
     -- The game already owns tileChanged handling. Own actions are optimistic and
     -- need not receive an echo; do not add a listener or require an acknowledgment.
     return runtime
@@ -1451,7 +1474,9 @@ local function moveTo(x, y, worldName, token, onStep)
     tileAt(x, y)
     local hold = takeControls()
     local targetX, targetY = x + 0.5, y + 1
-    local farmNavigation = App.job == "plant" or App.job == "harvest"
+    local rotationPhase = App.rotationState and App.rotationState.phase
+    local farmNavigation = App.job == "plant" or App.job == "harvest" or App.job == "rotation"
+        and (rotationPhase == "plant" or rotationPhase == "replant" or rotationPhase == "harvest")
     local timeout = farmNavigation and math.max(90, App.config.options.moveTimeout) or App.config.options.moveTimeout
     local deadline, banned, replans = os.clock() + timeout, {}, 0
     local function collectionStep(state)
@@ -1461,7 +1486,7 @@ local function moveTo(x, y, worldName, token, onStep)
         local waited = os.clock() - started
         -- Pickup waiting has its own timeout and is not a failed walking step.
         deadline = deadline + waited
-        return proceed ~= false, waited
+        return proceed ~= false, waited, proceed == "hold"
     end
     -- Waypoints and the final destination must agree. A looser waypoint
     -- tolerance can otherwise accept an empty route without ever moving.
@@ -1501,15 +1526,20 @@ local function moveTo(x, y, worldName, token, onStep)
             while true do
                 worldCheck(worldName, token)
                 state = position()
-                local proceed, waited = collectionStep(state)
+                local proceed, waited, pacing = collectionStep(state)
                 began, movedAt = began + waited, movedAt + waited
                 if not proceed then hold.direction, hold.jump = 0, false; return false end
                 state = position()
                 if reached(state, waypoint.x + 0.5, waypoint.y + 1) then break end
                 assert(os.clock() < deadline, "Returning to the saved position timed out. Check the route.")
-                if UserInputService:GetFocusedTextBox() then
+                if UserInputService:GetFocusedTextBox() or pacing then
                     hold.direction, hold.jump = 0, false
                     movedAt = os.clock()
+                    if pacing then
+                        -- Native planting cadence can be slower than running.
+                        -- Briefly ease movement before passing an unplanted tile.
+                        began, deadline = began + 0.025, deadline + 0.025
+                    end
                 else
                     hold.direction = waypoint.drop and Navigation.dropSteer(state, waypoint)
                         or Navigation.steer(waypoint.x + 0.5 - state.x, state.vx or 0, state.grounded and 48 or 17)
@@ -2861,6 +2891,22 @@ local function readPlantResume(record)
                 and point[key] >= 0 and point[key] <= 65535, "Invalid pending seed placement.")
         end
         assert(point.before >= 1 and point.before <= 200, "Invalid pending seed count.")
+        if point.tiles then
+            assert(type(point.tiles) == "table" and #point.tiles >= 1 and #point.tiles <= 8
+                and #point.tiles <= point.before, "Invalid pending seed batch.")
+            local seen = {}
+            for key in pairs(point.tiles) do
+                assert(type(key) == "number" and key == math.floor(key) and key >= 1 and key <= #point.tiles,
+                    "Invalid pending seed batch list.")
+            end
+            for _, tile in ipairs(point.tiles) do
+                assert(type(tile) == "table" and type(tile.x) == "number" and tile.x == math.floor(tile.x)
+                    and tile.x >= 0 and tile.x <= 65535 and tile.y == point.y and not seen[tile.x],
+                    "Invalid pending seed batch tile.")
+                seen[tile.x] = true
+            end
+            assert(point.tiles[1].x == point.x, "Invalid pending seed batch origin.")
+        end
     end
     return record
 end
@@ -2917,13 +2963,16 @@ local function reconcilePlant(state, token)
     if not point then return end
     worldCheck(point.world, token)
     local id = App.config.planting.seedId
-    local actual, tile = refreshInventory(token)[id] or 0, tileAt(point.x, point.y)
-    if actual == point.before - 1 and tile == id then
-        App.stats.planted = App.stats.planted + 1
-    else
-        assert(actual == point.before and tile == 0,
+    local actual, planted = refreshInventory(token)[id] or 0, 0
+    for _, tile in ipairs(point.tiles or {point}) do
+        local value = tileAt(tile.x, tile.y)
+        assert(value == 0 or value == id,
             "Cannot reconcile the interrupted seed placement. Check the backpack and tile, then clear saved planting.")
+        if value == id then planted = planted + 1 end
     end
+    assert(actual == point.before - planted,
+        "Cannot reconcile the interrupted seed placement. Check the backpack and tile, then clear saved planting.")
+    App.stats.planted = App.stats.planted + planted
     state.pending = nil
     savePlantResume(state)
 end
@@ -2953,6 +3002,111 @@ local function plantTile(point, state, token)
         state.pending = nil
         savePlantResume(state)
         return true
+    end)
+end
+-- Run the native seed helper while walking. Only a small, saved batch may be
+-- optimistic; server inventory plus every tile must agree before more seeds.
+local function plantRow(row, reverse, state, token)
+    return withoutPickups(function()
+        local name, id = App.config.planting.worlds[state.worldIndex], App.config.planting.seedId
+        local r = worldCheck(name, token)
+        local points = {}
+        for x = reverse and row.right or row.left, reverse and row.left or row.right, reverse and -1 or 1 do
+            if not state.skipped[x .. ":" .. row.y] and Core.plantingTile(r.world, r.items, x, row.y) then
+                table.insert(points, {x = x, y = row.y})
+            end
+        end
+        if #points == 0 or count(id) == 0 then return end
+        local available = refreshInventory(token)[id] or 0
+        local cursor, nextPlant, lastPlant = 1, 0, 0
+        local function confirm()
+            local pending = state.pending
+            if not pending then return end
+            local hold = takeControls()
+            hold.direction, hold.jump = 0, false
+            pause(math.max(0, lastPlant + 0.2 - os.clock()), token)
+            local deadline = os.clock() + App.config.options.actionTimeout
+            while true do
+                worldCheck(name, token)
+                local after = refreshInventory(token)[id] or 0
+                assert(after <= pending.before and after >= pending.before - #pending.tiles,
+                    "Seed count changed unexpectedly while planting. Check diagnostics before resuming.")
+                local all = true
+                for _, point in ipairs(pending.tiles) do if tileAt(point.x, point.y) ~= id then all = false end end
+                if all and after == pending.before - #pending.tiles then
+                    -- Observe late foreground corrections once per batch, without
+                    -- an inventory round trip or animation stop at each tile.
+                    local settled = os.clock() + 0.12
+                    repeat
+                        worldCheck(name, token)
+                        for _, point in ipairs(pending.tiles) do
+                            assert(tileAt(point.x, point.y) == id,
+                                "Tile " .. point.x .. ", " .. point.y .. " changed while the action settled. Stopping.")
+                        end
+                        pause(0.03, token)
+                    until os.clock() >= settled
+                    available = after
+                    App.stats.planted = App.stats.planted + #pending.tiles
+                    state.pending = nil
+                    savePlantResume(state)
+                    return
+                end
+                assert(os.clock() < deadline, "The server did not confirm a planted seed batch at " .. pending.x .. ", " .. pending.y .. ".")
+                pause(0.15, token)
+            end
+        end
+        local function step(avatar)
+            checkpoint(token)
+            worldCheck(name, token)
+            if state.pending then
+                local corrected = false
+                for _, point in ipairs(state.pending.tiles) do if tileAt(point.x, point.y) ~= id then corrected = true end end
+                if corrected or #state.pending.tiles >= 8 or count(id) == 0 then confirm() end
+            end
+            if available == 0 then return false end
+            local point = points[cursor]
+            if not point then return false end
+            avatar = position() -- A batch confirmation may have yielded during movement.
+            local ahead = (point.x + 0.5 - avatar.x) * (reverse and -1 or 1)
+            if avatar.grounded and math.abs(avatar.y - (row.y + 1)) <= 0.22 and ahead < -1.2 then return false end
+            if not avatar.grounded or math.abs(avatar.y - (row.y + 1)) > 0.22
+                or math.abs(avatar.x - (point.x + 0.5)) > 1.2
+                or UserInputService:GetFocusedTextBox() then return true end
+            if os.clock() < nextPlant then return ahead <= 0.55 and "hold" or true end
+            if not Core.plantingTile(r.world, r.items, point.x, point.y) then cursor = cursor + 1; return true end
+            if not r.handlers.canPlace(r.items[id], point.x, point.y) then
+                if math.abs(avatar.x - (point.x + 0.5)) <= 0.55 then
+                    state.skipped[point.x .. ":" .. point.y] = "not permitted"
+                    savePlantResume(state)
+                    cursor = cursor + 1
+                end
+                return true
+            end
+            local pending = state.pending or {world = name, x = point.x, y = point.y, before = available, tiles = {}}
+            table.insert(pending.tiles, {x = point.x, y = point.y})
+            state.pending = pending
+            savePlantResume(state) -- Persist every attempted tile before the native action.
+            r.handlers.plantSeed(id, point.x, point.y)
+            checkpoint(token)
+            worldCheck(name, token)
+            lastPlant, nextPlant = os.clock(), os.clock() + math.max(0.15, App.config.options.placeDelay)
+            cursor = cursor + 1
+            if tileAt(point.x, point.y) ~= id then confirm() end
+            return true
+        end
+        local destination, stepFailed = points[#points], false
+        local ok, issue = pcall(moveTo, destination.x, row.y, name, token, function(avatar)
+            local succeeded, proceed = pcall(step, avatar)
+            if not succeeded then stepFailed = true; error(proceed, 0) end
+            return proceed
+        end)
+        checkpoint(token)
+        worldCheck(name, token)
+        if not ok and stepFailed then error(issue, 0) end
+        confirm()
+        if not ok then error(issue, 0) end
+        -- Any missed cells (slow replies, obstacles or small native reach) are
+        -- visited by the existing precise per-tile fallback in zigzag order.
     end)
 end
 local function rotationFarmStatus(r, box, id, seedId)
@@ -3009,7 +3163,7 @@ local function runPlant(token, saved, lastWorldIndex)
             local name = settings.worlds[state.worldIndex]
             enterPlantWorld(name, state, token)
             reconcilePlant(state, token)
-            local r, refill = runtime(), false
+            local r, refill, streamedRows = runtime(), false, {}
             if not state.rows then state.rows = Core.farmRows(r.world, r.items); savePlantResume(state) end
             for _, row in ipairs(state.rows) do
                 assert(row.y < r.world.h - 1 and row.right < r.world.w, "Saved farm rows no longer fit this world. Clear saved planting and start again.")
@@ -3038,18 +3192,28 @@ local function runPlant(token, saved, lastWorldIndex)
                                 state.rowY = point.y
                                 savePlantResume(state)
                             end
+                            if not streamedRows[point.y] then
+                                streamedRows[point.y] = true
+                                for index, row in ipairs(state.rows) do
+                                    if row.y == point.y then plantRow(row, index % 2 == 0, state, token); break end
+                                end
+                            end
                             if Core.plantingTile(r.world, r.items, point.x, point.y) then moveTo(point.x, point.y, name, token) end
                         end)
                     end
                     checkpoint(token)
                     worldCheck(name, token)
                     if not arrived then
+                        -- A request timeout during batch confirmation must never
+                        -- be treated as an unreachable tile and overwrite cargo.
+                        if state.pending then error(issue, 0) end
                         if type(issue) == "table" and issue.recoverable then error(issue, 0) end
                         local text = tostring(issue)
                         assert(text:find("route", 1, true) or text:find("position", 1, true) or text:find("support", 1, true)
                             or text:find("platform", 1, true) or text:find("timed out", 1, true), text)
-                        state.skipped[key] = "unreachable"
-                    elseif not permitted or not plantTile(point, state, token) then state.skipped[key] = "not permitted" end
+                        if Core.plantingTile(r.world, r.items, point.x, point.y) then state.skipped[key] = "unreachable" end
+                    elseif not permitted or (Core.plantingTile(r.world, r.items, point.x, point.y)
+                        and count(id) > 0 and not plantTile(point, state, token)) then state.skipped[key] = "not permitted" end
                     if state.skipped[key] then savePlantResume(state) end
                 end
             end

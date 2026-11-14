@@ -3008,6 +3008,148 @@ local function zigzagPlantingFixture(seeds, worlds)
     return f
 end
 
+test("Planting streams a long row in order with moving placements and bounded saved batches", function()
+    local f = plantingFixture(40, 100)
+    f.world.w = 32
+    for _, grid in pairs(f.grids) do
+        for y = 0, 7 do for x = 7, 31 do grid[y][x] = y == 6 and 2 or 0 end end
+    end
+    local server, reads, moving, previous, largest = f.server, 0, 0, nil, 0
+    f.server = function(name, ...)
+        if name == "GetInventory" then reads = reads + 1 end
+        return server(name, ...)
+    end
+    f.onPlant = function(_, x)
+        local pending = f.hooks.readPlantResume().state.pending
+        assert(pending.tiles[#pending.tiles].x == x, "Each attempted tile must be saved before planting")
+        largest = math.max(largest, #pending.tiles)
+        assert(#pending.tiles <= 8)
+        if math.abs(f.avatar.vx) > 0.8 then moving = moving + 1 end
+        if previous then assert(os.clock() - previous >= 0.2 - 0.000001, "Native cooldown must be respected") end
+        previous = os.clock()
+    end
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(#f.plantCalls == 32 and f.app.stats.planted == 32 and f.serverSeeds == 8)
+    for index, point in ipairs(f.plantCalls) do assert(point.x == index - 1 and point.y == 5) end
+    assert(moving >= 24, "Most seeds should be placed while moving, rather than after centering")
+    assert(largest == 8 and reads <= 8, "Inventory checks should confirm batches instead of each tile")
+end)
+
+test("A delayed planting inventory reply holds the next batch until all eight seeds confirm", function()
+    local f = plantingFixture(20, 100)
+    f.world.w = 12
+    for y = 0, 7 do for x = 7, 11 do f.grids.FARM1[y][x] = y == 6 and 2 or 0 end end
+    local server, delayed, confirmed = f.server, false, false
+    f.server = function(name, ...)
+        if name == "GetInventory" and #f.plantCalls == 8 then
+            if not delayed then
+                delayed = true
+                assert(f.app.controls.direction == 0)
+                return {slots = {{955, 20}}, capacity = 54}
+            end
+            confirmed = true
+        end
+        return server(name, ...)
+    end
+    f.onPlant = function() if #f.plantCalls > 8 then assert(confirmed, "Do not start another optimistic batch") end end
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(delayed and confirmed and #f.plantCalls == 12 and f.app.stats.planted == 12 and f.serverSeeds == 8)
+end)
+
+test("A partially rejected planting batch pauses and resumes only its unaccepted tiles", function()
+    local f = plantingFixture(10, 100)
+    f.onPlant = function()
+        if #f.plantCalls == 3 then
+            f.onPlant = nil
+            f.grids.FARM1[5][1], f.serverSeeds = 0, f.serverSeeds + 1
+        end
+    end
+    f.hooks.start("plant")
+    assert(f.app.lastError:find("did not confirm a planted seed", 1, true) and #f.plantCalls == 3)
+    local saved = f.hooks.readPlantResume()
+    assert(#saved.state.pending.tiles == 3 and saved.state.pending.before == 10 and f.app.stats.planted == 0)
+    f.hooks.start("plant", saved)
+    assert(not f.app.lastError, f.app.lastError)
+    assert(f.serverSeeds == 3 and f.app.stats.planted == 7 and #f.plantCalls == 8)
+    local occurrences = {}
+    for _, point in ipairs(f.plantCalls) do occurrences[point.x] = (occurrences[point.x] or 0) + 1 end
+    assert(occurrences[0] == 1 and occurrences[1] == 2 and occurrences[2] == 1)
+end)
+
+test("A picker interruption preserves and reconciles several outstanding moving seed placements", function()
+    local f = plantingFixture(10, 100)
+    local pending
+    f.onPlant = function()
+        if #f.plantCalls == 4 then
+            pending = f.hooks.readPlantResume().state.pending
+            assert(#pending.tiles == 4 and pending.before == 10)
+            f.onPlant = nil
+            f.world.name, f.avatar.active = "", false
+        end
+    end
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(pending and #f.plantCalls == 7 and f.app.stats.planted == 7 and f.serverSeeds == 3)
+    for index, point in ipairs(f.plantCalls) do assert(point.x == index - 1) end
+end)
+
+test("A late foreground rollback during batch settling prevents another seed batch", function()
+    local f = plantingFixture(20, 100)
+    f.world.w = 12
+    for y = 0, 7 do for x = 7, 11 do f.grids.FARM1[y][x] = y == 6 and 2 or 0 end end
+    local server, physics, confirmedRead, corrected = f.server, f.onWait, false, false
+    f.server = function(name, ...)
+        if name == "GetInventory" and #f.plantCalls == 8 then confirmedRead = true end
+        return server(name, ...)
+    end
+    f.onWait = function(dt)
+        physics(dt)
+        if confirmedRead and not corrected then
+            corrected = true
+            f.grids.FARM1[5][0], f.serverSeeds = 0, f.serverSeeds + 1
+        end
+    end
+    f.hooks.start("plant")
+    assert(corrected and f.app.lastError:find("changed while the action settled", 1, true))
+    assert(#f.plantCalls == 8 and f.app.stats.planted == 0 and #f.hooks.readPlantResume().state.pending.tiles == 8)
+end)
+
+test("A planting inventory timeout retains the batch instead of skipping a tile and spending more seeds", function()
+    local f = plantingFixture(20, 100)
+    f.world.w = 12
+    for y = 0, 7 do for x = 7, 11 do f.grids.FARM1[y][x] = y == 6 and 2 or 0 end end
+    local server = f.server
+    f.server = function(name, ...)
+        if name == "GetInventory" and #f.plantCalls == 8 then error("Game request timed out") end
+        return server(name, ...)
+    end
+    f.hooks.start("plant")
+    assert(f.app.lastError:find("Game request timed out", 1, true))
+    local state = f.hooks.readPlantResume().state
+    assert(#f.plantCalls == 8 and #state.pending.tiles == 8 and state.pending.before == 20)
+    assert(next(state.skipped) == nil and f.app.stats.planted == 0)
+end)
+
+test("Saved planting batches reject duplicate, sparse, oversized or cross-row tile evidence", function()
+    local f = plantingFixture(10, 100)
+    local function record(tiles)
+        f.hooks.savePlantResume({worldIndex = 1, phase = "farm", skipped = {},
+            pending = {world = "FARM1", x = 0, y = 5, before = 10, tiles = tiles}})
+    end
+    record({{x = 0, y = 5}, {x = 0, y = 5}})
+    rejects(f.hooks.readPlantResume, "batch tile")
+    record({{x = 0, y = 5}, {x = 1, y = 3}})
+    rejects(f.hooks.readPlantResume, "batch tile")
+    record({{x = 0, y = 5}, [3] = {x = 2, y = 5}})
+    rejects(f.hooks.readPlantResume, "batch list")
+    local tiles = {}
+    for x = 0, 8 do tiles[#tiles + 1] = {x = x, y = 5} end
+    record(tiles)
+    rejects(f.hooks.readPlantResume, "seed batch")
+end)
+
 test("Planting follows both platform turns and retains zigzag order after a completed row refill", function()
     local f = zigzagPlantingFixture(5, {"FARM1", "FARM2"})
     f.hooks.start("plant")
@@ -3290,6 +3432,11 @@ test("The actual planting follower travels around a distant row edge", function(
     local edge = false
     for key in pairs(visited) do if tonumber(key:match("^(%d+):")) >= 78 then edge = true end end
     assert(edge)
+    f.avatar.x, f.avatar.y, f.avatar.vx, f.avatar.vy = 2.5, 5.999, 0, 0
+    f.app.job, f.app.rotationState = "rotation", {phase = "replant"}
+    f.hooks.moveTo(2, 2, "BREAK", 1)
+    assert(math.abs(f.avatar.x - 2.5) < 0.16 and math.abs(f.avatar.y - 3) < 0.22,
+        "Rotation replanting must use the full farm navigation search too")
 end)
 
 test("Discovery exposes a unique native plantSeed hook belonging to the active world", function()
@@ -3524,6 +3671,8 @@ test("A large discovery snapshot yields and reads each function's upvalues at mo
     end
     local r = f.hooks.connectGame()
     assert(r.ready and f.app.discoveryPerformance.yields > 0)
+    assert(f.app.discoveryPerformance.steps <= #f.discoveryObjects + 5100,
+        "Full attachment should index the snapshot once and scan only functions for ownership")
     for _, n in pairs(reads) do assert(n == 1, "A function's upvalues were repeatedly scanned") end
 end)
 
@@ -3540,6 +3689,7 @@ test("Transfer attachment skips unrelated function upvalues and defers punching 
         noise[fn] = true
         table.insert(f.discoveryObjects, fn)
     end
+    for n = 1, 10000 do table.insert(f.discoveryObjects, {noise = n}) end
     local reads = 0
     getupvalues = function(fn)
         assert(not noise[fn], "Moving Drops must not inspect unrelated function upvalues")
@@ -3555,6 +3705,9 @@ test("Transfer attachment skips unrelated function upvalues and defers punching 
     local r = f.hooks.connectGame({transferOnly = true})
     assert(r.ready and r.farmingDeferred and r.items == items and r.inventory == f.inventory)
     assert(reads < 30, "Transfer attachment must read only the necessary world/controller methods")
+    assert(f.app.discoveryPerformance.steps <= #f.discoveryObjects + 100,
+        "Fast attachment must not repeatedly traverse unrelated tables/functions")
+    assert(f.app.discoveryPerformance.yields <= 3, "Lightweight indexing should avoid repeated per-frame waits")
     -- PNB can still discover its handlers when selected later.
     getupvalues = nil
     f.app.job, f.boxes[12] = nil, {}
@@ -3988,6 +4141,29 @@ test("A reset during replant restores its config and reconciles the confirmed se
     assert(not f.app.lastError,f.app.lastError)
     assert(f.app.profile == "Replant Recovery" and #f.plants == 4 and f.app.stats.planted == 5)
     assert(f.plants[1].x == 2 and f.plants[1].world == "FARM2" and #f.harvests == 0 and f.pnbBlocks == 0)
+end)
+
+test("A fresh rotation instance restores multiple pending replant seeds without replaying them", function()
+    local f = rotationFixture()
+    fillGrowingFarms(f, {FARM = 200, FARM2 = 200})
+    for x = 1, 5 do f.grids.FARM2[8][x] = 0; f.treeTimes.FARM2[8 * f.world.w + x] = nil end
+    for x = 1, 3 do f.grids.FARM2[8][x] = 955; f.treeTimes.FARM2[8 * f.world.w + x] = os.clock() end
+    f.serverItems[955] = 7; f.inventory:add(955, 7)
+    f.hooks.saveRotationResume({phase = "replant", worldIndex = 2, cycle = 1, work = 10, seedCargo = 0,
+        completed = {FARM = true}, readyAt = {}, plant = {phase = "farm", worldIndex = 2, skipped = {},
+            pending = {world = "FARM2", x = 1, y = 8, before = 10,
+                tiles = {{x = 1, y = 8}, {x = 2, y = 8}, {x = 3, y = 8}}}}})
+    local runtime, next = f.app.runtime, f.reload()
+    f.hooks, f.app = next, next.App
+    f.app.runtime = runtime
+    local saved = next.readRotationResume()
+    assert(#saved.state.plant.pending.tiles == 3)
+    f.app.config, f.app.profile = saved.config, saved.profile
+    f.afterWait = function() if f.app.stats.cycles == 1 then f.app:stop() end end
+    next.start("rotation", saved)
+    assert(not f.app.lastError, f.app.lastError)
+    assert(#f.plants == 2 and f.plants[1].x == 4 and f.plants[2].x == 5 and f.app.stats.planted == 5)
+    assert(#f.harvests == 0 and f.pnbBlocks == 0)
 end)
 
 test("Invalid saved harvest deadlines are rejected before rotation can enter a world", function()

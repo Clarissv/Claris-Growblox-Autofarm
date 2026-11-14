@@ -1,6 +1,6 @@
 # Full Rotation guide
 
-For **Claris Growblox 0.1.25**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
+For **Claris Growblox 0.1.26**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
 
 The usual flow is **fill planting space → PNB while trees grow → harvest a ready farm → transfer its blocks and seeds → replant that farm → repeat**. Planting and ready harvests take priority over breaking. A full farm skips planting even when seed storage contains thousands of seeds.
 
@@ -151,6 +151,10 @@ A slow current game request or pickup can delay that boundary. PNB also checks a
 
 The route starts at the **top-left supported row**, crosses right, descends to the next supported row, crosses left, and continues alternating. Each new farm starts from the left.
 
+From v0.1.26, planting places seeds while walking along that row. It uses the native seed helper and confirms up to **eight seeds per batch** against server inventory and all planted tiles. It briefly stops for confirmation, row turns and obstacles, and eases movement if it would pass an empty tile before the next placement is allowed. Missed cells use precise movement as a fallback. **Settings → Delay after placement** controls planting timing: default 0.2 seconds, minimum 0.15. Existing profiles retain their saved delay; you can lower a slower value and save the profile. The same behavior applies to the initial planting pass and replanting after harvest.
+
+Each attempted tile is saved before placement. After an interruption, rotation checks the saved batch against the live tiles and server seed count before continuing. Accepted seeds are counted once, empty unaccepted cells can be retried, and conflicting evidence pauses with a diagnostic. Older single-seed planting checkpoints remain supported. No new setup or toggle is required for moving planting.
+
 - Planting skips rows without empty supported planting tiles.
 - Harvesting skips rows without ripe selected trees or matching drops to collect.
 - The next supported row may be more than one tile below the previous row.
@@ -268,6 +272,8 @@ Accounts can use the same webhook and ping the same Discord user; reports identi
 | Seed mismatch / use PNB seed storage | Select the correct block, save the left PNB box, and press Use PNB seeds for planting again. |
 | Missing method 'Set' when using PNB seeds or loading config | Update to v0.1.25, push the rebuilt release, rerun the same GitHub loader, then retry. This fixes the dropdown refresh and resets the old UI lock. Check that the farm list and seed settings are displayed correctly. |
 | Planting hook unavailable before starting | Farming hooks are deferred during the initial connection. They attach when Planting or Full Rotation starts. If task startup itself fails, copy diagnostics. |
+| Game connection still takes time after a reload | v0.1.26 indexes game objects once and reduces forced frame waits. Push the complete rebuilt release and rerun the loader. Copy diagnostics shows discovery time/yields/checks; executor GC/debug calls and world loading still affect startup. |
+| Planting pauses while crossing a row | Short batch-confirmation and timing pauses are expected. Check Delay after placement for a slow saved value. Obstacles or missed cells use precise movement. A failed batch confirmation pauses rather than continuing to spend seeds. |
 | Missing farm box | Visit the exact named farm and save its reachable harvest box. Check every listed world. |
 | Full farm is not planting | Occupied tiles are intentionally skipped. Growing trees lead to PNB; ripe trees lead to harvest. |
 | Some trees are ripe but the farm is still growing | The maturity wait accounts for remaining matching growing trees too. |
