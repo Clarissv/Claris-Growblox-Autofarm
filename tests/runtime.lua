@@ -231,7 +231,7 @@ local function attachPhysics(f, map)
             if jump and not previousJump and state.grounded then state.vy, state.grounded = -19.8997487421324, false end
             previousJump = jump
             local acceleration = direction == 0 and (state.grounded and 48 or 17) or (state.grounded and 36 or 22)
-            local desired = direction * 7.2
+            local desired = direction * (f.world.riding and f.world.riding.speed or 7.2)
             if state.vx < desired then state.vx = math.min(desired, state.vx + acceleration * dt)
             else state.vx = math.max(desired, state.vx - acceleration * dt) end
             local nextX = state.x + state.vx * dt
@@ -1862,11 +1862,14 @@ local function harvestFixture()
     local originalServer = f.server
     f.server = function(name, x, y, id, _, _, n)
         if name ~= "DisplayItem" then return originalServer(name) end
-        assert(f.world.name == "FARM" and x == 12 and y == 8 and id == 954)
+        assert(f.world.name == "FARM" and x == 12 and y == 8 and (id == 954 or id == 955))
         assert(n > 0 and n <= (f.serverItems[id] or 0))
         f.serverItems[id] = f.serverItems[id] - n
-        local total = f.hooks.Core.storageCount(f.boxes[x], id)
-        f.boxes[x] = {{id, total + n}}
+        local total = f.hooks.Core.itemCount(f.boxes[x], id)
+        local rows = {}
+        for _, row in ipairs(f.boxes[x]) do if row[1] ~= id then rows[#rows+1] = row end end
+        rows[#rows+1] = {id, total + n}
+        f.boxes[x] = rows
         f.deposits[#f.deposits + 1] = n
         return true
     end
@@ -1901,9 +1904,10 @@ test("Harvest collection stores held blocks and all selected drops while leaving
     local seed, gems, other = f.addDrop(101, 955, 10), f.addDrop(102, 112, 20), f.addDrop(103, 1, 5)
     f.onWait = function() if os.clock() >= 0.2 then pending.pending = false end end
     f.harvest()
-    assert(f.hooks.Core.storageCount(f.boxes[12], 954) == 320 and f.inventory:count(954) == 0)
+    assert(f.hooks.Core.itemCount(f.boxes[12], 954) == 320 and f.hooks.Core.itemCount(f.boxes[12], 955) == 10 and f.inventory:count(954) == 0)
     assert(f.app.stats.harvested == 120 and f.app.stats.stashed == 320)
-    assert(#f.drops == 3 and seed.n == 10 and gems.n == 20 and other.n == 5)
+    assert(#f.drops == 2 and seed.n == 0 and gems.n == 20 and other.n == 5)
+    assert(f.app.stats.harvestSeeds == 10 and f.app.stats.stashedSeeds == 10)
     assert(f.app.status:find("Finished collecting harvest", 1, true))
 end)
 
@@ -2358,6 +2362,202 @@ local function zigzagHarvestFixture()
     return f
 end
 
+local function treeHarvestFixture(method)
+    local f = zigzagHarvestFixture()
+    f.app.config.harvesting.method = method or "fist"
+    f.app.runtime.items[955].grow = 100
+    f.app.runtime.items[898] = {name = "Dear John Tractor", kind = "cloth", slot = "feet", ride = "tractor"}
+    f.app.runtime.items[777] = {name = "Boots", kind = "cloth", slot = "feet"}
+    f.inventory:add(898, 1)
+    f.inventory:add(777, 1)
+    f.serverItems[898], f.serverItems[777] = 1, 1
+    f.trees, f.treeActions, f.wearActions, f.worn = {}, {}, {}, 777
+    f.app.runtime.harvestGear = {
+        feet = function() return f.worn end,
+        wear = function(id)
+            if f.worn == id then f.worn = nil else f.worn = id end
+            f.wearActions[#f.wearActions + 1] = {id = id, worn = f.worn, y = f.avatar.y}
+            f.world.riding = f.worn == 898 and {harvest = true, speed = 3.6} or nil
+        end,
+    }
+    f.app.runtime.treeRipe = function(x, y, id)
+        local tree = f.trees[y * f.world.w + x]
+        if not tree then return nil end
+        return 1000 + os.clock() >= tree.p + (f.app.runtime.items[id].grow or 0)
+    end
+    function f.addTree(x, y, ripe, id)
+        f.world.fg[y][x] = id or 955
+        f.trees[y * f.world.w + x] = {p = ripe == false and 1000 or 0}
+    end
+    local function destroy(x, y, tractor)
+        assert(f.app.controls and f.app.controls.pausePickup, "Tree harvesting must suppress automatic pickups")
+        assert(f.world.fg[y][x] == 955 and f.app.runtime.treeRipe(x, y, 955))
+        if f.refuseTree then return end
+        f.treeActions[#f.treeActions + 1] = {x = x, y = y, tractor = tractor}
+        f.world.fg[y][x], f.trees[y * f.world.w + x] = 0, nil
+        f.addDrop(100 + #f.treeActions, 954, 10, x + 0.5, y + 0.5)
+    end
+    f.app.runtime.handlers = {hit = function(x, y)
+        assert(f.worn ~= 898, "Fist must remove the automatic harvesting vehicle first")
+        assert(f.avatar.grounded and math.abs(f.avatar.x - (x + 0.5)) < 0.16)
+        f.hits = (f.hits or 0) + 1
+        return destroy(x, y, false)
+    end}
+    f.world.ride = function(now)
+        if not f.world.riding or not f.world.riding.harvest then return end
+        local y = math.floor(f.avatar.y - 0.475)
+        for x = math.floor(f.avatar.x - 0.3), math.floor(f.avatar.x + 0.3) do
+            if f.world.fg[y] and f.world.fg[y][x] == 955 and f.app.runtime.treeRipe(x, y, 955) then
+                destroy(x, y, true)
+            end
+        end
+    end
+    local physics = f.onWait
+    f.onWait = function(dt)
+        physics(dt)
+        if f.app.controls then f.world.ride(os.clock()) end
+    end
+    local accept = f.accept
+    f.accept = function(drop, want)
+        assert(not f.world.riding or not f.world.riding.harvest, "Collection must remove the tractor")
+        assert(#f.treeActions == (f.expectedTrees or 0), "All trees must be harvested before the first block pickup")
+        return accept(drop, want)
+    end
+    return f
+end
+
+test("Fist harvests ripe trees in zigzag order before collecting their drops", function()
+    local f = treeHarvestFixture("fist")
+    for _, y in ipairs({2, 4, 6}) do for _, x in ipairs({2, 7, 13}) do f.addTree(x, y) end end
+    f.addTree(4, 4, false)
+    f.expectedTrees = 9
+    f.harvest()
+    assert(f.hits == 9 and f.app.stats.trees == 9 and f.app.stats.stashed == 90)
+    local order = {}
+    for _, point in ipairs(f.treeActions) do order[#order + 1] = point.x .. ":" .. point.y end
+    assert(table.concat(order, ",") == "2:2,7:2,13:2,13:4,7:4,2:4,2:6,7:6,13:6", table.concat(order, ","))
+    assert(f.world.fg[4][4] == 955 and f.worn == 777)
+end)
+
+test("Tractor harvests by native walking, removes it between rows, and restores the previous footwear", function()
+    local f = treeHarvestFixture("tractor")
+    for _, y in ipairs({2, 4, 6}) do for _, x in ipairs({2, 7, 13}) do f.addTree(x, y) end end
+    f.expectedTrees = 9
+    f.harvest()
+    assert(not f.hits and f.app.stats.trees == 9 and f.app.stats.stashed == 90 and f.worn == 777)
+    local order, equips = {}, 0
+    for _, point in ipairs(f.treeActions) do assert(point.tractor); order[#order + 1] = point.x .. ":" .. point.y end
+    assert(table.concat(order, ",") == "2:2,7:2,13:2,13:4,7:4,2:4,2:6,7:6,13:6", table.concat(order, ","))
+    for _, action in ipairs(f.wearActions) do
+        if action.worn == 898 then
+            equips = equips + 1
+            assert(math.floor(action.y - 0.01) == (equips == 1 and 2 or equips == 2 and 4 or 6))
+        end
+    end
+    assert(equips == 3 and f.world.riding == nil)
+end)
+
+test("Growing trees alone do not cause harvest movement or punches", function()
+    local f = treeHarvestFixture("fist")
+    f.addTree(2, 2, false)
+    local physics = f.onWait
+    f.onWait = function(dt)
+        assert(f.controls.dir() == 0 and not f.controls.jumping())
+        physics(dt)
+    end
+    f.harvest()
+    assert(not f.hits and #f.treeActions == 0 and #f.wearActions == 0 and #f.requests == 0)
+end)
+
+test("Tractor requires ownership and rejects mixed seed farms before moving or changing clothing", function()
+    local f = treeHarvestFixture("tractor")
+    f.addTree(2, 2)
+    f.inventory:remove(898, 1)
+    f.serverItems[898] = 0
+    rejects(f.harvest, "Tractor is not in the backpack")
+    assert(#f.treeActions == 0 and #f.wearActions == 0 and #f.requests == 0)
+    f.inventory:add(898, 1)
+    f.serverItems[898] = 1
+    f.app.runtime.items[627] = {kind = "seed", grow = 100}
+    f.addTree(3, 4, false, 627)
+    rejects(f.harvest, "another seed type")
+    assert(#f.treeActions == 0 and #f.wearActions == 0 and f.worn == 777)
+end)
+
+test("A refused Fist harvest pauses before any drops are collected", function()
+    local f = treeHarvestFixture("fist")
+    f.addTree(2, 2)
+    f.refuseTree = true
+    rejects(f.harvest, "Fist did not harvest")
+    assert(f.hits == 3 and f.world.fg[2][2] == 955 and #f.requests == 0 and f.worn == 777)
+end)
+
+test("Stop during tractor harvesting restores clothing and prevents further tree actions or pickups", function()
+    local f = treeHarvestFixture("tractor")
+    f.addTree(2, 2)
+    f.addTree(7, 2)
+    local physics = f.onWait
+    f.onWait = function(dt)
+        physics(dt)
+        if #f.treeActions == 1 then f.app:stop() end
+    end
+    rejects(f.harvest, "Stopped")
+    assert(#f.treeActions == 1 and f.world.fg[2][7] == 955 and #f.requests == 0)
+    assert(f.worn == 777 and f.app.controls == nil)
+end)
+
+test("Fist removes an already-worn tractor and harvests only the selected crop", function()
+    local f = treeHarvestFixture("fist")
+    f.addTree(2, 2)
+    f.app.runtime.items[627] = {name = "Other Seed", kind = "seed", grow = 100}
+    f.addTree(7, 4, true, 627)
+    f.worn, f.world.riding = 898, {harvest = true, speed = 3.6}
+    f.expectedTrees = 1
+    f.harvest()
+    assert(f.hits == 1 and not f.treeActions[1].tractor and f.world.fg[4][7] == 627)
+    assert(f.worn == 898 and f.app.stats.trees == 1)
+end)
+
+test("Missing tree growth data refuses harvest before movement or pickup", function()
+    local f = treeHarvestFixture("fist")
+    f.addTree(2, 2)
+    f.trees[2 * f.world.w + 2] = nil
+    rejects(f.harvest, "growth data is not ready")
+    assert(not f.hits and #f.wearActions == 0 and #f.requests == 0)
+end)
+
+test("Tree and equipment discovery binds shared native upvalues, including empty metadata", function()
+    local f = fixture()
+    local items, world, trees, renders, worn = f.app.runtime.items, f.world, {}, {}, {feet = 898}
+    prepareDiscovery(f, true)
+    attachWorldHandlers(f, items)
+    local ripe = function(id, tree) return 1000 >= tree.p + (items[id].grow or 0) end
+    local gear = {
+        onWear = function(id) assert(world.fg); worn.feet = id end,
+        isWorn = function(id) return worn.feet == id end,
+    }
+    world.ride = function() assert(world.fg); return trees, ripe, gear end
+    local setTree = function(x, y, tree) trees[y * world.w + x] = tree; renders[x] = nil end
+    local oldInfo = getinfo
+    getinfo = function(fn)
+        if fn == ripe then return {name = "treeRipe"} end
+        if fn == setTree then return {name = "setTree"} end
+        return oldInfo(fn)
+    end
+    table.insert(f.discoveryObjects, setTree)
+    local r = f.hooks.connectGame()
+    assert(r.treeRipe and r.harvestGear and r.harvestGear.feet() == 898)
+    assert(r.treeRipe(2, 2, 955) == nil, "Empty metadata must not imply a ripe tree")
+    setTree(2, 2, {p = 0})
+    assert(r.treeRipe(2, 2, 955) == true)
+    setTree(2, 2, {p = 2000})
+    assert(r.treeRipe(2, 2, 955) == false)
+    r.harvestGear.wear(777)
+    assert(worn.feet == 777)
+    local transfer = f.hooks.connectGame({transferOnly = true})
+    assert(transfer.treeRipe == nil and transfer.harvestGear == nil and transfer.farmingDeferred)
+end)
+
 test("Harvest follows top-left zigzag rows and lands at both platform edges", function()
     local f = zigzagHarvestFixture()
     for row = 1, 3 do
@@ -2399,7 +2599,7 @@ test("Harvest with no selected loose or held blocks completes without walking or
         local f = zigzagHarvestFixture()
         f.avatar.x, f.avatar.y = 3.5, 6.999
         if otherDrops then
-            f.addDrop(1, 955, 10, 2.5, 2.5)
+            f.addDrop(1, 18, 10, 2.5, 2.5)
             f.addDrop(2, 112, 10, 13.5, 4.5)
             local display = f.addDrop(3, 954, 10, 7.5, 2.5)
             display.display = true
@@ -2422,11 +2622,11 @@ test("Harvest skips an empty middle row without reversing the lower row", functi
     f.addDrop(13, 954, 10, 13.5, 2.5)
     f.addDrop(31, 954, 10, 2.5, 6.5)
     f.addDrop(33, 954, 10, 13.5, 6.5)
-    f.addDrop(21, 955, 10, 7.5, 4.5)
+    f.addDrop(21, 18, 10, 7.5, 4.5)
     f.harvest()
     assert(table.concat(f.accepted, ",") == "11,13,31,33")
     assert(not table.concat(f.app.logs, "\n"):find("Collecting farm row 2/", 1, true))
-    assert(#f.drops == 1 and f.drops[1].id == 955 and f.app.stats.stashed == 40)
+    assert(#f.drops == 1 and f.drops[1].id == 18 and f.app.stats.stashed == 40)
 end)
 
 test("Harvest stops crossing the last occupied row as soon as its only stack is gone", function()
@@ -2826,6 +3026,42 @@ test("A planting picker interruption after the top row preserves the next row di
     assert(not f.app.lastError, f.app.lastError)
     assert(#f.plantCalls == 15 and f.plantCalls[6].x == 5 and f.plantCalls[6].y == 3)
     assert(f.plantCalls[11].x == 1 and f.plantCalls[11].y == 5)
+end)
+
+test("Planting skips full upper and middle rows without losing the lower row direction", function()
+    local f = zigzagPlantingFixture(20)
+    for x = 1, 5 do f.grids.FARM1[1][x], f.grids.FARM1[3][x] = 955, 955 end
+    local physics, reachedUpper = f.onWait, false
+    f.onWait = function(dt)
+        physics(dt)
+        if f.avatar.y < 4.8 then reachedUpper = true end
+    end
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(#f.plantCalls == 5 and not reachedUpper and f.withdrawals == 0)
+    for index, point in ipairs(f.plantCalls) do assert(point.y == 5 and point.x == index) end
+end)
+
+test("Planting removes a harvesting tractor so occupied trees remain intact during travel", function()
+    local f = zigzagPlantingFixture(20)
+    f.app.runtime.harvestGear = {
+        feet = function() return f.worn end,
+        wear = function(id)
+            if f.worn == id then f.worn = nil else f.worn = id end
+            f.world.riding = f.worn == 898 and {harvest = true, speed = 3.6} or nil
+        end,
+    }
+    f.worn, f.world.riding = 898, {harvest = true, speed = 3.6}
+    for x = 1, 5 do f.grids.FARM1[1][x] = 955 end
+    local physics = f.onWait
+    f.onWait = function(dt)
+        assert(f.worn ~= 898, "Planting movement must not auto-harvest existing trees")
+        physics(dt)
+    end
+    f.hooks.start("plant")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(#f.plantCalls == 10 and f.worn == 898)
+    for x = 1, 5 do assert(f.grids.FARM1[1][x] == 955) end
 end)
 
 test("An occupied solid edge does not prevent planting the rest of its row", function()
@@ -3296,6 +3532,317 @@ test("Discovery stops at its next frame boundary when the app is unloaded", func
     f.app.runtime = nil
     rejects(function() f.hooks.connectGame() end, "unloaded during discovery")
     assert(f.app.runtime == nil and waits == 2)
+end)
+
+local function mixedTransferFixture(seedFirst)
+    local f = pickupFixture()
+    f.world.name, f.app.job = "FARM", "transfer"
+    f.avatar.x, f.avatar.y = 13.5, 9
+    f.world.fg[8][21] = 12
+    f.worldBoxes = {FARM = {[20]={{955,450},{954,430}}}, BREAK = {[12]={},[8]={}}}
+    f.withdrawals, f.seedWithdrawals = 0, 0
+    f.world.displays.get = function(x) return f.worldBoxes[f.world.name][x] or {} end
+    f.world.enter = function(name) f.world.name = name; return true end
+    local base = f.server
+    f.server = function(name, x, y, id, _, _, n)
+        if name == "GetInventory" then return base(name) end
+        if name == "UseDoor" then return true, {enter=f.world.name == "FARM" and "BREAK" or "FARM"} end
+        assert(name == "DisplayItem")
+        local rows = f.worldBoxes[f.world.name][x]
+        assert(rows)
+        if not id then
+            f.withdrawals = f.withdrawals + 1
+            local taken = {}
+            for _, row in ipairs(rows) do
+                local got = math.min(row[2], 200 - (f.serverItems[row[1]] or 0))
+                if got > 0 then
+                    row[2] = row[2] - got
+                    f.serverItems[row[1]] = (f.serverItems[row[1]] or 0) + got
+                    taken[#taken+1] = {row[1],got}
+                    if row[1] == 955 then f.seedWithdrawals = f.seedWithdrawals + 1 end
+                    if seedFirst then seedFirst = false; break end
+                end
+            end
+            if f.afterWithdraw then f.afterWithdraw(taken) end
+            return true, {taken=taken}
+        end
+        if f.beforeDeposit then f.beforeDeposit(id,n) end
+        assert(n > 0 and n <= (f.serverItems[id] or 0))
+        f.serverItems[id] = f.serverItems[id] - n
+        local found = false
+        for _, row in ipairs(rows) do if row[1] == id then row[2],found = row[2]+n,true end end
+        if not found then rows[#rows+1]={id,n} end
+        return true
+    end
+    return f
+end
+
+test("Mixed Farm storage moves every block, keeps a full seed stack between trips, and returns seeds", function()
+    for _, seedFirst in ipairs({false,true}) do
+        local f = mixedTransferFixture(seedFirst)
+        f.serverItems[954], f.serverItems[955] = 20, 25
+        f.inventory:add(954,20); f.inventory:add(955,25)
+        f.beforeDeposit = function(id)
+            if f.world.name == "BREAK" then assert(id == 954 and f.serverItems[955] == 200) end
+        end
+        f.hooks.takeControls()
+        f.hooks.runTransfer(1)
+        assert(f.hooks.Core.itemCount(f.worldBoxes.BREAK[12],954) == 430)
+        assert(f.hooks.Core.itemCount(f.worldBoxes.BREAK[12],955) == 0)
+        assert(f.hooks.Core.itemCount(f.worldBoxes.FARM[20],955) == 475)
+        assert(f.serverItems[954] == 20 and f.serverItems[955] == 0)
+        assert(f.app.stats.trips == 3 and f.seedWithdrawals == 1 and f.app.resume == nil)
+    end
+end)
+
+test("A seed-only Farm box finishes without withdrawing its seeds and returns seeds already held", function()
+    local f = mixedTransferFixture()
+    f.worldBoxes.FARM[20] = {{955,450}}
+    f.serverItems[955] = 80; f.inventory:add(955,80)
+    f.hooks.takeControls(); f.hooks.runTransfer(1)
+    assert(f.withdrawals == 0 and f.app.stats.trips == 0 and f.serverItems[955] == 0)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.FARM[20],955) == 530)
+end)
+
+test("An interrupted mixed withdrawal retains the pending checkpoint and both item types", function()
+    local f = mixedTransferFixture()
+    f.afterWithdraw = function() error("Connection interrupted after storage mutation") end
+    f.hooks.takeControls()
+    rejects(function() f.hooks.runTransfer(1) end,"Connection interrupted")
+    assert(f.app.resume.phase == "pickupPending" and f.serverItems[954] == 200 and f.serverItems[955] == 200)
+end)
+
+test("Refused seed return preserves the full seed stack and an ambiguous-return checkpoint", function()
+    local f = mixedTransferFixture()
+    f.worldBoxes.FARM[20] = {{955,50}}
+    f.serverItems[955] = 200; f.inventory:add(955,200)
+    f.beforeDeposit = function() error("Seed return denied") end
+    f.hooks.takeControls()
+    rejects(function() f.hooks.runTransfer(1) end,"Seed return denied")
+    assert(f.app.resume.phase == "seedReturnPending" and f.serverItems[955] == 200)
+end)
+
+test("Harvest refills seed room independently of block room and finishes both stacks", function()
+    local f = zigzagHarvestFixture()
+    f.addDrop(11,955,450,7.5,2.5)
+    f.addDrop(12,954,30,7.5,2.5)
+    f.harvest()
+    assert(#f.drops == 0 and f.app.stats.harvestSeeds == 450 and f.app.stats.stashedSeeds == 450)
+    assert(f.hooks.Core.itemCount(f.boxes[12],955) == 450 and f.hooks.Core.itemCount(f.boxes[12],954) == 30)
+    assert(f.app.stats.harvested == 30 and f.app.pending == 0)
+end)
+
+test("Seed-only harvest visits its row and restores an already-worn tractor without cutting another crop", function()
+    local f = treeHarvestFixture("fist")
+    f.worn, f.world.riding = 898, {harvest=true,speed=3.6}
+    f.addTree(2,4,true,627)
+    f.addDrop(11,955,20,7.5,2.5)
+    f.harvest()
+    assert(f.app.stats.stashedSeeds == 20 and #f.treeActions == 0 and f.world.fg[4][2] == 627 and f.worn == 898)
+end)
+
+local function rotationFixture()
+    local f = mixedTransferFixture()
+    f.app.job, f.app.jobToken = nil, nil
+    f.app.config.planting = {seedId=955, storageWorld="BREAK", worlds={"FARM","FARM2"}}
+    f.app.config.points.plantBox = f.app.config.points.seedBox
+    f.app.config.points.seedBox.standX = 9
+    f.app.config.points.blockBox.standX = 11
+    f.app.config.options.harvestRespawn = false
+    f.app.config.rotation.farms = {}
+    f.grids, f.worldDrops, f.treeTimes = {}, {}, {}
+    f.worldBoxes = {FARM={[0]={}}, FARM2={[0]={}}, BREAK={[12]={},[8]={{955,10}}}}
+    for _, name in ipairs({"FARM","FARM2","BREAK"}) do
+        local grid = {}
+        for y = 0,19 do grid[y]={}; for x=0,29 do grid[y][x]=0 end end
+        for x = 0, (name == "BREAK" and 14 or 5) do grid[9][x]=2 end
+        if name == "BREAK" then grid[8][8],grid[8][12]=1422,1422
+        else
+            grid[8][0]=1422
+            for y=0,7 do grid[y][0]=2 end
+            f.app.config.rotation.farms[name]={world=name,x=0,y=8,standX=1,standY=8}
+        end
+        f.grids[name], f.worldDrops[name], f.treeTimes[name] = grid,{},{}
+    end
+    f.app.config.points.farmBox = f.app.config.rotation.farms.FARM
+    f.world.fg, f.drops = f.grids.FARM, f.worldDrops.FARM
+    f.world.name, f.avatar.x, f.avatar.y = "FARM",1.5,8.999
+    f.world.dropList = function() return f.worldDrops[f.world.name] end
+    f.world.dropTaken = function(uid, remaining)
+        for index, drop in ipairs(f.drops) do
+            if drop.uid == uid then drop.n=remaining; if remaining == 0 then table.remove(f.drops,index) end; return end
+        end
+    end
+    f.entries, f.plants, f.harvests, f.pnbBlocks, f.uid = {}, {}, {}, 0, 0
+    f.world.enter = function(name)
+        f.entries[#f.entries+1] = name
+        f.world.name, f.world.fg, f.drops = name, f.grids[name], f.worldDrops[name]
+        f.avatar.x, f.avatar.y, f.avatar.vx, f.avatar.vy = name == "BREAK" and 10.5 or 1.5,8.999,0,0
+        f.avatar.active, f.avatar.dead, f.avatar.grounded = true,false,true
+        return true
+    end
+    f.app.runtime.items[955].grow = 100
+    f.app.runtime.items[1422].solid = true
+    f.app.runtime.body.solidAt = function(x,y)
+        if x < 0 or x >= f.world.w or y >= f.world.h then return true end
+        local item = f.app.runtime.items[f.world.fg[y] and f.world.fg[y][x] or 0]
+        return item and item.solid or false
+    end
+    f.app.runtime.treeRipe = function(x,y)
+        local planted = f.treeTimes[f.world.name][y*f.world.w+x]
+        if planted == nil then return nil end
+        return os.clock() >= planted + f.app.runtime.items[955].grow
+    end
+    f.app.runtime.handlers = {
+        canPlace = function() return true end,
+        plantSeed = function(id,x,y)
+            assert(f.world.name ~= "BREAK" and f.serverItems[id] > 0)
+            f.world.fg[y][x] = id
+            f.treeTimes[f.world.name][y*f.world.w+x] = os.clock()
+            f.inventory:remove(id,1); f.serverItems[id] = f.serverItems[id]-1
+            f.plants[#f.plants+1]={world=f.world.name,x=x,y=y}
+        end,
+        setTile = function(_,x,y,id)
+            assert(f.world.name == "BREAK" and x == 10 and y == 7)
+            f.world.fg[y][x]=id; f.serverItems[id]=f.serverItems[id]-1
+        end,
+        hit = function(x,y)
+            local id = f.world.fg[y][x]
+            assert(id == 954 or id == 955)
+            f.world.fg[y][x]=0
+            f.uid=f.uid+2
+            if id == 955 then
+                assert(f.app.runtime.treeRipe(x,y))
+                f.harvests[#f.harvests+1]={world=f.world.name,x=x,y=y}
+                f.addDrop(f.uid,954,1,x+0.5,y+0.5)
+            else f.pnbBlocks=f.pnbBlocks+1 end
+            f.addDrop(f.uid+1,955,1,x+0.5,y+0.5)
+        end,
+    }
+    f.allowMovingPickup = true
+    attachPhysics(f,f.hooks.navigationMap(f.app.runtime))
+    local physics = f.onWait
+    f.onWait = function(dt)
+        if f.app.job and f.app.controls then -- Waiting for trees releases movement wrappers.
+            physics(dt)
+        end
+        if f.afterWait then f.afterWait(dt) end
+    end
+    installToggles(f)
+    f.app.runToggles.rotation={Value=false,Set=function(self,v) self.Value=v end}
+    return f
+end
+
+test("Full rotation plants both farms, waits for maturity, harvests seeds and blocks, runs PNB, and repeats", function()
+    local f = rotationFixture()
+    local waited = false
+    f.afterWait = function()
+        if f.app.status:find("growing trees",1,true) and not f.app.controls then
+            waited=true
+            assert(f.controls.dir() == -1 and f.controls.jumping() == true, "Maturity waits release original controls")
+        end
+        if f.app.stats.cycles == 2 then f.app:stop() end
+    end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError, f.app.lastError)
+    assert(waited and f.app.stats.cycles == 2 and f.pnbBlocks == 20 and #f.harvests == 20, "wait=" .. tostring(waited) .. " cycles=" .. f.app.stats.cycles .. " PNB=" .. f.pnbBlocks .. " trees=" .. #f.harvests .. " plants=" .. #f.plants)
+    assert(#f.plants == 20 and f.plants[1].world == "FARM" and f.plants[6].world == "FARM2")
+    assert(f.plants[11].world == "FARM" and f.plants[16].world == "FARM2")
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) == 30)
+    assert(f.app.stats.harvestSeeds == 20 and f.app.stats.stashedSeeds == 30)
+    assert(f.app.job == nil and not f.app.runToggles.rotation.Value and not f.hooks.readRotationResume())
+end)
+
+test("A rotation stopped during maturity wait makes no tree, pickup, or PNB actions", function()
+    local f = rotationFixture()
+    f.app.runtime.items[955].grow = 500
+    f.afterWait = function()
+        if f.app.status:find("growing trees",1,true) then f.app:stop() end
+    end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError and #f.plants == 10 and #f.harvests == 0 and #f.requests == 0 and f.pnbBlocks == 0)
+    assert(not f.hooks.readRotationResume())
+end)
+
+test("Saved rotation resumes the second farm's transfer without replanting or repeating its harvest", function()
+    local f = rotationFixture()
+    f.worldBoxes.FARM2[0]={{955,5}}
+    f.worldBoxes.BREAK[12]={{954,5}}
+    f.serverItems[955]=200; f.inventory:add(955,200)
+    f.hooks.saveRotationResume({phase="transfer",worldIndex=2,cycle=1,work=10,seedCargo=0,
+        transfer={phase="return",cargo=0,seeds=200}})
+    local saved=f.hooks.readRotationResume()
+    f.afterWait=function() if f.app.stats.cycles == 1 then f.app:stop() end end
+    f.hooks.start("rotation",saved)
+    assert(not f.app.lastError,f.app.lastError)
+    assert(#f.plants == 0 and #f.harvests == 0 and f.pnbBlocks == 5 and f.app.stats.cycles == 1)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) == 220)
+end)
+
+test("Ambiguous rotation seed withdrawals pause before world entry or additional storage mutations", function()
+    local f=rotationFixture()
+    f.hooks.saveRotationResume({phase="seedPickupPending",worldIndex=1,cycle=1,work=10,seedCargo=0})
+    f.hooks.start("rotation",f.hooks.readRotationResume())
+    assert(f.app.lastError:find("storage request was interrupted",1,true) and #f.entries == 0 and f.withdrawals == 0)
+    assert(f.hooks.readRotationResume().state.phase == "seedPickupPending")
+end)
+
+test("Rotation reconciles a planted seed after a picker interruption and continues the farm list", function()
+    local f=rotationFixture()
+    local plant=f.app.runtime.handlers.plantSeed
+    local interrupted=false
+    f.app.runtime.handlers.plantSeed=function(...)
+        plant(...)
+        if not interrupted then
+            interrupted=true
+            f.world.name,f.avatar.active="",false
+        end
+    end
+    f.afterWait=function() if f.app.stats.cycles == 1 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(interrupted and #f.plants == 10 and #f.harvests == 10 and f.pnbBlocks == 10)
+    assert(f.app.stats.planted == 10 and f.app.stats.cycles == 1)
+end)
+
+test("Rotation rejoins PNB after an interrupted break without placing or harvesting twice", function()
+    local f=rotationFixture()
+    local hit=f.app.runtime.handlers.hit
+    local interrupted=false
+    f.app.runtime.handlers.hit=function(...)
+        hit(...)
+        if f.world.name == "BREAK" and not interrupted then
+            interrupted=true
+            f.world.name,f.avatar.active="",false
+        end
+    end
+    f.afterWait=function() if f.app.stats.cycles == 1 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(interrupted and #f.plants == 10 and #f.harvests == 10 and f.pnbBlocks == 10)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[8],955) == 20)
+end)
+
+test("An empty rotation with no seeds or crop pauses after checking the list instead of repeating empty travel", function()
+    local f=rotationFixture()
+    f.worldBoxes.BREAK[8]={}
+    f.hooks.start("rotation")
+    assert(f.app.lastError:find("no harvest or stored crop",1,true))
+    assert(#f.plants == 0 and #f.harvests == 0 and f.pnbBlocks == 0 and f.app.stats.cycles == 0)
+    assert(#f.entries < 15)
+end)
+
+test("Rotation recovery files preserve progress independently and reject account or phase corruption", function()
+    local f=rotationFixture()
+    local state={phase="wait",worldIndex=2,cycle=3,work=10,seedCargo=0}
+    f.hooks.saveRotationResume(state)
+    state.worldIndex=1
+    local saved=f.hooks.readRotationResume()
+    assert(saved.state.worldIndex == 2 and saved.state.cycle == 3)
+    saved.userId=999
+    rejects(f.hooks.readRotationResume,"another account")
+    saved.userId=f.player.UserId; saved.state.phase="unknown"
+    rejects(f.hooks.readRotationResume,"rotation phase")
 end)
 
 return string.format("%d actual-script runtime tests passed (mock services/server)", passed)

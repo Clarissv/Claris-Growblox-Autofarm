@@ -331,4 +331,69 @@ test("Solid walls and isolated box roofs do not reverse long farm rows", functio
     assert(#tiles == 10 and tiles[1].x == 1 and tiles[6].x == 5 and tiles[6].y == 5)
 end)
 
+test("Harvest methods default older profiles to Fist and preserve Tractor independently", function()
+    local config = setup()
+    config.harvesting = nil
+    assert(Core.validate(config).harvesting.method == "fist")
+    config.harvesting = {method = "tractor"}
+    local saved = Core.validate(config)
+    assert(saved.harvesting.method == "tractor")
+    saved.harvesting.method = "fist"
+    assert(config.harvesting.method == "tractor")
+    config.harvesting.method = "unknown"
+    rejects(function() Core.validate(config) end, "harvesting method")
+end)
+
+test("Ripe trees follow physical row direction while growing trees and other crops are skipped", function()
+    local world = {w = 5, h = 5, fg = {}}
+    for y = 0, 4 do world.fg[y] = {}; for x = 0, 4 do world.fg[y][x] = 0 end end
+    for x = 0, 4 do world.fg[3][x] = 955 end
+    world.fg[3][2] = 627
+    local row = {y = 3, left = 0, right = 4, direction = -1}
+    local points = Core.ripeTrees(world, 955, row, function(x) return x ~= 1 end)
+    assert(#points == 3 and points[1].x == 4 and points[2].x == 3 and points[3].x == 0)
+    rejects(function() Core.ripeTrees(world, 955, row, function() return nil end) end, "growth data")
+    assert(Core.hasTrees(world, 955) and not Core.hasTrees(world, 123))
+end)
+
+test("Planting row space excludes occupied, unsupported, and previously skipped cells", function()
+    local world = {w = 4, h = 3, fg = {[0] = {[0]=955,[1]=0,[2]=0,[3]=0}, [1] = {[0]=2,[1]=2,[2]=0,[3]=2}}}
+    local items = {[2]={solid=true}}
+    local row = {y = 0, left = 0, right = 3}
+    assert(Core.rowHasPlantingSpace(world, items, row))
+    assert(not Core.rowHasPlantingSpace(world, items, row, {["1:0"] = "denied", ["3:0"] = "unreachable"}))
+end)
+
+test("Farm boxes accept the matching block and seed while dedicated PNB boxes remain strict", function()
+    local rows={{955,300},{954,450},{954,50}}
+    assert(Core.storageCount(rows,954,955) == 500 and Core.storageCount(rows,955,954) == 300)
+    rejects(function() Core.storageCount(rows,954) end,"different item")
+    rejects(function() Core.storageCount({{955,200},{18,1}},954,955) end,"different item")
+end)
+
+test("Legacy Farm storage migrates into an independent per-world rotation map", function()
+    local config=setup()
+    config.rotation=nil
+    local saved=Core.validate(config)
+    assert(saved.rotation.farms[config.points.farmBox.world].x == config.points.farmBox.x)
+    config.rotation={farms={FARM={world="OTHER",x=1,y=1,standX=1,standY=1}}}
+    rejects(function() Core.validate(config) end,"rotation storage world")
+end)
+
+test("Full rotation requires matching planting seeds, shared PNB seed storage, and a box for every farm", function()
+    local config=setup()
+    config.planting={seedId=955,storageWorld="BREAK",worlds={"FARM","FARM2"}}
+    config.points.plantBox=config.points.seedBox
+    config.rotation.farms={FARM=config.points.farmBox}
+    local items={[954]={hits=2},[955]={kind="seed"},[627]={kind="seed"}}
+    rejects(function() Core.checkSetup(config,"rotation",items) end,"FARM2")
+    config.rotation.farms.FARM2={world="FARM2",x=1,y=1,standX=1,standY=1}
+    assert(Core.checkSetup(config,"rotation",items))
+    config.planting.seedId=627
+    rejects(function() Core.checkSetup(config,"rotation",items) end,"must match")
+    config.planting.seedId=955
+    config.points.plantBox={world="BREAK",x=7,y=8,standX=7,standY=8}
+    rejects(function() Core.checkSetup(config,"rotation",items) end,"PNB seed box")
+end)
+
 return string.format("%d configuration/layout/storage tests passed", passed)

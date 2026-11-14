@@ -18,6 +18,8 @@ function Core.defaults()
             moveAfterHarvest = false, harvestRespawn = true },
         webhook = { url = "", enabled = false, intervalMinutes = 5, includeBoxes = true },
         planting = {seedId = 0, storageWorld = "", worlds = {}},
+        harvesting = {method = "fist"},
+        rotation = {farms = {}},
     }
 end
 
@@ -105,6 +107,11 @@ function Core.validate(input)
     local out = Core.defaults()
     out.webhook = Core.validateWebhook(input.webhook)
     out.planting = Core.validatePlanting(input.planting)
+    if input.harvesting ~= nil then
+        assert(type(input.harvesting) == "table" and (input.harvesting.method == "fist" or input.harvesting.method == "tractor"),
+            "Invalid harvesting method.")
+        out.harvesting.method = input.harvesting.method
+    end
     out.blockId = input.blockId
     for key, limits in pairs(Core.LIMITS) do
         local value = input.options[key]
@@ -136,6 +143,24 @@ function Core.validate(input)
             out.points[key] = copy
         end
     end
+    if input.rotation ~= nil then
+        assert(type(input.rotation) == "table" and type(input.rotation.farms) == "table", "Invalid rotation farm storage.")
+        local total = 0
+        for name, point in pairs(input.rotation.farms) do
+            local world = Core.worldName(name)
+            assert(world == name and type(point) == "table" and point.world == world, "Invalid rotation storage world.")
+            local copy = {world = world}
+            for _, key in ipairs({"x", "y", "standX", "standY"}) do
+                assert(integer(point[key], 0, 65535), "Invalid rotation storage position.")
+                copy[key] = point[key]
+            end
+            out.rotation.farms[world], total = copy, total + 1
+        end
+        assert(total <= 50, "Use at most 50 saved rotation farms.")
+    end
+    if out.points.farmBox and not out.rotation.farms[out.points.farmBox.world] then
+        out.rotation.farms[out.points.farmBox.world] = out.points.farmBox
+    end
     return out
 end
 
@@ -161,13 +186,13 @@ function Core.farmable(item)
         and type(item.hits) == "number" and item.hits > 0
 end
 
-function Core.storageCount(rows, itemId)
+function Core.storageCount(rows, itemId, companionId)
     local count = 0
     for _, row in pairs(rows or {}) do
-        assert(type(row) == "table" and row[1] == itemId,
+        assert(type(row) == "table" and (row[1] == itemId or (companionId ~= nil and row[1] == companionId)),
             "This storage box contains a different item. Use a box dedicated to the selected item.")
         assert(integer(row[2], 0, 4294967295), "Invalid storage count.")
-        count = count + row[2]
+        if row[1] == itemId then count = count + row[2] end
     end
     return count
 end
@@ -227,8 +252,50 @@ function Core.plantingTiles(world, items, rows)
     return tiles
 end
 
+function Core.rowHasPlantingSpace(world, items, row, skipped)
+    for x = row.left, row.right do
+        if not (skipped and skipped[x .. ":" .. row.y]) and Core.plantingTile(world, items, x, row.y) then return true end
+    end
+    return false
+end
+
+function Core.hasTrees(world, seedId)
+    for y = 0, world.h - 1 do
+        for x = 0, world.w - 1 do
+            if world.fg[y] and world.fg[y][x] == seedId then return true end
+        end
+    end
+    return false
+end
+
+function Core.ripeTrees(world, seedId, row, ripe)
+    local result = {}
+    local direction = row.direction or 1
+    local first, last = direction == 1 and row.left or row.right, direction == 1 and row.right or row.left
+    for x = first, last, direction do
+        if world.fg[row.y] and world.fg[row.y][x] == seedId then
+            local ready = ripe(x, row.y, seedId)
+            assert(ready ~= nil, "Tree growth data is not ready at " .. x .. ", " .. row.y .. ". Reconnect after the world loads.")
+            if ready then table.insert(result, {x = x, y = row.y}) end
+        end
+    end
+    return result
+end
+
 function Core.checkSetup(config, mode, items)
-    assert(mode == "pnb" or mode == "transfer" or mode == "harvest" or mode == "plant", "Unknown farming task.")
+    assert(mode == "pnb" or mode == "transfer" or mode == "harvest" or mode == "plant" or mode == "rotation", "Unknown farming task.")
+    if mode == "rotation" then
+        Core.checkSetup(config, "plant", items)
+        Core.checkSetup(config, "pnb", items)
+        assert(config.planting.seedId == Core.seedId(items, config.blockId), "Rotation planting seed must match the selected PNB block.")
+        local stock, seeds = config.points.plantBox, config.points.seedBox
+        assert(stock.world == seeds.world and stock.x == seeds.x and stock.y == seeds.y,
+            "Use the PNB seed box as planting storage for rotation.")
+        for _, name in ipairs(config.planting.worlds) do
+            assert(config.rotation.farms[name], "Save Farm storage in rotation world: " .. name)
+        end
+        return true
+    end
     if mode == "plant" then
         local p = Core.validatePlanting(config.planting)
         assert(items[p.seedId] and items[p.seedId].kind == "seed", "Choose a seed on the Planting tab.")
