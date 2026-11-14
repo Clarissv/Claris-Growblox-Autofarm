@@ -3569,6 +3569,170 @@ test("Harvest follows top-left zigzag rows and lands at both platform edges", fu
     assert(#f.drops == 0 and f.app.stats.stashed == 45 and f.respawns == 1)
 end)
 
+local function watchForwardCollection(f)
+    local physics, accept, started, progress = f.onWait,f.accept,{},{}
+    f.accept = function(drop,want)
+        local amount = accept(drop,want)
+        if amount > 0 then started[math.floor(drop.y)] = true end
+        return amount
+    end
+    f.onWait = function(dt)
+        physics(dt)
+        local y = math.floor(f.avatar.y-0.01)
+        if y >= 2 and y <= 6 and y%2 == 0 then
+            local active = f.app.status:find("Collecting farm row",1,true) and f.app.status:find(" at " .. y .. "...",1,true)
+            local live = false
+            for _,drop in ipairs(f.drops) do if math.floor(drop.y) == y then live=true; break end end
+            if active and started[y] and live and f.avatar.grounded then
+                local direction = (y/2)%2 == 1 and 1 or -1
+                local forward = f.avatar.x*direction
+                if progress[y] then assert(forward >= progress[y]-0.3,
+                    "Collection reversed along row " .. y .. " instead of finishing its forward pass") end
+                progress[y] = math.max(progress[y] or forward,forward)
+            elseif not active then progress[y] = nil end
+        end
+    end
+end
+
+test("Delayed row pickups keep one zigzag direction instead of crossing the row and returning", function()
+    local f = zigzagHarvestFixture()
+    for row=1,3 do for column,x in ipairs({2,7,13}) do
+        f.addDrop(row*10+column,954,5,x+0.5,row*2+0.5)
+    end end
+    local physics, progress, delayed = f.onWait, {}, false
+    f.onWait = function(dt)
+        physics(dt)
+        local y = math.floor(f.avatar.y-0.01)
+        local row = y/2
+        if row >= 1 and row <= 3 and row == math.floor(row) then
+            local direction = row%2 == 1 and 1 or -1
+            local entry = direction == 1 and "1:" .. y or "14:" .. y
+            local live, started = false, false
+            for _,uid in ipairs(f.accepted) do if uid == row*10+(direction == 1 and 1 or 3) then started=true; break end end
+            for _,drop in ipairs(f.drops) do if math.floor(drop.y) == y then live=true; break end end
+            if started and f.visited[entry] and live then
+                local forward = f.avatar.x*direction
+                if progress[row] then assert(forward >= progress[row]-0.3,
+                    "Collection reversed along row " .. y .. " instead of finishing its forward pass") end
+                progress[row] = math.max(progress[row] or forward,forward)
+            end
+        end
+        if not delayed then
+            for _,drop in ipairs(f.drops) do
+                if drop.uid == 12 and f.hooks.Navigation.pickupOverlap(f.avatar,drop) then
+                    delayed,drop.pending,drop.readyAt = true,true,os.clock()+1
+                end
+            end
+        end
+        for _,drop in ipairs(f.drops) do
+            if drop.uid == 12 and delayed and os.clock() >= drop.readyAt then drop.pending=false end
+        end
+    end
+    f.harvest()
+    assert(delayed and table.concat(f.accepted,",") == "11,12,13,23,22,21,31,32,33")
+    assert(#f.drops == 0 and f.app.stats.stashed == 45 and f.app.pending == 0)
+end)
+
+test("Clustered partial pickups finish in one forward pass with at most eight delayed requests", function()
+    local f = zigzagHarvestFixture()
+    for row=1,3 do
+        f.addDrop(row*1000,954,1,2.5,row*2+0.5)
+        for n=1,12 do
+            f.addDrop(row*1000+n,954,3,7.5,row*2+0.5)
+            f.addDrop(row*1000+100+n,955,1,7.5,row*2+0.5)
+            f.addDrop(row*1000+200+n,112,1,7.5,row*2+0.5)
+        end
+        f.addDrop(row*1000+999,954,1,13.5,row*2+0.5)
+    end
+    local accept, peak, queued, physics = f.accept,0,{},f.onWait
+    f.accept = function(drop,want) return accept(drop,math.min(want,1)) end
+    f.spawn = function(fn)
+        peak = math.max(peak,f.app.pending)
+        queued[#queued+1] = {fn=fn,at=os.clock()+0.15}
+    end
+    f.onWait = function(dt)
+        physics(dt)
+        local ready = {}
+        for index=#queued,1,-1 do
+            if queued[index].at <= os.clock() then ready[#ready+1]=queued[index].fn; table.remove(queued,index) end
+        end
+        for _,fn in ipairs(ready) do fn() end
+    end
+    watchForwardCollection(f)
+    f.harvest()
+    assert(peak <= 8 and #queued == 0 and f.app.pending == 0 and #f.drops == 0)
+    assert(f.app.stats.stashed == 114 and f.app.stats.stashedSeeds == 36 and f.app.stats.gems == 36)
+end)
+
+test("Inventory confirmations stop forward steering while slow replies settle instead of skipping row drops", function()
+    local f = zigzagHarvestFixture()
+    for row=1,3 do for x=2,13 do f.addDrop(row*100+x,954,1,x+0.5,row*2+0.5) end end
+    local server = f.server
+    f.server = function(name,...)
+        if name == "GetInventory" then task.wait(0.35) end
+        return server(name,...)
+    end
+    watchForwardCollection(f)
+    f.harvest()
+    assert(#f.drops == 0 and f.app.stats.stashed == 36 and f.app.pending == 0)
+end)
+
+test("A low-FPS forward collection pass brakes before passing a delayed row drop", function()
+    local f = zigzagHarvestFixture()
+    for row=1,3 do for column,x in ipairs({2,7,13}) do f.addDrop(row*10+column,954,2,x+0.5,row*2+0.5) end end
+    local wait, physics, delayed = task.wait,f.onWait,false
+    task.wait = function(dt) return wait(math.max(dt or 0.03,1/12)) end
+    f.spawn = function(fn) task.defer(fn) end
+    f.onWait = function(dt)
+        physics(dt)
+        for _,drop in ipairs(f.drops) do
+            if drop.uid == 12 then
+                if not delayed and f.hooks.Navigation.pickupOverlap(f.avatar,drop) then
+                    delayed,drop.pending,drop.readyAt = true,true,os.clock()+1
+                end
+                if delayed and os.clock() >= drop.readyAt then drop.pending=false end
+            end
+        end
+    end
+    watchForwardCollection(f)
+    f.harvest()
+    task.wait = wait
+    assert(delayed and table.concat(f.accepted,",") == "11,12,13,23,22,21,31,32,33")
+    assert(#f.drops == 0 and f.app.stats.stashed == 18 and f.app.pending == 0)
+end)
+
+test("Genuine pickup refusals retry in reach during the forward row pass", function()
+    local f = zigzagHarvestFixture()
+    for row=1,3 do for column,x in ipairs({2,7,13}) do f.addDrop(row*10+column,954,2,x+0.5,row*2+0.5) end end
+    local accept, refused = f.accept,{}
+    f.accept = function(drop,want)
+        if not refused[drop.uid] then refused[drop.uid]=os.clock(); return 0 end
+        assert(os.clock()-refused[drop.uid] >= 1)
+        return accept(drop,want)
+    end
+    watchForwardCollection(f)
+    f.harvest()
+    assert(table.concat(f.accepted,",") == "11,12,13,23,22,21,31,32,33")
+    assert(#f.drops == 0 and #f.requests == 18 and f.app.stats.stashed == 18)
+end)
+
+test("A large gem UID keeps making pickup progress during a forward wait longer than the action timeout", function()
+    local f = zigzagHarvestFixture()
+    f.addDrop(1,112,1,2.5,2.5)
+    f.addDrop(2,112,100000,7.5,2.5)
+    f.addDrop(3,112,1,13.5,2.5)
+    local accept = f.accept
+    f.accept = function(drop,want)
+        task.wait(0.15)
+        return accept(drop,math.min(want,1000))
+    end
+    watchForwardCollection(f)
+    f.harvest()
+    assert(os.clock() > f.app.config.options.actionTimeout and #f.drops == 0)
+    assert(f.app.stats.gems == 100002 and f.serverGems == 100102 and f.app.pending == 0)
+    assert(#f.deposits == 0)
+end)
+
 test("A full harvest backpack returns to its current row after respawn without skipping a partial stack", function()
     local f = zigzagHarvestFixture()
     f.addDrop(11, 954, 10, 2.5, 2.5)
@@ -3582,13 +3746,13 @@ test("A full harvest backpack returns to its current row after respawn without s
     assert(f.deposits[1] == 200 and f.deposits[2] == 90 and f.app.pending == 0)
 end)
 
-test("Harvest skips an empty upper row and retains the next row's right-to-left direction", function()
+test("Harvest skips an empty upper row and starts the first occupied row from the left", function()
     local f = zigzagHarvestFixture()
     f.addDrop(21, 954, 10, 2.5, 4.5)
     f.addDrop(23, 954, 10, 13.5, 4.5)
     f.harvest()
-    assert(table.concat(f.accepted, ",") == "23,21")
-    assert(not f.visited["1:2"] and not f.visited["14:2"] and f.visited["14:4"])
+    assert(table.concat(f.accepted, ",") == "21,23")
+    assert(not f.visited["1:2"] and not f.visited["14:2"] and f.visited["1:4"])
     assert(not table.concat(f.app.logs, "\n"):find("Collecting farm row 1/", 1, true))
 end)
 
@@ -3614,15 +3778,26 @@ test("Harvest with no selected loose or held blocks completes without walking or
     end
 end)
 
-test("Harvest skips an empty middle row without reversing the lower row", function()
+test("The next occupied row reverses after an empty middle row without crossing it to find its entry", function()
     local f = zigzagHarvestFixture()
     f.addDrop(11, 954, 10, 2.5, 2.5)
     f.addDrop(13, 954, 10, 13.5, 2.5)
     f.addDrop(31, 954, 10, 2.5, 6.5)
     f.addDrop(33, 954, 10, 13.5, 6.5)
     f.addDrop(21, 18, 10, 7.5, 4.5)
+    local physics = f.onWait
+    f.onWait = function(dt)
+        physics(dt)
+        local topFinished, lowerStarted = false,false
+        for _,uid in ipairs(f.accepted) do
+            if uid == 13 then topFinished=true elseif uid == 33 then lowerStarted=true end
+        end
+        if topFinished and not lowerStarted and f.avatar.grounded and math.floor(f.avatar.y-0.01) == 6 then
+            assert(f.avatar.x >= 12.9, "The next row must collect from the arrival side, not cross it to start again")
+        end
+    end
     f.harvest()
-    assert(table.concat(f.accepted, ",") == "11,13,31,33")
+    assert(table.concat(f.accepted, ",") == "11,13,33,31")
     assert(not table.concat(f.app.logs, "\n"):find("Collecting farm row 2/", 1, true))
     assert(#f.drops == 1 and f.drops[1].id == 18 and f.app.stats.stashed == 40)
 end)
@@ -3729,6 +3904,27 @@ test("The movement follower lands after a tall fall through a world-edge column"
     f.hooks.moveTo(6, 62, "BREAK", 1)
     assert(visited["6:62"] and f.avatar.grounded and math.abs(f.avatar.y - 63) < 0.22)
     assert(f.controls.dir() == 0 and not f.controls.jumping())
+end)
+
+test("A nearby harvest drop retries from a fractional supported position when no tile center overlaps it", function()
+    local f = harvestFixture()
+    local map = harvestFloor(f)
+    for x = 0,f.world.w-1 do f.world.fg[9][x] = (x == 9 or x == 10 or x == 12) and 1 or 0 end
+    f.avatar.x = 9.05
+    attachPhysics(f,map)
+    local drop = f.addDrop(26,954,20,8.5,8.5)
+    local goal = f.hooks.Navigation.pickupGoal(map,f.avatar,drop,{nativeOnly=true})
+    assert(not goal and f.hooks.Navigation.pickupOverlap(f.avatar,drop),
+        "Fixture must reproduce native reach without a supported tile-center pickup goal")
+    f.accept = function(candidate,want)
+        if #f.requests == 1 then return 0 end -- A temporary server refusal needs a retry.
+        assert(f.hooks.Navigation.pickupOverlap(f.avatar,candidate), "Retry must use actual native overlap")
+        return want
+    end
+    f.harvest()
+    assert(#f.requests == 2 and f.requests[2].time-f.requests[1].time >= 1)
+    assert(#f.drops == 0 and f.app.stats.stashed == 20 and f.app.pending == 0)
+    assert(f.app.harvestCollectionRecovery:find("current supported position",1,true))
 end)
 
 test("An unreachable harvest drop produces a location diagnostic instead of completing", function()
@@ -5386,6 +5582,107 @@ test("An empty PNB with a saved future deadline recovers loose and stored crop w
     assert(f.app.stats.moved == 404 and f.app.stats.harvested == 3 and f.app.stats.harvestSeeds == 2)
     assert(f.serverGems == 107 and f.hooks.Core.itemCount(f.worldBoxes.BREAK[8],955) >= 7)
     assert(f.hooks.Core.itemCount(f.worldBoxes.BREAK[12],954) == 204)
+end)
+
+test("Rotation defers an unsupported drop and transfers an 8000-block mixed farm box before PNB", function()
+    local f = rotationFixture()
+    fillGrowingFarms(f,{FARM=2000,FARM2=2000})
+    f.worldBoxes.BREAK[12] = {}
+    f.worldBoxes.FARM[0] = {{954,8000},{955,3}}
+    local inaccessible = f.addDrop(10000,954,9,4.5,1.5)
+    f.addDrop(10001,954,1,2.5,8.5)
+    f.addDrop(10002,955,2,3.5,8.5)
+    f.addDrop(10003,112,7,4.5,8.5)
+    f.hooks.saveRotationResume({phase="wait",worldIndex=1,cycle=1,work=0,seedCargo=0,completed={},readyAt={}})
+    local hit = f.app.runtime.handlers.hit
+    f.app.runtime.handlers.hit = function(x,y)
+        if f.world.name == "BREAK" then
+            assert(f.hooks.Core.itemCount(f.worldBoxes.FARM[0],954) == 0,
+                "PNB must wait for all 8000 farm blocks to be transported")
+            assert(f.app.stats.moved == 8001 and f.app.stats.harvestSeeds == 2)
+        end
+        return hit(x,y)
+    end
+    local finalState
+    f.afterWait = function()
+        if f.pnbBlocks == 1 then finalState=f.hooks.readRotationResume().state; f.app:stop() end
+    end
+    f.hooks.start("rotation",f.hooks.readRotationResume())
+    assert(not f.app.lastError,f.app.lastError)
+    assert(#f.worldDrops.FARM == 1 and f.worldDrops.FARM[1] == inaccessible and inaccessible.n == 9)
+    assert(#f.harvests == 0 and #f.plants == 0 and f.app.pending == 0)
+    assert(f.serverGems == 107 and f.app.stats.moved == 8001)
+    assert(finalState.deferredHarvest.FARM["10000"].id == 954)
+    assert(f.app.harvestCollectionRecovery:find("No reachable floor",1,true))
+end)
+
+test("Deferred harvest drops survive reloads, avoid repeat visits, and retry after moving", function()
+    local f = rotationFixture()
+    fillGrowingFarms(f,{FARM=2000,FARM2=2000})
+    f.worldBoxes.BREAK[12] = {}
+    local drop = f.addDrop(10000,955,4,4.5,1.5)
+    f.hooks.saveRotationResume({phase="wait",worldIndex=1,cycle=1,work=0,seedCargo=0,completed={},readyAt={},
+        deferredHarvest={FARM={["10000"]={id=955,x=4.5,y=1.5,retryAt=300}}}})
+    local saved = f.hooks.readRotationResume()
+    local moved, finalState = false
+    f.afterWait = function()
+        if not moved and f.app.status:find("waiting for growing trees",1,true) then
+            assert(f.app.rotationState.phase == "waitPNB" and #f.worldDrops.FARM == 1)
+            assert(f.app.stats.harvestSeeds == 0, "Deferred drop must not start another collection pass")
+            moved = true
+            drop.y = 8.5
+            f.app.rotationState.readyAt.FARM = 0 -- Next scheduled visit sees its new position.
+        elseif moved and f.app.stats.harvestSeeds == 4 and f.world.name == "BREAK" then
+            finalState=f.hooks.readRotationResume().state
+            f.app:stop()
+        end
+    end
+    f.hooks.start("rotation",saved)
+    assert(not f.app.lastError,f.app.lastError)
+    assert(moved and #f.worldDrops.FARM == 0 and f.app.stats.harvestSeeds == 4)
+    assert(not finalState.deferredHarvest.FARM["10000"])
+end)
+
+test("Rotation retries an expired deferred harvest drop and rejects corrupt deferred records", function()
+    local f = rotationFixture()
+    fillGrowingFarms(f,{FARM=2000,FARM2=2000})
+    f.worldBoxes.BREAK[12] = {}
+    f.addDrop(10000,954,1,2.5,8.5)
+    local state = {phase="wait",worldIndex=1,cycle=1,work=0,seedCargo=0,completed={},readyAt={},
+        deferredHarvest={FARM={["10000"]={id=954,x=2.5,y=8.5,retryAt=0}}}}
+    f.hooks.saveRotationResume(state)
+    f.afterWait = function() if f.pnbBlocks == 1 then f.app:stop() end end
+    f.hooks.start("rotation",f.hooks.readRotationResume())
+    assert(not f.app.lastError,f.app.lastError)
+    assert(#f.worldDrops.FARM == 0 and f.app.stats.moved == 1)
+    state.deferredHarvest.FARM["10000"].retryAt = "bad"
+    f.hooks.saveRotationResume(state)
+    rejects(f.hooks.readRotationResume,"deferred harvest location or time")
+end)
+
+test("Rotation skips a repeatedly refused drop on its forward row without abandoning other pickups", function()
+    local f = rotationFixture()
+    fillGrowingFarms(f,{FARM=2000,FARM2=2000})
+    f.worldBoxes.BREAK[12] = {}
+    local refused = f.addDrop(10000,954,9,2.5,8.5)
+    f.addDrop(10001,954,1,4.5,8.5)
+    local accept = f.accept
+    f.accept = function(drop,want)
+        if drop.uid == 10000 then return 0 end
+        return accept and accept(drop,want) or want
+    end
+    f.hooks.saveRotationResume({phase="wait",worldIndex=1,cycle=1,work=0,seedCargo=0,completed={},readyAt={}})
+    local finalState
+    f.afterWait = function()
+        if f.pnbBlocks == 1 then finalState=f.hooks.readRotationResume().state; f.app:stop() end
+    end
+    f.hooks.start("rotation",f.hooks.readRotationResume())
+    assert(not f.app.lastError,f.app.lastError)
+    assert(#f.worldDrops.FARM == 1 and f.worldDrops.FARM[1] == refused and f.app.stats.moved == 1)
+    assert(finalState.deferredHarvest.FARM["10000"] and f.app.pending == 0)
+    local attempts = 0
+    for _,request in ipairs(f.requests) do if request.uid == 10000 then attempts=attempts+1 end end
+    assert(attempts == 3, "Isolated refusal must be deferred after three settled attempts")
 end)
 
 test("Empty seed/block supply checks the farms once and waits without repeating an empty drain", function()

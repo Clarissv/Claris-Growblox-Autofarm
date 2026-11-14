@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.36"
+local VERSION = "0.1.37"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -1024,7 +1024,17 @@ local function walkTo(x, y, worldName, token, onStep)
     while true do
         worldCheck(worldName, token)
         local state = position()
-        if not collectionStep(state) then hold.direction, hold.jump = 0, false; return false end
+        local proceed, _, pacing = collectionStep(state)
+        if not proceed then hold.direction, hold.jump = 0, false; return false end
+        while pacing do
+            hold.direction, hold.jump = 0, false
+            pause(0.025, token)
+            deadline = deadline + 0.025
+            worldCheck(worldName, token)
+            state = position()
+            proceed, _, pacing = collectionStep(state)
+            if not proceed then return false end
+        end
         state = position()
         if reached(state, targetX, targetY) then hold.direction, hold.jump = 0, false; return end
         assert(os.clock() < deadline, "Could not reach the saved position. Check stepping platforms and door access.")
@@ -1063,14 +1073,14 @@ local function walkTo(x, y, worldName, token, onStep)
                 began, movedAt = began + waited, movedAt + waited
                 if not proceed then hold.direction, hold.jump = 0, false; return false end
                 state = position()
-                if reached(state, waypoint.x + 0.5, waypoint.y + 1) then break end
+                if not pacing and reached(state, waypoint.x + 0.5, waypoint.y + 1) then break end
                 assert(os.clock() < deadline, "Returning to the saved position timed out. Check the route.")
                 if UserInputService:GetFocusedTextBox() or pacing then
                     hold.direction, hold.jump = 0, false
                     movedAt = os.clock()
                     if pacing then
-                        -- Native planting cadence can be slower than running.
-                        -- Briefly ease movement before passing an unplanted tile.
+                        -- Keep the next planting or pickup target in reach while
+                        -- its native action is pending, without reversing a row.
                         began, deadline = began + 0.025, deadline + 0.025
                     end
                 else
@@ -1426,7 +1436,7 @@ local function takeDropBatch(anchor, targets, attempts, retryAt, eligible, token
                 assert(ok, tostring(result))
                 return result
             end)
-            table.insert(jobs, {request = request, uid = uid, id = id, want = want, deadline = deadline,
+            table.insert(jobs, {request = request, uid = uid, id = id, want = want, deadline = deadline, started = os.clock(),
                 avatarX = state.x, avatarY = state.y, dropX = drop.x, dropY = drop.y})
         end
     end
@@ -1888,6 +1898,18 @@ local function runTreeHarvest(token)
     App.harvestPhase = "Collecting blocks, seeds and gems"
 end
 
+local function harvestDropDeferred(name, drop)
+    local rotation = App.rotationState
+    local deferred = rotation and rotation.deferredHarvest and rotation.deferredHarvest[name]
+    local key = tostring(drop.uid)
+    local saved = deferred and deferred[key]
+    if not saved then return false end
+    if saved.id == drop.id and math.abs(saved.x-drop.x) < 0.1 and math.abs(saved.y-drop.y) < 0.1
+        and Workspace:GetServerTimeNow() < saved.retryAt then return true end
+    deferred[key] = nil -- Retry when the drop moves or its cooldown expires.
+    return false
+end
+
 local function runHarvest(token)
     Core.checkSetup(App.config, "harvest", runtime().items)
     local box, id = App.config.points.farmBox, App.config.blockId
@@ -1922,10 +1944,28 @@ local function runHarvest(token)
         local rangeLimited, emptySince = false, nil
         local deadline = os.clock() + App.config.options.actionTimeout
         local routeJobs, routeReserved, routeAccepted = {}, {}, 0
+        local waitingDrop, waitingAt
+        local deferredCount = 0
+        App.harvestCollectionRecovery = "No drops deferred"
+        local lastCollectionStep
         local function selected(drop)
             return type(drop) == "table" and not drop.display and (drop.id == id or drop.id == seedId or drop.id == 112)
                 and type(drop.uid) == "number" and type(drop.n) == "number" and drop.n > 0
                 and type(drop.x) == "number" and type(drop.y) == "number"
+                and not harvestDropDeferred(box.world, drop)
+        end
+        local function deferDrop(drop, message)
+            assert(rotation and App.pending == 0, message)
+            rotation.deferredHarvest = rotation.deferredHarvest or {}
+            local deferred = rotation.deferredHarvest[box.world] or {}
+            rotation.deferredHarvest[box.world] = deferred
+            deferred[tostring(drop.uid)] = {id=drop.id,x=drop.x,y=drop.y,retryAt=Workspace:GetServerTimeNow()+300}
+            deferredCount = deferredCount+1
+            deadline = os.clock()+App.config.options.actionTimeout
+            App.harvestCollectionRecovery = "Deferred uid " .. drop.uid .. " at " .. drop.x .. ", " .. drop.y
+                .. " for 5 minutes: " .. message
+            saveRotationResume(rotation)
+            setStatus(App.harvestCollectionRecovery .. " Continuing collection and Farm storage transfer.")
         end
         local function capacityBlocked()
             for _, drop in pairs(r.world.dropList()) do
@@ -1943,6 +1983,15 @@ local function runHarvest(token)
         end
         local function near(state, drop)
             return Navigation.pickupOverlap(state, drop)
+        end
+        local function pickupCooldown(drop)
+            if retryAt[drop.uid] == nil then
+                local refused = drop.refused or -math.huge
+                local blocked = App.controls and App.controls.suppressedTakes[drop.uid]
+                if blocked and blocked.grid == r.world.fg and refused >= blocked.at then refused = -math.huge end
+                retryAt[drop.uid] = refused + 1
+            end
+            return retryAt[drop.uid]
         end
         local function farmRowFor(drop)
             local closest, distance
@@ -1969,6 +2018,10 @@ local function runHarvest(token)
         end
         local function checkAttempts(drop)
             if (attempts[drop.uid] or 0) < 3 then return end
+            if rotation then
+                deferDrop(drop, "Server refused three settled pickups; " .. tostring(lastRefusal[drop.uid]))
+                return
+            end
             error("The server refused harvested drop uid " .. drop.uid .. " at " .. drop.x .. ", " .. drop.y
                 .. ". Last pickup: " .. tostring(lastRefusal[drop.uid])
                 .. ". Check pickup reach and access; copy diagnostics.")
@@ -1978,6 +2031,7 @@ local function runHarvest(token)
             for _, result in ipairs(results) do
                 if result.amount > 0 then
                     accepted, needsApproach[result.uid] = true, nil
+                    if waitingDrop == result.uid then waitingAt = os.clock() end
                 else
                     rangeLimited = true
                     local attemptState = {x = result.avatarX, y = result.avatarY}
@@ -2020,17 +2074,25 @@ local function runHarvest(token)
             end
             if #results > 0 then applyResults(results, true, true) end
             if #routeJobs == 0 and (waitAll or routeAccepted >= 8) then
-                if routeAccepted > 0 then refreshInventory(token) end
+                if routeAccepted > 0 then
+                    local hold = takeControls()
+                    local direction, jumping = hold.direction, hold.jump
+                    hold.direction, hold.jump = 0, false
+                    refreshInventory(token)
+                    hold.direction, hold.jump = direction, jumping
+                end
                 routeReserved, routeAccepted = {}, 0
             end
         end
         local function collectOnRoute(state)
+            local now = os.clock()
+            local stepDuration = math.min(0.2,math.max(0.025,now-(lastCollectionStep or now)))
+            lastCollectionStep = now
             settleRoute(false)
             if restrictRoute and not rowHasDrops(activeFarmRow) then return false end
             if not state.grounded then return end
             sweepRow, sweepX = math.floor(state.y - 0.01), state.x
             if capacityBlocked() then return false end
-            if #routeJobs >= 8 then return end
             local function eligible(drop)
                 return selected(drop) and onActiveRow(drop) and near(position(), drop)
                     and not needsApproach[drop.uid] and not drop.pending and not drop.taking
@@ -2039,8 +2101,10 @@ local function runHarvest(token)
             local targets = {}
             for _, drop in pairs(r.world.dropList()) do
                 if selected(drop) and near(state, drop) and onActiveRow(drop) then
-                    retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
-                    checkAttempts(drop)
+                    pickupCooldown(drop)
+                    if restrictRoute and needsApproach[drop.uid] and math.abs(drop.x-state.x) < 0.2
+                        and math.abs(state.vx or 0) < 0.8 then needsApproach[drop.uid] = nil end
+                    if (attempts[drop.uid] or 0) >= 3 then settleRoute(true); checkAttempts(drop) end
                     if eligible(drop) then table.insert(targets, drop) end
                 end
             end
@@ -2053,6 +2117,35 @@ local function runHarvest(token)
                 if job.id ~= 112 then routeReserved[job.id] = (routeReserved[job.id] or 0) + job.want end
             end
             settleRoute(false)
+            if restrictRoute then
+                local current, row = position(), farmRows[activeFarmRow]
+                if current.grounded and math.abs(current.y-(row.y+1)) < 0.22 then
+                    local velocity = math.max(0,(current.vx or 0)*sweepDirection)
+                    local braking = velocity*velocity/96 + velocity*stepDuration + 0.04
+                    local blocker, offset
+                    for _, drop in pairs(r.world.dropList()) do
+                        if selected(drop) and onActiveRow(drop) then
+                            local forward = (drop.x-current.x)*sweepDirection
+                            local fresh = false
+                            if drop.taking and stepDuration <= 0.04 and braking-forward < 0.55 then
+                                for _, job in ipairs(routeJobs) do
+                                    if job.uid == drop.uid and not job.request.done and os.clock()-job.started < 0.04 then fresh=true; break end
+                                end
+                            end
+                            if not fresh and forward >= -0.6 and forward <= braking and (not offset or forward < offset) then
+                                blocker,offset = drop,forward
+                            end
+                        end
+                    end
+                    if blocker then
+                        if waitingDrop ~= blocker.uid then waitingDrop,waitingAt = blocker.uid,os.clock() end
+                        assert(os.clock()-waitingAt < App.config.options.actionTimeout,
+                            "Harvested drop uid " .. blocker.uid .. " did not settle during the forward row pass. Check pickup readiness and access.")
+                        return "hold"
+                    end
+                end
+            end
+            waitingDrop,waitingAt = nil,nil
         end
         local function returnToStorage()
             local state, point = position(), box
@@ -2105,6 +2198,7 @@ local function runHarvest(token)
         end
         local function stash()
             settleRoute(true)
+            waitingDrop,waitingAt = nil,nil
             if count(id) == 0 and count(seedId) == 0 then return end
             returnToStorage()
             setStatus("Storing harvested " .. r.items[id].name .. " in Farm storage...")
@@ -2137,72 +2231,45 @@ local function runHarvest(token)
             end
         end
         if #farmRows >= 1 then
+            local collectionDirection = 1
             for index = 1, #farmRows do
-                -- Keep the physical row index for direction, but visit only live harvest work.
+                -- Empty rows do not change the side where the previous pass ended.
                 if rowHasDrops(index) then
                     activeFarmRow = index
                     restrictRoute, rangeLimited = true, true
-                    local row, direction = farmRows[index], index % 2 == 1 and 1 or -1
+                    local row, direction = farmRows[index], collectionDirection
+                    sweepDirection = direction
                     local entry, exit = direction == 1 and row.left or row.right, direction == 1 and row.right or row.left
                     if capacityBlocked() then
                         stash()
                     end
                     setStatus("Collecting farm row " .. index .. "/" .. #farmRows .. " at " .. row.y .. "...")
                     moveTo(entry, row.y, box.world, token, function() return rowHasDrops(index) end)
-                    local swept = false
                     while true do
                         worldCheck(box.world, token)
                         if not rowHasDrops(index) then break end
                         if capacityBlocked() then
-                            local saved = position()
                             stash()
-                            moveTo(math.floor(saved.x), math.floor(saved.y - 0.01), box.world, token,
-                                function() return rowHasDrops(index) end)
-                        end
-                        if not swept then
-                            swept = moveTo(exit, row.y, box.world, token, collectOnRoute) ~= false
-                            settleRoute(true)
-                            deadline = os.clock() + App.config.options.actionTimeout
-                        end
-                        if swept then
-                            local remaining = {}
+                            local nextDrop
                             for _, drop in pairs(r.world.dropList()) do
-                                if selected(drop) and onActiveRow(drop) then
-                                    retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
-                                    table.insert(remaining, drop)
+                                if selected(drop) and onActiveRow(drop) and (not nextDrop or drop.x*direction < nextDrop.x*direction) then
+                                    nextDrop = drop
                                 end
                             end
-                            if #remaining == 0 then break end
-                            table.sort(remaining, function(a, b)
-                                return a.x == b.x and a.uid < b.uid or a.x * direction < b.x * direction
-                            end)
-                            local drop, state = remaining[1], position()
-                            checkAttempts(drop)
-                            if not near(state, drop) or needsApproach[drop.uid] then
-                                local goal, message = Navigation.pickupGoal(navigationMap(r), state, drop, {
-                                    nativeOnly = true, step = function() pause(0, token); worldCheck(box.world, token) end,
-                                })
-                                assert(goal, tostring(message) .. " Drop uid " .. drop.uid .. " at " .. drop.x .. ", " .. drop.y)
-                                local finished = moveTo(goal.x, goal.y, box.world, token, collectOnRoute)
-                                settleRoute(true)
-                                if finished ~= false and near(position(), drop) then
-                                    needsApproach[drop.uid], approached[drop.uid] = nil, true
-                                end
-                                deadline = os.clock() + App.config.options.actionTimeout
-                            elseif not drop.pending and not drop.taking and os.clock() >= math.max(drop.readyAt or 0, retryAt[drop.uid]) then
-                                local results = takeDropBatch(box, remaining, attempts, retryAt, function(candidate)
-                                    return selected(candidate) and onActiveRow(candidate) and not needsApproach[candidate.uid]
-                                        and not candidate.pending and not candidate.taking and near(position(), candidate)
-                                        and os.clock() >= math.max(candidate.readyAt or 0, retryAt[candidate.uid] or 0)
-                                end, token, onTaken)
-                                applyResults(results, true)
-                                pause(0.03, token)
-                            else
-                                assert(os.clock() < deadline, "Harvested drops did not become ready. Check pending pickups and copy diagnostics.")
-                                pause(0.05, token)
+                            if nextDrop then
+                                local resumeX = math.max(row.left,math.min(row.right,math.floor(nextDrop.x)))
+                                moveTo(resumeX,row.y,box.world,token,function() return rowHasDrops(index) end)
                             end
+                            setStatus("Collecting farm row " .. index .. "/" .. #farmRows .. " at " .. row.y .. "...")
                         end
+                        -- Resolve each stack before running beyond its pickup
+                        -- overlap. Never schedule a return sweep along this row.
+                        local finished = moveTo(exit,row.y,box.world,token,collectOnRoute)
+                        settleRoute(true)
+                        deadline = os.clock()+App.config.options.actionTimeout
+                        if finished ~= false then break end
                     end
+                    collectionDirection = -collectionDirection
                 end
             end
             activeFarmRow, restrictRoute = nil, false
@@ -2216,7 +2283,7 @@ local function runHarvest(token)
                 if selected(drop) then
                     -- Suppressed native pickup attempts can keep updating refused.
                     -- Freeze its initial cooldown; our own refusals update retryAt.
-                    retryAt[drop.uid] = retryAt[drop.uid] or ((drop.refused or -math.huge) + 1)
+                    pickupCooldown(drop)
                     table.insert(remaining, drop)
                 end
             end
@@ -2231,7 +2298,8 @@ local function runHarvest(token)
                     end
                     setStatus("Finished collecting harvest: " .. (App.stats.stashed - storedBefore)
                         .. " blocks and " .. (App.stats.stashedSeeds - seedsBefore) .. " seeds stored in the farm Display Box; "
-                        .. (App.stats.gems - gemsBefore) .. " gems collected.")
+                        .. (App.stats.gems - gemsBefore) .. " gems collected."
+                        .. (deferredCount > 0 and " " .. deferredCount .. " inaccessible drops deferred; continuing with stored harvest." or ""))
                     return
                 end
                 pause(0.05, token)
@@ -2265,7 +2333,7 @@ local function runHarvest(token)
                 local targets, nextDrop = {}, nil
                 for _, drop in ipairs(remaining) do
                     checkAttempts(drop)
-                    if ready(drop) then
+                    if selected(drop) and ready(drop) then
                         nextDrop = nextDrop or drop
                         if eligible(drop) then table.insert(targets, drop) end
                     end
@@ -2281,28 +2349,46 @@ local function runHarvest(token)
                         nativeOnly = true,
                         step = function() pause(0, token); worldCheck(box.world, token) end,
                     })
-                    assert(goal, tostring(message) .. " Drop uid " .. nextDrop.uid .. " at " .. nextDrop.x .. ", " .. nextDrop.y)
-                    if sweepRow ~= goal.y then
-                        sweepRow, sweepX = goal.y, goal.x + 0.5
-                        sweepDirection = nextDrop.x >= state.x and 1 or -1
-                    elseif (nextDrop.x - sweepX) * sweepDirection < -0.2 then
-                        sweepDirection = -sweepDirection
-                    end
-                    if not needsApproach[nextDrop.uid] then
-                        local edge = Navigation.rowEnd(navigationMap(r), goal, sweepDirection)
-                        for _, drop in ipairs(remaining) do
-                            local tileX = math.floor(drop.x)
-                            if math.floor(drop.y) == goal.y and (tileX - goal.x) * sweepDirection > 0
-                                and (edge - tileX) * sweepDirection >= 0 then goal.x = tileX end
-                        end
-                    end
-                    local finished = moveTo(goal.x, goal.y, box.world, token, collectOnRoute)
-                    settleRoute(true)
-                    if finished ~= false and near(position(), nextDrop) then
+                    local here = position()
+                    if not goal and here.grounded and near(here, nextDrop) then
+                        -- A fractional position at a floor edge can overlap the
+                        -- drop even when no supported tile center does. Let the
+                        -- server decide before giving up or requesting a route.
+                        local hold = takeControls()
+                        hold.direction, hold.jump = 0, false
                         needsApproach[nextDrop.uid], approached[nextDrop.uid] = nil, true
+                        App.harvestCollectionRecovery = "Retrying nearby uid " .. nextDrop.uid .. " from the current supported position"
+                        setStatus(App.harvestCollectionRecovery)
+                        deadline = os.clock()+App.config.options.actionTimeout
+                        pause(0.03, token)
+                    elseif not goal and rotation then
+                        settleRoute(true)
+                        deferDrop(nextDrop, tostring(message))
+                        deadline = os.clock()+App.config.options.actionTimeout
+                    else
+                        assert(goal, tostring(message) .. " Drop uid " .. nextDrop.uid .. " at " .. nextDrop.x .. ", " .. nextDrop.y)
+                        if sweepRow ~= goal.y then
+                            sweepRow, sweepX = goal.y, goal.x + 0.5
+                            sweepDirection = nextDrop.x >= state.x and 1 or -1
+                        elseif (nextDrop.x - sweepX) * sweepDirection < -0.2 then
+                            sweepDirection = -sweepDirection
+                        end
+                        if not needsApproach[nextDrop.uid] then
+                            local edge = Navigation.rowEnd(navigationMap(r), goal, sweepDirection)
+                            for _, drop in ipairs(remaining) do
+                                local tileX = math.floor(drop.x)
+                                if selected(drop) and math.floor(drop.y) == goal.y and (tileX - goal.x) * sweepDirection > 0
+                                    and (edge - tileX) * sweepDirection >= 0 then goal.x = tileX end
+                            end
+                        end
+                        local finished = moveTo(goal.x, goal.y, box.world, token, collectOnRoute)
+                        settleRoute(true)
+                        if finished ~= false and near(position(), nextDrop) then
+                            needsApproach[nextDrop.uid], approached[nextDrop.uid] = nil, true
+                        end
+                        deadline = os.clock() + App.config.options.actionTimeout
+                        pause(0.03, token)
                     end
-                    deadline = os.clock() + App.config.options.actionTimeout
-                    pause(0.03, token)
                 else
                     assert(os.clock() < deadline, "Harvested drops did not become ready. Check pending pickups and copy diagnostics.")
                     pause(0.05, token)
@@ -3052,7 +3138,8 @@ local function rotationFarmStatus(r, box, id, seedId, token)
     App.harvestMaturity = box.world .. ": " .. ripeCount .. " ripe; " .. growing .. " growing"
     local stock = storageCount(box, id, seedId) > 0 or storageCount(box, seedId, id) > 0
     for _, drop in pairs(r.world.dropList()) do
-        if not drop.display and (drop.id == id or drop.id == seedId or drop.id == 112) and (drop.n or 0) > 0 then stock = true end
+        if not drop.display and (drop.id == id or drop.id == seedId or drop.id == 112) and (drop.n or 0) > 0
+            and not harvestDropDeferred(box.world, drop) then stock = true end
     end
     -- Existing harvest can supply PNB without breaking any of the growing trees.
     return growing, growing == 0 and (ripeCount > 0 or stock), remaining, stock
@@ -3251,6 +3338,21 @@ local function readRotationResume()
     end
     if state.seedWait ~= nil then assert(type(state.seedWait) == "boolean", "Invalid saved rotation seed wait.") end
     if state.pnbEmpty ~= nil then assert(type(state.pnbEmpty) == "boolean", "Invalid saved PNB supply state.") end
+    if state.deferredHarvest ~= nil then
+        assert(type(state.deferredHarvest) == "table", "Invalid saved deferred harvest drops.")
+        for name, drops in pairs(state.deferredHarvest) do
+            assert(record.config.rotation.farms[name] and type(drops) == "table", "Invalid saved deferred harvest farm.")
+            for uid, drop in pairs(drops) do
+                assert(type(uid) == "string" and uid:match("^%d+$") and type(drop) == "table"
+                    and type(drop.id) == "number" and drop.id > 0 and drop.id == math.floor(drop.id), "Invalid saved deferred harvest drop.")
+                for _, key in ipairs({"x", "y", "retryAt"}) do
+                    local value = drop[key]
+                    assert(type(value) == "number" and value == value and value >= 0 and value < math.huge,
+                        "Invalid saved deferred harvest location or time.")
+                end
+            end
+        end
+    end
     if state.collectOnly ~= nil then
         assert(type(state.collectOnly) == "boolean", "Invalid saved stock collection state.")
         if state.collectOnly then
@@ -4345,7 +4447,7 @@ App.runToggles.transfer = transferTab:Toggle({ Title = "Moving Drops", Value = f
 local selectedProfile, profileNameInput, profileDropdown = nil, nil, nil
 local settingsControls = {}
 ui.harvestStatus = harvestTab:Paragraph({ Title = "Status", Desc = App.status })
-harvestTab:Paragraph({ Title = "Harvest trees and collect drops", Desc = "Start only when every tree of the selected crop in this world is fully grown. Then break trees and collect matching blocks, seeds and gems in top-down zigzag rows. Blocks and seeds share the Farm Display Box; gems update your balance. Rotation runs PNB while growing farms wait." })
+harvestTab:Paragraph({ Title = "Harvest trees and collect drops", Desc = "Start only when every tree of the selected crop in this world is fully grown. Then break trees and collect matching blocks, seeds and gems: left to right, down to the next occupied row, then right to left. Slow pickups settle before leaving reach. Blocks and seeds share the Farm Display Box; gems update your balance. Rotation defers inaccessible drops and transfers stored harvest while growing farms wait." })
 settingsControls.harvestMethod = harvestTab:Dropdown({ Title = "Harvest method", Values = {"Fist", "Dear John Tractor"},
     Value = App.config.harvesting.method == "tractor" and "Dear John Tractor" or "Fist",
     Callback = function(value)
@@ -4806,6 +4908,7 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nFPS setting save: " .. (App.fpsSaveError or "ready")
         .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
         .. "\nLast refused harvest pickup: " .. (App.lastHarvestRefusal or "none")
+        .. "\nHarvest collection recovery: " .. (App.harvestCollectionRecovery or "not requested")
         .. "\nHarvest storage return: " .. (App.harvestReturnDebug or "not requested")
         .. "\nRotation phase: " .. (App.rotationState and (App.rotationState.phase .. "; cycle " .. App.rotationState.cycle
             .. "; farm " .. App.rotationState.worldIndex .. "/" .. #App.config.planting.worlds) or "idle")
