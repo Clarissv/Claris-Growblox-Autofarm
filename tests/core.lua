@@ -368,6 +368,25 @@ test("Ripe trees follow physical row direction while growing trees and other cro
     assert(Core.hasTrees(world, 955) and not Core.hasTrees(world, 123))
 end)
 
+test("Whole-world growth counts every selected tree and waits for the latest maturity", function()
+    local world={w=3,h=4,fg={[0]={[0]=955},[2]={[1]=955,[2]=627},[3]={[2]=955}}}
+    local growing,ripe,left=Core.treeGrowth(world,955,function(x,y) return y==0 end,
+        function(x,y) return y==2 and 20 or 45 end)
+    assert(growing==2 and ripe==1 and left==45)
+    world.fg[3][2]=0
+    growing,ripe,left=Core.treeGrowth(world,955,function(x,y) return y==0 end)
+    assert(growing==1 and ripe==1 and left==30)
+    assert(Core.treeGrowth({w=1,h=1,fg={}},955)==0)
+end)
+
+test("Whole-world growth rejects missing metadata and yields during long scans", function()
+    local world={w=1,h=33,fg={[0]={[0]=955}}}
+    rejects(function() Core.treeGrowth(world,955,function() return nil end) end,"growth data is not ready")
+    local steps=0
+    Core.treeGrowth(world,955,function() return true end,nil,function() steps=steps+1 end)
+    assert(steps==2)
+end)
+
 test("Harvest replanting defaults Off and survives profile export/import", function()
     local config = setup()
     config.options.harvestPlanting = nil

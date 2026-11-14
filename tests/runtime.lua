@@ -2817,14 +2817,13 @@ end)
 test("Fist harvests ripe trees in zigzag order before collecting their drops", function()
     local f = treeHarvestFixture("fist")
     for _, y in ipairs({2, 4, 6}) do for _, x in ipairs({2, 7, 13}) do f.addTree(x, y) end end
-    f.addTree(4, 4, false)
     f.expectedTrees = 9
     f.harvest()
     assert(f.hits == 9 and f.app.stats.trees == 9 and f.app.stats.stashed == 90)
     local order = {}
     for _, point in ipairs(f.treeActions) do order[#order + 1] = point.x .. ":" .. point.y end
     assert(table.concat(order, ",") == "2:2,7:2,13:2,13:4,7:4,2:4,2:6,7:6,13:6", table.concat(order, ","))
-    assert(f.world.fg[4][4] == 955 and f.worn == 777)
+    assert(f.world.fg[4][4] == 0 and f.worn == 777)
 end)
 
 test("Tractor harvests by native walking, removes it between rows, and restores the previous footwear", function()
@@ -3112,15 +3111,62 @@ test("Changed missed trees are never punched as another crop during Tractor clea
     assert(not f.hits and f.world.fg[2][7]==627 and #f.requests==0 and f.worn==777)
 end)
 
-test("Growing trees remain planted while nearby Tractor misses are cleared from below", function()
+test("A growing tree prevents the Tractor from starting a partially ripe farm", function()
     local f=treeHarvestFixture("tractor")
     for _,x in ipairs({2,7,13}) do f.addTree(x,2) end
     f.addTree(5,2,false)
     f.tractorMissed,f.expectedTrees={[2*f.world.w+7]=true},3
     requireForwardTractorPass(f)
-    f.harvest()
-    assert(f.hits==1 and f.world.fg[2][5]==955 and f.app.stats.trees==3 and f.app.stats.stashed==30)
+    assert(f.harvest()==false)
+    assert(not f.hits and f.world.fg[2][5]==955 and f.app.stats.trees==0 and f.app.stats.stashed==0)
+    assert(#f.treeActions==0 and #f.wearActions==0 and #f.requests==0)
     assert(f.worn==777)
+end)
+
+test("Both harvest methods wait for growing selected trees outside the detected farm rows", function()
+    for _,method in ipairs({"fist","tractor"}) do
+        local f=treeHarvestFixture(method)
+        f.addTree(2,2)
+        f.addTree(8,0,false)
+        assert(f.harvest()==false)
+        assert(#f.treeActions==0 and #f.requests==0 and #f.wearActions==0 and f.app.stats.trees==0)
+        assert(f.app.status:find("Waiting for all trees",1,true) and f.app.harvestMaturity:find("1 growing",1,true))
+    end
+end)
+
+test("A partially ripe farm starts harvesting only after its final tree matures", function()
+    local f=treeHarvestFixture("fist")
+    f.addTree(2,2)
+    f.addTree(7,4,false)
+    assert(f.harvest()==false and #f.treeActions==0)
+    f.trees[4*f.world.w+7].p=0
+    f.expectedTrees=2
+    f.harvest()
+    assert(f.hits==2 and f.app.stats.trees==2 and f.app.stats.stashed==20)
+    assert(f.app.harvestMaturity:find("0 growing",1,true))
+end)
+
+test("An immature standalone farm neither collects old drops nor starts automatic Moving Drops", function()
+    local f=treeHarvestFixture("fist")
+    f.addTree(2,2)
+    f.addTree(7,4,false)
+    f.addDrop(1000,954,1,2.5,2.5)
+    f.app.job=nil
+    f.app.config.options.moveAfterHarvest=true
+    installToggles(f)
+    f.hooks.start("harvest")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(f.app.job==nil and #f.treeActions==0 and #f.requests==0 and #f.deposits==0)
+    assert(f.app.status:find("Waiting for all trees",1,true) and not f.app.runToggles.transfer.Value)
+end)
+
+test("Stop cancels the whole-world maturity scan before movement or harvesting", function()
+    local f=treeHarvestFixture("fist")
+    f.world.h=33
+    f.addTree(2,2)
+    f.onWait=function() f.app:stop() end
+    rejects(f.harvest,"Stopped")
+    assert(#f.treeActions==0 and #f.requests==0 and f.app.stats.trees==0)
 end)
 
 test("Growing trees alone do not cause harvest movement or punches", function()
@@ -4936,6 +4982,32 @@ local function fillGrowingFarms(f, readyIn)
         end
     end
 end
+
+test("Old farm drops and stored crop never override a growing tree's rotation deadline", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=200,FARM2=0})
+    f.treeTimes.FARM[8*f.world.w+1]=0-f.app.runtime.items[955].grow
+    f.worldBoxes.FARM[0]={{954,1},{955,1}}
+    f.addDrop(10000,954,1,2.5,8.5)
+    f.afterWait=function() if #f.harvests==5 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(#f.harvests==5 and f.harvests[1].world=="FARM2" and #f.worldDrops.FARM==1)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.FARM[0],954,955)==1)
+end)
+
+test("Resuming an immature harvest returns to PNB instead of harvesting or transferring stored crop", function()
+    local f=rotationFixture()
+    fillGrowingFarms(f,{FARM=200,FARM2=200})
+    f.worldBoxes.FARM[0]={{954,1}}
+    f.app.config.options.harvestPlanting=true
+    f.hooks.saveRotationResume({phase="harvest",worldIndex=1,cycle=1,work=0,seedCargo=0,completed={},readyAt={}})
+    f.afterWait=function() if f.pnbBlocks==2 then f.app:stop() end end
+    f.hooks.start("rotation",f.hooks.readRotationResume())
+    assert(not f.app.lastError,f.app.lastError)
+    assert(#f.harvests==0 and #f.plants==0 and f.pnbBlocks==2)
+    assert(f.hooks.Core.storageCount(f.worldBoxes.FARM[0],954,955)==1)
+end)
 
 test("Combined rotation loads PNB seeds and replants both ripe farms during harvest before breaking", function()
     local f=rotationFixture()

@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.31"
+local VERSION = "0.1.32"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -1548,13 +1548,27 @@ local function runTreeHarvest(token)
     local r = worldCheck(name, token)
     local seedId = Core.seedId(r.items, id)
     local planter = App.rotationState and App.config.options.harvestPlanting and makeHarvestPlanter(token) or nil
-    if not Core.hasTrees(r.world, seedId) then suspendHarvestVehicle(token); return end
+    if not Core.hasTrees(r.world, seedId) then
+        App.harvestMaturity = name .. ": no selected trees"
+        suspendHarvestVehicle(token)
+        return
+    end
     if r.farmingDeferred then
         setStatus("Connecting tree harvesting hooks...")
         r = connectGame()
         worldCheck(name, token)
     end
     assert(type(r.treeRipe) == "function", "Tree growth hooks are unavailable. Reconnect and copy diagnostics.")
+    local growing, ripeCount, remaining = Core.treeGrowth(r.world, seedId, r.treeRipe, r.treeRemaining,
+        function() pause(0, token); worldCheck(name, token) end)
+    App.harvestMaturity = name .. ": " .. ripeCount .. " ripe; " .. growing .. " growing"
+    if growing > 0 then
+        suspendHarvestVehicle(token)
+        App.harvestPhase = "Waiting for all farm trees to grow"
+        setStatus("Waiting for all trees in " .. name .. " to grow: " .. growing .. " still growing; check again in "
+            .. math.ceil(remaining) .. "s.")
+        return false
+    end
     local rows, method = Core.farmRows(r.world, r.items), App.config.harvesting.method
     local work = {}
     for _, row in ipairs(rows) do
@@ -1787,7 +1801,7 @@ local function runHarvest(token)
     storageCount(box, id, seedId) -- Reject unsuitable storage before claiming anything.
     return harvestEquipmentScope(function() return withoutPickups(function()
         refreshInventory(token)
-        runTreeHarvest(token)
+        if runTreeHarvest(token) == false then return false end
         r = worldCheck(box.world, token)
         App.harvestPhase = "Collecting blocks, seeds and gems"
         local storedBefore, seedsBefore, gemsBefore = App.stats.stashed, App.stats.stashedSeeds, App.stats.gems
@@ -2878,31 +2892,17 @@ makeHarvestPlanter = function(token)
         end
     end}
 end
-local function rotationFarmStatus(r, box, id, seedId)
-    local growing, ripeCount, remaining, unknownTimer = 0, 0, nil, false
-    for _, row in ipairs(Core.farmRows(r.world, r.items)) do
-        for x = row.left, row.right do
-            if tileAt(x, row.y) == seedId then
-                assert(type(r.treeRipe) == "function", "Tree growth hooks are unavailable for rotation.")
-                local ripe = r.treeRipe(x, row.y, seedId)
-                assert(ripe ~= nil, "Tree growth data is not ready. Reconnect and copy diagnostics.")
-                if ripe then ripeCount = ripeCount + 1
-                else
-                    growing = growing + 1
-                    local left = type(r.treeRemaining) == "function" and r.treeRemaining(x, row.y, seedId) or nil
-                    if type(left) == "number" and left == left and left > 0 and left < math.huge then
-                        remaining = math.max(remaining or left, left)
-                    else unknownTimer = true end
-                end
-            end
-        end
-    end
-    local crop = growing == 0 and ripeCount > 0 or storageCount(box, id, seedId) > 0
+local function rotationFarmStatus(r, box, id, seedId, token)
+    local growing, ripeCount, remaining = Core.treeGrowth(r.world, seedId, r.treeRipe, r.treeRemaining,
+        function() pause(0, token); worldCheck(box.world, token) end)
+    App.harvestMaturity = box.world .. ": " .. ripeCount .. " ripe; " .. growing .. " growing"
+    local crop = ripeCount > 0 or storageCount(box, id, seedId) > 0
         or storageCount(box, seedId, id) > 0
     for _, drop in pairs(r.world.dropList()) do
         if not drop.display and (drop.id == id or drop.id == seedId) and (drop.n or 0) > 0 then crop = true end
     end
-    return growing, crop, unknownTimer and math.min(remaining or 30, 30) or remaining or 30
+    -- Loose drops and staged storage never override a growing tree in this world.
+    return growing, growing == 0 and crop, remaining
 end
 local function runPlant(token, saved, lastWorldIndex)
     return harvestEquipmentScope(function()
@@ -2993,7 +2993,7 @@ local function runPlant(token, saved, lastWorldIndex)
                 for _ in pairs(state.skipped) do skipped = skipped + 1 end
                 if App.rotationState then
                     local rotation = App.rotationState
-                    local growing, crop, left = rotationFarmStatus(r, App.config.rotation.farms[name], App.config.blockId, id)
+                    local growing, crop, left = rotationFarmStatus(r, App.config.rotation.farms[name], App.config.blockId, id, token)
                     rotation.readyAt[name] = growing > 0 and not crop and Workspace:GetServerTimeNow() + left or 0
                 end
                 setStatus("Processed " .. name .. ": " .. skipped .. " tiles skipped due to access or route. Moving to the next farm.")
@@ -3172,7 +3172,7 @@ local function runRotation(token, saved)
                 elseif state.phase == "wait" then
                     travel(name)
                     local r = worldCheck(name, token)
-                    local growing, crop, remaining = rotationFarmStatus(r, p.farmBox, id, seedId)
+                    local growing, crop, remaining = rotationFarmStatus(r, p.farmBox, id, seedId, token)
                     if crop then
                         state.readyAt[name] = nil
                         transition(App.config.options.harvestPlanting and "harvestStock" or "harvest")
@@ -3236,10 +3236,17 @@ local function runRotation(token, saved)
                 elseif state.phase == "harvest" then
                     travel(name)
                     takeControls()
-                    runHarvest(token)
+                    local harvested = runHarvest(token)
                     state.harvestPlant = nil
-                    state.work = state.work + storageCount(p.farmBox, id, seedId) + storageCount(p.farmBox, seedId, id)
-                    transition("transfer")
+                    if harvested == false then
+                        -- Recheck after reload/refill as well as scheduled entry.
+                        -- New growing trees defer this farm to the normal PNB wait.
+                        state.readyAt[name] = nil
+                        transition("wait")
+                    else
+                        state.work = state.work + storageCount(p.farmBox, id, seedId) + storageCount(p.farmBox, seedId, id)
+                        transition("transfer")
+                    end
                 elseif state.phase == "transfer" then
                     local t = state.transfer
                     travel(t and t.phase == "deliver" and p.blockBox.world or name)
@@ -3421,8 +3428,8 @@ local function start(mode, saved)
                     else error(problem, 0) end
                 end
             elseif mode == "harvest" then
-                runHarvest(token)
-                if App.config.options.moveAfterHarvest then
+                local harvested = runHarvest(token)
+                if harvested ~= false and App.config.options.moveAfterHarvest then
                     checkpoint(token)
                     App.job = "transfer"
                     transferRan = true
@@ -4079,7 +4086,7 @@ App.runToggles.transfer = transferTab:Toggle({ Title = "Moving Drops", Value = f
 local selectedProfile, profileNameInput, profileDropdown = nil, nil, nil
 local settingsControls = {}
 ui.harvestStatus = harvestTab:Paragraph({ Title = "Status", Desc = App.status })
-harvestTab:Paragraph({ Title = "Harvest trees and collect drops", Desc = "Break ripe trees of the selected block, then collect matching blocks, seeds and gems while walking top-down zigzag rows. Blocks and seeds share the Farm Display Box; gems update your balance. Skip empty rows and leave growing trees planted." })
+harvestTab:Paragraph({ Title = "Harvest trees and collect drops", Desc = "Start only when every tree of the selected crop in this world is fully grown. Then break trees and collect matching blocks, seeds and gems in top-down zigzag rows. Blocks and seeds share the Farm Display Box; gems update your balance. Rotation runs PNB while growing farms wait." })
 settingsControls.harvestMethod = harvestTab:Dropdown({ Title = "Harvest method", Values = {"Fist", "Dear John Tractor"},
     Value = App.config.harvesting.method == "tractor" and "Dear John Tractor" or "Fist",
     Callback = function(value)
@@ -4127,7 +4134,7 @@ settingsControls.harvestRespawn = harvestTab:Toggle({ Title = "Respawn to Farm s
         App.config.options.harvestRespawn = value
     end })
 App.runToggles.harvest = harvestTab:Toggle({ Title = "Collect harvest", Value = false,
-    Desc = "On harvests ripe trees, then collects and stores blocks. Off stops. Turns Off when finished or on a problem.",
+    Desc = "Requires every selected tree in the world to be fully grown. An immature farm stops with a waiting status; start again when ready, or use Full Rotation to wait automatically. Off stops.",
     Callback = function(enabled) setRunningEnabled("harvest", enabled) end })
 local plantControls, seedLabels = {}, {}
 local seedSearch, seedSearchGeneration = "", 0
@@ -4545,6 +4552,7 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
             .. "; farm " .. App.rotationState.worldIndex .. "/" .. #App.config.planting.worlds) or "idle")
         .. "\nHarvest method: " .. App.config.harvesting.method .. "; phase: " .. (App.harvestPhase or "not started")
         .. "\nTrees harvested: " .. App.stats.trees .. "; equipment restore: " .. (App.harvestGearError or "ready")
+        .. "\nFarm maturity check: " .. (App.harvestMaturity or "not requested")
         .. "\nRecovery save: " .. (App.recoverySaveError or "ready")
         .. "\nSession save: " .. (App.sessionSaveError or "ready")
         .. "\nSession restore: " .. (App.sessionRestoreError or "ready")

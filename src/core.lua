@@ -308,6 +308,31 @@ function Core.hasTrees(world, seedId)
     return false
 end
 
+-- Check the whole world, including trees outside the detected walking rows.
+-- Unknown growth data must never be interpreted as a mature tree.
+function Core.treeGrowth(world, seedId, isRipe, timeRemaining, step)
+    local growing, ripeCount, remaining, unknownTimer = 0, 0, nil, false
+    for y = 0, world.h - 1 do
+        for x = 0, world.w - 1 do
+            if world.fg[y] and world.fg[y][x] == seedId then
+                assert(type(isRipe) == "function", "Tree growth hooks are unavailable.")
+                local ripe = isRipe(x, y, seedId)
+                assert(type(ripe) == "boolean", "Tree growth data is not ready. Reconnect and copy diagnostics.")
+                if ripe then ripeCount = ripeCount + 1
+                else
+                    growing = growing + 1
+                    local left = type(timeRemaining) == "function" and timeRemaining(x, y, seedId) or nil
+                    if type(left) == "number" and left == left and left > 0 and left < math.huge then
+                        remaining = math.max(remaining or left, left)
+                    else unknownTimer = true end
+                end
+            end
+        end
+        if step and y % 16 == 15 then step() end
+    end
+    return growing, ripeCount, unknownTimer and math.min(remaining or 30, 30) or remaining or 30
+end
+
 function Core.ripeTrees(world, seedId, row, ripe)
     local result = {}
     local direction = row.direction or 1

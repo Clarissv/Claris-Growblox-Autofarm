@@ -1,6 +1,6 @@
 # Full Rotation guide
 
-For **Claris Growblox 0.1.31**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
+For **Claris Growblox 0.1.32**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
 
 The usual flow is **fill planting space → PNB while trees grow → harvest a ready farm → transfer its blocks and seeds → replant that farm → repeat**. Planting and ready harvests normally take priority over breaking. When the planting seed supply is exhausted, rotation finishes the full PNB block stock first. A full farm skips planting even when seed storage contains thousands of seeds.
 
@@ -91,6 +91,10 @@ The existing **Save Farm storage** controls also remember the box for that world
 
 Choose the harvesting method on **Harvest Drops** before starting rotation.
 
+From v0.1.32, a harvest pass starts only when **every tree of the selected crop in that farm world is fully grown**. This automatic check applies to Fist and Tractor and includes trees outside the detected walking rows. One growing matching tree makes rotation wait for that world's latest maturity deadline, process other ready farms, and continue PNB while it waits. Existing loose drops or blocks/seeds in the farm box do not override the check. Missing tree growth data pauses with diagnostics instead of assuming maturity.
+
+Rotation checks again before starting a saved harvest after a reload, world change or seed refill. Combined planting begins only after the farm passes this check; newly planted trees during that active harvest pass do not stop its remaining harvesting and cleanup. Standalone **Collect harvest** stops with a waiting status and leaves the trees and drops untouched if the world is immature; start it again when ready, or use Full Rotation for automatic waiting. **Copy diagnostics → Farm maturity check** shows the last checked world's ripe/growing counts. No new toggle or configuration is required.
+
 | Method | Behavior | Requirements |
 | --- | --- | --- |
 | **Fist** | Walks supported rows and hits ripe selected trees before collecting their drops. | Tile access and a reachable route. |
@@ -143,7 +147,8 @@ A fresh run begins with a planting pass over the full list. It fills empty suppo
 | Condition | Rotation behavior |
 | --- | --- |
 | Full farms with growing trees and seeds still in storage | Skips planting and runs PNB while the trees grow. |
-| Full farms with ripe trees and planting seeds available | Skips occupied tiles and processes ready harvests before breaking existing PNB stock. |
+| Full farms where every selected tree is ripe, with planting seeds available | Skips occupied tiles and processes ready harvests before breaking existing PNB stock. |
+| A farm has both ripe and growing selected trees | Waits for every selected tree in that world to mature; processes other ready farms or PNB while waiting. Old drops and staged farm storage do not trigger early harvest. |
 | Empty supported planting spaces with seeds available | Fills them during the initial planting pass, before the harvest/wait flow. |
 | A farm becomes ready during normal PNB | Finishes the current block and pickups, stores unused inventory, then leaves for harvest. |
 | A farm has been harvested | Transfers its blocks/seeds and replants remaining empty spaces before more PNB. With Replant during harvest On, some or all tiles were already replanted during the harvest pass. |
