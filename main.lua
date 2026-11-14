@@ -500,7 +500,19 @@ function Navigation.plan(map, start, goal, options)
             end
             if onLaunchFloor then -- Walk off the current ledge before simulating its fall.
             elseif fits(x, nextFeet) then feet = nextFeet
-            elseif vy < 0 then vy = 0
+            elseif vy < 0 then
+                -- A 25 ms step can overshoot the narrow clearance between a
+                -- ceiling and a platform. Resolve the head against the crossed
+                -- ceiling surface instead of leaving the feet below the ledge.
+                local ceiling
+                for row = math.floor(feet - 0.949), math.floor(nextFeet - 0.949), -1 do
+                    for column = math.floor(x - 0.299), math.floor(x + 0.299) do
+                        if solid(column, row) or danger(column, row) then ceiling = row; break end
+                    end
+                    if ceiling then break end
+                end
+                if not ceiling then return nil end
+                feet, vy = ceiling + 1.9491, 0
             else return nil end
             if feet > maxY + 2 then return nil end
         end
@@ -648,7 +660,7 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.29"
+local VERSION = "0.1.30"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -1672,12 +1684,18 @@ local function moveTo(x, y, worldName, token, onStep)
             state = position()
         end
         local start = {x = math.floor(state.x), y = math.floor(state.y - 0.01)}
+        local routeContext = worldName .. ": from tile " .. start.x .. ", " .. start.y
+            .. " to standing tile " .. x .. ", " .. y
+        App.navigationDebug = "Planning " .. routeContext
         local route, message = Navigation.plan(navigationMap(r), start, {x = x, y = y}, {
             banned = banned, fullWorld = farmNavigation,
             maxNodes = farmNavigation and math.min(12000, r.world.w * r.world.h) or 1600,
             step = function() pause(0, token); worldCheck(worldName, token) end,
         })
-        assert(route, message)
+        if not route then
+            App.navigationDebug = "Failed " .. routeContext .. "; " .. tostring(message)
+            error(tostring(message) .. " Route: " .. routeContext, 0)
+        end
         if #route == 0 then route = {{x = x, y = y, fromX = start.x, fromY = start.y, jump = false, duration = 0.2}} end
         route = Navigation.straightRuns(route)
         App.navigationDebug = "Planned " .. #route .. " walking/jumping steps to " .. x .. ", " .. y

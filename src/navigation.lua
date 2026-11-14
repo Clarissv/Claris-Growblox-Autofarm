@@ -123,7 +123,19 @@ function Navigation.plan(map, start, goal, options)
             end
             if onLaunchFloor then -- Walk off the current ledge before simulating its fall.
             elseif fits(x, nextFeet) then feet = nextFeet
-            elseif vy < 0 then vy = 0
+            elseif vy < 0 then
+                -- A 25 ms step can overshoot the narrow clearance between a
+                -- ceiling and a platform. Resolve the head against the crossed
+                -- ceiling surface instead of leaving the feet below the ledge.
+                local ceiling
+                for row = math.floor(feet - 0.949), math.floor(nextFeet - 0.949), -1 do
+                    for column = math.floor(x - 0.299), math.floor(x + 0.299) do
+                        if solid(column, row) or danger(column, row) then ceiling = row; break end
+                    end
+                    if ceiling then break end
+                end
+                if not ceiling then return nil end
+                feet, vy = ceiling + 1.9491, 0
             else return nil end
             if feet > maxY + 2 then return nil end
         end

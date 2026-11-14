@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.29.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.30.
+
+Version 0.1.30 fixes a reachable storage entrance being rejected when a platform or raised ledge is just below a low ceiling. The jump simulation now resolves the avatar's head against the crossed ceiling surface, allowing the platform landing instead of stopping below it. Native collision/access, harmful-tile and support checks remain enforced. Route diagnostics now record the world, starting tile and destination standing tile before planning, including failed searches. Existing profiles and task checkpoints remain compatible.
 
 Version 0.1.29 separates sessions, profiles, exports and every task checkpoint by Roblox user ID, so two accounts sharing executor files cannot overwrite each other. Owned legacy sessions/checkpoints migrate once; the active named profile is recovered from the owned session snapshot. Other old profiles remain available for explicit import. Copy diagnostics shows the account ID and data folder. Update both running instances.
 
@@ -249,7 +251,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.29 passes 334 offline checks: 42 configuration/layout/storage tests, 284 generated-runtime tests against mock services/server, six generated-loader tests, and two release checks. New coverage interleaves two account saves on shared storage, separates profiles/exports/checkpoints, checks owner-only legacy migration and account swaps, drains PNB before ripe harvest and after reload, and verifies walking mixed-drop collection with bounded requests, inventory reads and delayed capacity reservations. Existing refill, FPS, connection, rotation recovery, UI, webhook, import/export, harvest, transfer and navigation checks remain passing. These mocks do not establish live speed/FPS, server pickup acceptance, emulator filesystem behavior, account/world permissions, teleport execution or Discord delivery.
+Version 0.1.30 passes 339 offline checks: 42 configuration/layout/storage tests, 289 generated-runtime tests against mock services/server, six generated-loader tests, and two release checks. New coverage reproduces the low-ceiling storage entrance, follows the platform route to both PNB boxes, refills planting seeds before farm travel, and preserves rejection of sealed or unsupported destinations with useful route diagnostics. Earlier account isolation/migration, depleted-seed PNB draining, walking pickups, refill, FPS, connection, UI, webhook and recovery checks remain passing. These mocks do not establish live speed/FPS, server pickup acceptance, emulator filesystem behavior, account/world permissions, teleport execution or Discord delivery.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 

@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.29"
+local VERSION = "0.1.30"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -1025,12 +1025,18 @@ local function moveTo(x, y, worldName, token, onStep)
             state = position()
         end
         local start = {x = math.floor(state.x), y = math.floor(state.y - 0.01)}
+        local routeContext = worldName .. ": from tile " .. start.x .. ", " .. start.y
+            .. " to standing tile " .. x .. ", " .. y
+        App.navigationDebug = "Planning " .. routeContext
         local route, message = Navigation.plan(navigationMap(r), start, {x = x, y = y}, {
             banned = banned, fullWorld = farmNavigation,
             maxNodes = farmNavigation and math.min(12000, r.world.w * r.world.h) or 1600,
             step = function() pause(0, token); worldCheck(worldName, token) end,
         })
-        assert(route, message)
+        if not route then
+            App.navigationDebug = "Failed " .. routeContext .. "; " .. tostring(message)
+            error(tostring(message) .. " Route: " .. routeContext, 0)
+        end
         if #route == 0 then route = {{x = x, y = y, fromX = start.x, fromY = start.y, jump = false, duration = 0.2}} end
         route = Navigation.straightRuns(route)
         App.navigationDebug = "Planned " .. #route .. " walking/jumping steps to " .. x .. ", " .. y

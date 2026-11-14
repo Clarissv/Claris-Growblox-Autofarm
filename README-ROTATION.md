@@ -1,6 +1,6 @@
 # Full Rotation guide
 
-For **Claris Growblox 0.1.29**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
+For **Claris Growblox 0.1.30**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
 
 The usual flow is **fill planting space → PNB while trees grow → harvest a ready farm → transfer its blocks and seeds → replant that farm → repeat**. Planting and ready harvests normally take priority over breaking. When the planting seed supply is exhausted, rotation finishes the full PNB block stock first. A full farm skips planting even when seed storage contains thousands of seeds.
 
@@ -52,6 +52,8 @@ Rotation enters worlds directly by name. Linked doors are required for standalon
 5. Stand at the middle PNB spot and press **Save PNB spot and matching boxes**. Check the saved world and coordinates. The individual **Save block storage** and **Save seed storage** controls can also save their respective boxes while you stand beside them.
 
 For a PNB spot at tile `10, 8`, the seed box must be `8, 8`, the block box `12, 8`, and the block being broken occupies `10, 7`. The two empty tiles between the player and boxes are part of the required layout.
+
+Different accounts can use different world geometry and PNB coordinates. Each world needs the five-tile station and a reachable route from its entrance to the player and both saved box standing positions. A raised room reached by jumping onto a side platform is supported. From v0.1.30, the planner handles the tight jump clearance when that platform sits just below a low ceiling. Closed access, blocked corridors and missing support can still prevent travel.
 
 Leave the standalone **Place & Break** toggle Off while running Full Rotation. Rotation manages PNB itself.
 
@@ -289,6 +291,7 @@ Accounts can use the same webhook and ping the same Discord user; reports identi
 | --- | --- |
 | Missing PNB spot or storage | Resave the middle spot and left/right boxes on Place & Break, all in the same world. |
 | Layout error | Put boxes two tiles left/right of the PNB spot on the same row; clear the tile above the player. |
+| No walking/jumping route to a raised PNB room under a low roof | Update to v0.1.30. It fixes the ceiling collision simulation during platform jumps. Copy diagnostics now shows the world, start tile and target standing tile. Check whether this account can manually reach that exact spot. A failure during `plant` can be the seed-box refill route. |
 | Seed mismatch / use PNB seed storage | Select the correct block, save the left PNB box, and press Use PNB seeds for planting again. |
 | Missing method 'Set' when using PNB seeds or loading config | Update to v0.1.25, push the rebuilt release, rerun the same GitHub loader, then retry. This fixes the dropdown refresh and resets the old UI lock. Check that the farm list and seed settings are displayed correctly. |
 | Planting hook unavailable before starting | Farming hooks are deferred during the initial connection. They attach when Planting or Full Rotation starts. If task startup itself fails, copy diagnostics. |
@@ -369,9 +372,9 @@ cd "F:\VSCode\Luau\Claris Growblox Autofarm\logic"
 npm.cmd run build
 npm.cmd test
 npm.cmd run test:lua
-git add src/main.lua tests/runtime.lua package.json main.lua loader.lua release.json releases/ README.md README-ROTATION.md RESEARCH.md
-git commit -m "Isolate account data and improve rotation collection"
+git add src/main.lua src/navigation.lua tests/runtime.lua package.json main.lua loader.lua release.json releases/ README.md README-ROTATION.md RESEARCH.md
+git commit -m "Fix low-ceiling storage routes"
 git push origin HEAD
 ```
 
-Run the Git commands only after the checks pass. Push the updated loader, manifest, bundle, and new immutable release folder together. Keep using the same GitHub loader command after updates, and reload both accounts onto v0.1.29 or newer.
+Run the Git commands only after the checks pass. Push the updated loader, manifest, bundle, and new immutable release folder together. Keep using the same GitHub loader command after updates, and reload both accounts onto v0.1.30 or newer.

@@ -275,6 +275,97 @@ local function attachPhysics(f, map)
     return visited
 end
 
+local function lowCeilingPNBFixture()
+    local f = fixture()
+    f.world.w, f.world.h, f.world.name = 16, 12, "CLSXIVSTORAGE234"
+    f.app.runtime.items[1422].solid = true
+    f.app.runtime.items[102] = {name="Platform",platform=true}
+    f.world.fg = {}
+    for y=0,11 do
+        f.world.fg[y]={}
+        for x=0,15 do
+            local solid = y==6 or y==5 and x<=5 or y==4 and x==5
+                or y==2 and x<=9 or x==9 and (y==3 or y==4)
+            f.world.fg[y][x] = solid and 2 or x==6 and y==4 and 102 or 0
+        end
+    end
+    f.world.fg[4][0], f.world.fg[4][4] = 1422, 1422
+    f.app.runtime.body.solidAt = function(x,y)
+        if x<0 or x>=f.world.w or y>=f.world.h then return true end
+        local item=f.app.runtime.items[f.world.fg[y] and f.world.fg[y][x] or 0]
+        return item and item.solid == true or false
+    end
+    f.app.config.points.pnb = {world=f.world.name,x=2,y=4}
+    f.app.config.points.seedBox = {world=f.world.name,x=0,y=4,standX=1,standY=4}
+    f.app.config.points.blockBox = {world=f.world.name,x=4,y=4,standX=3,standY=4}
+    f.avatar.x, f.avatar.y, f.avatar.vx, f.avatar.vy = 10.5, 5.999, 0, 0
+    f.app.job = "plant"
+    f.map = f.hooks.navigationMap(f.app.runtime)
+    return f
+end
+
+test("Low-ceiling storage routing jumps onto the side platform before entering the raised PNB room", function()
+    local f = lowCeilingPNBFixture()
+    local route, issue = f.hooks.Navigation.plan(f.map,{x=6,y=5},{x=1,y=4},{fullWorld=true})
+    assert(route, issue)
+    assert(route[1].jump and route[1].x == 6 and route[1].y == 3,
+        "The low roof permits the platform landing even when a full jump would hit it")
+    assert(route[#route].x == 1 and route[#route].y == 4)
+end)
+
+test("The movement follower reaches both PNB boxes from the lower white-door entrance under a low roof", function()
+    local f = lowCeilingPNBFixture()
+    local visited = attachPhysics(f,f.map)
+    f.hooks.moveTo(1,4,f.world.name,1)
+    assert(visited["6:3"] and visited["1:4"] and math.abs(f.avatar.x-1.5)<0.16)
+    f.hooks.moveTo(3,4,f.world.name,1)
+    assert(visited["3:4"] and f.avatar.grounded and math.abs(f.avatar.x-3.5)<0.16)
+    assert(f.controls.dir()==0 and not f.controls.jumping())
+end)
+
+test("Ceiling collision resolution cannot open a sealed or inaccessible PNB corridor", function()
+    local f = lowCeilingPNBFixture()
+    f.world.fg[3][3],f.world.fg[4][3] = 2,2
+    local route,issue=f.hooks.Navigation.plan(f.map,{x=10,y=5},{x=1,y=4},{fullWorld=true})
+    assert(not route and issue:find("No walking/jumping route",1,true))
+    rejects(function() f.hooks.moveTo(1,4,f.world.name,1) end,"Route: CLSXIVSTORAGE234: from tile 10, 5 to standing tile 1, 4")
+    assert(f.app.navigationDebug:find("Failed CLSXIVSTORAGE234: from tile 10, 5",1,true))
+    assert(f.app.navigationDebug:find("to standing tile 1, 4",1,true))
+end)
+
+test("Low-ceiling navigation retains support and headroom checks at saved box positions", function()
+    local f = lowCeilingPNBFixture()
+    f.world.fg[4][1]=2
+    local route,issue=f.hooks.Navigation.plan(f.map,{x=6,y=5},{x=1,y=4},{fullWorld=true})
+    assert(not route and issue:find("no accessible support or headroom",1,true))
+    f.world.fg[4][1],f.world.fg[5][1],f.world.fg[6][1]=0,0,0
+    route,issue=f.hooks.Navigation.plan(f.map,{x=6,y=5},{x=1,y=4},{fullWorld=true})
+    assert(not route and issue:find("no accessible support or headroom",1,true))
+end)
+
+test("Planting refills through the low-ceiling PNB route before leaving storage for its farm", function()
+    local f = lowCeilingPNBFixture()
+    attachPhysics(f,f.map)
+    f.app.config.points.plantBox = f.app.config.points.seedBox
+    f.app.config.planting = {seedId=955,storageWorld=f.world.name,worlds={"FARM"}}
+    f.boxes[0],f.serverSeeds,f.withdrawals={{955,10}},0,0
+    f.server=function(name,x,y,id)
+        if name=="GetInventory" then return {slots=f.serverSeeds>0 and {{955,f.serverSeeds}} or {},capacity=54} end
+        assert(name=="DisplayItem" and x==0 and y==4 and id==nil)
+        assert(math.abs(f.avatar.x-1.5)<0.16 and math.abs(f.avatar.y-5)<0.22)
+        f.withdrawals,f.serverSeeds=f.withdrawals+1,10
+        f.boxes[0]={}
+        return true,{taken={{955,10}}}
+    end
+    f.world.enter=function(name)
+        assert(name=="FARM" and f.inventory:count(955)==10 and f.withdrawals==1)
+        f.app:stop()
+        return true
+    end
+    rejects(function() f.hooks.runPlant(1,{state={phase="stock",worldIndex=1,skipped={}}}) end,"Stopped")
+    assert(f.withdrawals==1 and f.inventory:count(955)==10 and f.app.pending==0)
+end)
+
 test("The actual movement controller climbs from the lock via the side entrance", function()
     local f = fixture()
     local map = raisedFarm(f)
