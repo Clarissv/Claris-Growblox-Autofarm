@@ -1,6 +1,8 @@
 # Claris Growblox Autofarm
 
-WindUI script for Growblox, intended to run through Delta. Version 0.1.38.
+WindUI script for Growblox, intended to run through Delta. Version 0.1.39.
+
+Version 0.1.39 adds **Settings → FPS booster: Grey map**. It replaces native 2D map and nearby tree textures with grey shapes, suppresses texture shadows, and temporarily enables the client's local low graphics flag to reduce distant tree rendering and cosmetic effects. The sky, avatar, controls, doors, locks and Display Boxes remain visible. It works independently of hiding floating drops, can change during rotation, and saves across supported world-change resumes. Turning it Off, unloading or reloading restores current surviving textures and the previous local graphics flag. It never changes world tiles, tree growth, inventory or pickup data.
 
 Version 0.1.38 makes Moving Drops enter the saved source and destination worlds directly. Its only required locations are the Farm Display Box and destination Display Box; a PNB spot and linked doors are unnecessary. Choose **Moving Drops → Item to move → Blocks / Seeds** for the selected crop. Mixed farm boxes can return both types: the selected type is delivered, the other type is held through trips and returned to the farm box afterward. Each trip saves its chosen item, exact new cargo, destination and held companion count across supported world-change reloads. Previously held selected items stay in the backpack. Older profiles default to Blocks and use their PNB block box; Seeds uses the PNB seed box until an explicit Moving Drops destination is saved. Full Rotation still transfers blocks into its dedicated PNB block box and sends seeds into its PNB seed box independently of these standalone choices. Existing profiles and safe transfer checkpoints remain supported.
 
@@ -185,13 +187,17 @@ After a release's first load, the loader reuses its validated main script and Wi
 
 An interrupted storage request leaves a `pickupPending`, `depositPending`, or `seedReturnPending` checkpoint. Check the backpack and both boxes before pressing **Clear saved transfer** and starting again. This avoids repeating a storage action whose result was lost. Normal Stop clears the automatic resume checkpoint; restarting starts a fresh task.
 
-## FPS booster for scattered drops
+## FPS booster: Grey map and floating drops
+
+Turn **Settings → FPS booster: Grey map** On for a plain grey map with grey tree shapes. Growblox uses GUI sprites, so this targets its actual map renderer instead of changing 3D part materials. The sky/background, avatar, HUD, doors, locks, access areas, Display Boxes and their contents keep their normal appearance. Native local low graphics reduces distant tree drawings and cosmetic effects while enabled. Tree maturity checks, navigation, harvesting and planting still use the original world data.
 
 Turn **Settings → FPS booster: hide floating drops** On when a farm has many floating items. Loose blocks, seeds and gems become invisible; their quantities and pickup positions remain available to automation. Display Boxes and the rest of the world stay visible. Harvest collects selected blocks, matching seeds and gems; PNB collects blocks, seeds and nearby gems.
 
 You can switch it while a task runs. The choice saves to the current session and matching saved task checkpoints, so queued world-change resumes retain it. Save your named profile too if you want the same choice when loading that profile; export/import carries the setting. Newly created drops are hidden on the periodic scan, roughly once per second. Normal Stop keeps the booster active. Turn it Off to see loose items for manual play, or unload the script to restore surviving drop visuals.
 
-**Copy diagnostics** includes the booster state, hidden sprite count and any visual/save errors. This reduces drawing and bobbing work; the native client still manages drop records and pickup processing, and the server still loads the world. The FPS gain on your device needs in-game verification.
+Both toggles work independently and follow these saving rules. Enable both for a grey map without loose item sprites. Grey map also scans roughly once per second to catch new tiles and trees. Turn Grey map Off to restore current surviving textures and the previous local graphics flag; unload or reload also restores them before the next attachment. The script preserves native texture changes when tile frames are reused. A missing renderer or failed visual update appears in diagnostics and retries without stopping rotation.
+
+**Copy diagnostics** includes both booster states, hidden drop count, simplified map/tree sprite count and any visual/save errors. These options reduce texture drawing, distant tree effects and drop bobbing work; the native client still manages drop records and pickup processing, and the server still loads the world. The FPS gain on your device needs in-game verification.
 
 ## Set up Discord reports
 
@@ -271,7 +277,7 @@ npm run test:lua
 
 The build uses only Node's standard library and the supplied `../WindUI` checkout; no npm installation is required. `tests/run.ps1` uses the existing Lua library at `C:\Program Files\VideoLAN\VLC\plugins\lua\liblua_plugin.dll`. An alternate compatible DLL can be supplied with `-LuaLibrary`. The Lua test runner compiles the complete generated script and loader and executes the offline fixtures.
 
-Version 0.1.38 passes 418 offline checks: 47 configuration/layout/storage tests, 363 generated-runtime tests against mock services/server, six generated-loader tests, and two release checks. New coverage verifies direct transfers with only two boxes, mixed-box seed and block ordering, exact cargo preservation, four inventory reads per trip, companion return, seed-trip world reloads, interrupted storage protection, configuration/UI restoration, and rotation's dedicated destinations. Earlier collection direction, low-FPS pickup timing, farm-stock recovery, maturity, combined planting, Tractor gems, navigation, account isolation, seed-exhaustion draining, FPS, connection, webhook and recovery checks remain passing. These mocks do not establish live speed/FPS, server pickup acceptance, emulator filesystem behavior, account/world permissions, teleport execution or Discord delivery.
+Version 0.1.39 passes 428 offline checks: 48 configuration/layout/storage tests, 372 generated-runtime tests against mock services/server, six generated-loader tests, and two release checks. New coverage verifies grey map/tree rendering without altering pickup or growth data, visible sky/avatar/HUD/storage/access markers, native tile repainting and reuse, new trees, destroyed frames, periodic yielded scans, independent toggles, restoration on unload/reload/world changes, recoverable visual failures, and active rotation checkpoint persistence. Earlier Moving Drops, collection direction, low-FPS pickup timing, farm-stock recovery, maturity, combined planting, Tractor gems, navigation, account isolation, seed-exhaustion draining, connection, webhook and recovery checks remain passing. These mocks do not establish live speed/FPS, server pickup acceptance, emulator filesystem behavior, account/world permissions, teleport execution or Discord delivery.
 
 Push the rebuilt files, new `releases/<revision>` folder, and updated `loader.lua` together. Do not modify an existing release's files. Keep the same GitHub `loadstring` when updating the project.
 

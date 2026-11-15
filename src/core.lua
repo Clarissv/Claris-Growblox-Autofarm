@@ -3,7 +3,7 @@ local Core = {}
 Core.VERSION = 1
 Core.REPO = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/"
 Core.POINTS = { "pnb", "blockBox", "seedBox", "farmBox", "moveBox", "farmDoor", "breakDoor", "plantBox" }
-Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest", "harvestRespawn", "fpsBooster", "harvestPlanting" }
+Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest", "harvestRespawn", "fpsBooster", "fpsGreyMap", "harvestPlanting" }
 Core.LIMITS = {
     placeDelay = { 0.15, 2 }, punchDelay = { 0.22, 2 },
     collectDelay = { 0, 5 }, actionTimeout = { 5, 30 },
@@ -15,7 +15,7 @@ function Core.defaults()
         version = Core.VERSION, blockId = 0, points = {},
         options = { placeDelay = 0.2, punchDelay = 0.24, collectDelay = 0.1,
             actionTimeout = 10, moveTimeout = 30, seedThreshold = 200, antiAFK = true, autoRejoin = true,
-            moveAfterHarvest = false, harvestRespawn = true, fpsBooster = false, harvestPlanting = false },
+            moveAfterHarvest = false, harvestRespawn = true, fpsBooster = false, fpsGreyMap = false, harvestPlanting = false },
         webhook = { url = "", enabled = false, intervalMinutes = 5, includeBoxes = true,
             discordId = "", failureAlerts = true },
         planting = {seedId = 0, storageWorld = "", worlds = {}},

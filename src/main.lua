@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.38"
+local VERSION = "0.1.39"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -108,6 +108,7 @@ local function saveFPSPreference()
                 and record.profile == App.profile then
                 record.config = Core.validate(record.config)
                 record.config.options.fpsBooster = App.config.options.fpsBooster
+                record.config.options.fpsGreyMap = App.config.options.fpsGreyMap
                 writeJSON(path, record)
             end
         end
@@ -754,6 +755,7 @@ end
 -- pickup and world cleanup, but detach loose sprites from the rendered GUI.
 -- Native visibility writes cannot reveal a detached frame; no per-frame hooks
 -- or property-change listeners are needed for thousands of drops.
+do
 local function restoreDropVisual(frame, record)
     if frame.Parent == nil then frame.Parent = record.parent end
     if not record.drop.display then
@@ -761,7 +763,7 @@ local function restoreDropVisual(frame, record)
         if record.pop and record.pop.Scale == 1 then record.pop.Scale = record.scale end
     end
 end
-restoreFPSBooster = function()
+local function restoreFloatingDrops()
     local state = App.fpsState
     App.fpsHidden = 0
     if not state then return true end
@@ -785,10 +787,9 @@ restoreFPSBooster = function()
     App.fpsState = nil
     return true
 end
-App.restoreFPSBooster = restoreFPSBooster
-pollFPSBooster = function(force)
+local function pollFloatingDrops(force)
     if not App.alive or not App.config.options.fpsBooster then
-        if restoreFPSBooster() then App.fpsBoosterError = nil end
+        if restoreFloatingDrops() then App.fpsBoosterError = nil end
         return
     end
     local r = App.runtime
@@ -798,7 +799,7 @@ pollFPSBooster = function(force)
     local ok, issue = pcall(function()
         local state = App.fpsState
         if not state or state.world ~= r.world then
-            assert(restoreFPSBooster(), App.fpsBoosterError)
+            assert(restoreFloatingDrops(), App.fpsBoosterError)
             state = {world = r.world, records = {}}
             App.fpsState = state
         end
@@ -846,7 +847,18 @@ pollFPSBooster = function(force)
     end)
     App.fpsBusy = false
     App.fpsBoosterError = not ok and tostring(issue) or nil
-    if not ok then restoreFPSBooster() end -- Visual failure must not interrupt a farming task.
+    if not ok then restoreFloatingDrops() end -- Visual failure must not interrupt a farming task.
+end
+local greyMap = (__CLARIS_FPS__)(App, upvalues)
+restoreFPSBooster = function()
+    local dropsOK, mapOK = restoreFloatingDrops(), greyMap.restore()
+    return dropsOK and mapOK
+end
+pollFPSBooster = function(force)
+    pollFloatingDrops(force)
+    greyMap.poll(force)
+end
+App.restoreFPSBooster = restoreFPSBooster
 end
 local function position()
     local r = runtime()
@@ -4904,19 +4916,20 @@ for _, info in ipairs({
     {"antiAFK", "Anti-AFK", "Keep the session active when Roblox detects idle time."},
     {"autoRejoin", "Rejoin world and return to PNB", "Re-enter the saved world from the world picker, then walk and jump back to the breaking spot."},
     {"fpsBooster", "FPS booster: hide floating drops", "Hide loose blocks, seeds and gems and stop their bobbing. Collection continues; Display Boxes stay visible. Turn Off to restore visuals."},
+    {"fpsGreyMap", "FPS booster: Grey map", "Replace map and nearby tree textures with grey shapes and reduce distant tree visuals. Keep the sky, avatar, controls, doors and Display Boxes. Turn Off to restore textures."},
 }) do
     local key = info[1]
     settingsControls[key] = settingsTab:Toggle({Title = info[2], Desc = info[3], Value = App.config.options[key],
         Callback = function(value)
             if App.syncingUI then return end
-            if key ~= "fpsBooster" and (App.job or App.configuring or App.pending > 0) then
+            if key ~= "fpsBooster" and key ~= "fpsGreyMap" and (App.job or App.configuring or App.pending > 0) then
                 notify("Stop the task before changing settings.")
                 settingsControls[key]:Set(App.config.options[key], false, false)
                 return
             end
             App.config.options[key] = value
             if key == "antiAFK" and value then installAntiAFK() end
-            if key == "fpsBooster" then
+            if key == "fpsBooster" or key == "fpsGreyMap" then
                 pollFPSBooster(true)
                 local ok, issue = pcall(saveFPSPreference)
                 App.fpsSaveError = not ok and tostring(issue) or nil
@@ -4971,6 +4984,8 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nAnti-AFK: " .. (App.antiAFKError or "ready")
         .. "\nFPS booster: " .. (App.config.options.fpsBooster and "On" or "Off")
         .. "; hidden loose sprites: " .. (App.fpsHidden or 0) .. "; " .. (App.fpsBoosterError or "ready")
+        .. "\nGrey map: " .. (App.config.options.fpsGreyMap and "On" or "Off")
+        .. "; simplified sprites: " .. (App.fpsMapCount or 0) .. "; " .. (App.fpsMapError or "ready")
         .. "\nFPS setting save: " .. (App.fpsSaveError or "ready")
         .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
         .. "\nLast refused harvest pickup: " .. (App.lastHarvestRefusal or "none")

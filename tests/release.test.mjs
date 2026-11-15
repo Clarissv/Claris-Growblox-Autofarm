@@ -26,9 +26,11 @@ test('bundle contains the current source and vendored WindUI license', () => {
     const core = read('src/core.lua');
     const source = read('src/main.lua');
     const expected = source.replace('__CLARIS_CORE__', `(function()\n${core}\nend)()`)
-        .replace('__CLARIS_NAV__', `(function()\n${read('src/navigation.lua')}\nend)()`);
+        .replace('__CLARIS_NAV__', `(function()\n${read('src/navigation.lua')}\nend)()`)
+        .replace('__CLARIS_FPS__', `(function()\n${read('src/fps.lua')}\nend)()`);
     assert.equal(read('main.lua'), expected, 'Run npm run build after editing source');
     assert.ok(!expected.includes('__CLARIS_CORE__'));
     assert.ok(!expected.includes('__CLARIS_NAV__'));
+    assert.ok(!expected.includes('__CLARIS_FPS__'));
     assert.match(read('vendor/WindUI.LICENSE'), /MIT License/);
 });

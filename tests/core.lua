@@ -195,6 +195,17 @@ test("FPS booster is optional in old profiles and portable when enabled", functi
     rejects(function() Core.validate(config) end, "fpsBooster")
 end)
 
+test("Grey map defaults off in old profiles and survives config export independently of drops", function()
+    local config = setup()
+    config.options.fpsGreyMap = nil
+    assert(Core.validate(config).options.fpsGreyMap == false)
+    config.options.fpsGreyMap = true
+    local imported = Core.importConfig(Core.exportConfig(config, "Grey Farm", "0.1.39"))
+    assert(imported.options.fpsGreyMap and not imported.options.fpsBooster)
+    config.options.fpsGreyMap = "yes"
+    rejects(function() Core.validate(config) end, "fpsGreyMap")
+end)
+
 test("Invalid anti-AFK or world-recovery values are rejected", function()
     local config = setup()
     config.options.antiAFK = "yes"

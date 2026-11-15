@@ -1,6 +1,6 @@
 # Full Rotation guide
 
-For **Claris Growblox 0.1.38**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
+For **Claris Growblox 0.1.39**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
 
 The usual flow is **fill planting space → collect existing farm stock if needed → PNB while trees grow → harvest a ready farm → transfer its blocks and seeds → replant that farm → repeat**. Planting and ready harvests normally take priority over breaking. When the planting seed supply is exhausted, rotation finishes the full PNB block stock first. A full farm skips planting even when seed storage contains thousands of seeds.
 
@@ -204,6 +204,8 @@ From v0.1.28, a refill or saved resume keeps moving planting on the unfinished r
 
 For worlds with many scattered drops, enable **Settings → FPS booster: hide floating drops**. It hides loose block, seed and gem sprites and stops their bobbing/pop visuals while automation keeps using their pickup data. Display Boxes remain visible. You can toggle it during rotation; it saves to the session and matching task checkpoints without changing pending cargo or progress, and applies after supported world-change resumes. Save the named profile to retain it when loading that profile or exporting to another device. New drops are hidden on a periodic scan, roughly once per second. Normal Stop keeps the boost active; switching it Off or unloading restores surviving visuals. Harvest collects selected blocks, matching seeds and gems; PNB also collects nearby gems. Live FPS improvement depends on the device and native client workload.
 
+For a plain grey map, also enable **Settings → FPS booster: Grey map**. It removes map and nearby tree textures, uses grey shapes, and temporarily enables native local low graphics to reduce distant tree rendering and cosmetic effects. Sky/background, avatar, controls, doors, locks, access areas, Display Boxes and their contents remain visible. Tree maturity, world collision, harvesting, planting and collection data stay intact. This toggle works independently of hiding drops and follows the same session, checkpoint, profile and export/import rules. Turn it Off, unload or reload to restore current surviving textures and the previous local graphics flag. Copy diagnostics shows the simplified sprite count and visual errors; visual failures retry without pausing rotation.
+
 - Planting skips rows without empty supported planting tiles.
 - Harvesting skips rows without ripe selected trees or matching drops to collect.
 - The next supported row may be more than one tile below the previous row.
@@ -336,6 +338,7 @@ Accounts can use the same webhook and ping the same Discord user; reports identi
 | Planting pauses while crossing a row | Short confirmations and timing pauses are expected. Unconfirmed tiles are skipped and retried once from below where reachable; rotation continues. Failed inventory reads or unexplained count changes still pause. Check Planting recovery in diagnostics. |
 | Floating blocks, seeds and gems are invisible | FPS booster hides their visuals. Automation can still collect them. Turn it Off in Settings for manual play; Display Box contents stay visible. |
 | FPS remains low with many drops | Enable FPS booster and check Copy diagnostics for hidden sprite count/errors. Native drop processing and world loading still cost time; the booster does not remove server items. |
+| Want a grey map with the sky visible | Enable Settings → FPS booster: Grey map, optionally alongside hiding floating drops. Doors and storage markers stay visible. Turn it Off to restore textures; save the named profile to retain it when loading or exporting. |
 | Missing farm box | Visit the exact named farm and save its reachable harvest box. Check every listed world. |
 | Full farm is not planting | Occupied tiles are intentionally skipped. Growing trees lead to PNB; ripe trees lead to harvest. |
 | Some trees are ripe but the farm is still growing | The maturity wait accounts for remaining matching growing trees too. |

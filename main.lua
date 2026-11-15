@@ -5,7 +5,7 @@ local Core = {}
 Core.VERSION = 1
 Core.REPO = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/"
 Core.POINTS = { "pnb", "blockBox", "seedBox", "farmBox", "moveBox", "farmDoor", "breakDoor", "plantBox" }
-Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest", "harvestRespawn", "fpsBooster", "harvestPlanting" }
+Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest", "harvestRespawn", "fpsBooster", "fpsGreyMap", "harvestPlanting" }
 Core.LIMITS = {
     placeDelay = { 0.15, 2 }, punchDelay = { 0.22, 2 },
     collectDelay = { 0, 5 }, actionTimeout = { 5, 30 },
@@ -17,7 +17,7 @@ function Core.defaults()
         version = Core.VERSION, blockId = 0, points = {},
         options = { placeDelay = 0.2, punchDelay = 0.24, collectDelay = 0.1,
             actionTimeout = 10, moveTimeout = 30, seedThreshold = 200, antiAFK = true, autoRejoin = true,
-            moveAfterHarvest = false, harvestRespawn = true, fpsBooster = false, harvestPlanting = false },
+            moveAfterHarvest = false, harvestRespawn = true, fpsBooster = false, fpsGreyMap = false, harvestPlanting = false },
         webhook = { url = "", enabled = false, intervalMinutes = 5, includeBoxes = true,
             discordId = "", failureAlerts = true },
         planting = {seedId = 0, storageWorld = "", worlds = {}},
@@ -696,7 +696,7 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.38"
+local VERSION = "0.1.39"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -803,6 +803,7 @@ local function saveFPSPreference()
                 and record.profile == App.profile then
                 record.config = Core.validate(record.config)
                 record.config.options.fpsBooster = App.config.options.fpsBooster
+                record.config.options.fpsGreyMap = App.config.options.fpsGreyMap
                 writeJSON(path, record)
             end
         end
@@ -1449,6 +1450,7 @@ end
 -- pickup and world cleanup, but detach loose sprites from the rendered GUI.
 -- Native visibility writes cannot reveal a detached frame; no per-frame hooks
 -- or property-change listeners are needed for thousands of drops.
+do
 local function restoreDropVisual(frame, record)
     if frame.Parent == nil then frame.Parent = record.parent end
     if not record.drop.display then
@@ -1456,7 +1458,7 @@ local function restoreDropVisual(frame, record)
         if record.pop and record.pop.Scale == 1 then record.pop.Scale = record.scale end
     end
 end
-restoreFPSBooster = function()
+local function restoreFloatingDrops()
     local state = App.fpsState
     App.fpsHidden = 0
     if not state then return true end
@@ -1480,10 +1482,9 @@ restoreFPSBooster = function()
     App.fpsState = nil
     return true
 end
-App.restoreFPSBooster = restoreFPSBooster
-pollFPSBooster = function(force)
+local function pollFloatingDrops(force)
     if not App.alive or not App.config.options.fpsBooster then
-        if restoreFPSBooster() then App.fpsBoosterError = nil end
+        if restoreFloatingDrops() then App.fpsBoosterError = nil end
         return
     end
     local r = App.runtime
@@ -1493,7 +1494,7 @@ pollFPSBooster = function(force)
     local ok, issue = pcall(function()
         local state = App.fpsState
         if not state or state.world ~= r.world then
-            assert(restoreFPSBooster(), App.fpsBoosterError)
+            assert(restoreFloatingDrops(), App.fpsBoosterError)
             state = {world = r.world, records = {}}
             App.fpsState = state
         end
@@ -1541,7 +1542,168 @@ pollFPSBooster = function(force)
     end)
     App.fpsBusy = false
     App.fpsBoosterError = not ok and tostring(issue) or nil
-    if not ok then restoreFPSBooster() end -- Visual failure must not interrupt a farming task.
+    if not ok then restoreFloatingDrops() end -- Visual failure must not interrupt a farming task.
+end
+local greyMap = ((function()
+-- Scoped Growblox GUI rendering overrides. Never change world grids or item data.
+return function(App, upvalues)
+    local Map = {}
+    local function gui(value, class)
+        return type(typeof) == "function" and typeof(value) == "Instance" and value:IsA(class)
+    end
+    local function tile(frame)
+        if not gui(frame, "ImageLabel") then return end
+        local id, z = frame:GetAttribute("id"), frame:GetAttribute("z")
+        if type(id) == "number" and (z == 2 or z == 3 or z == 4) then return id, z end
+    end
+    local function discover(r)
+        assert(type(r.world.treeLook) == "function", "Map renderer unavailable; retrying.")
+        local values, root = upvalues(r.world.treeLook)
+        for _, value in pairs(values) do
+            if gui(value, "GuiObject") then
+                for _, child in ipairs(value:GetChildren()) do
+                    if tile(child) ~= nil then
+                        assert(not root or root == value, "Map renderer is ambiguous; retrying.")
+                        root = value
+                        break
+                    end
+                end
+            end
+        end
+        assert(root, "Map tile frames unavailable; retrying.")
+        return root, values
+    end
+    local function restoreFrame(frame, record)
+        if frame.Parent == nil then return end -- Native renderer destroys/rebuilds its pools.
+        for key, saved in pairs(record) do
+            if frame[key] == saved.applied then frame[key] = saved.original end
+        end
+    end
+    local function override(frame, record, key, value)
+        local current, saved = frame[key], record[key]
+        if not saved then
+            saved = {original = current}
+            record[key] = saved -- Record first so failed property writes remain reversible.
+        elseif current ~= saved.applied then
+            saved.original = current -- Native tile reuse/repainting supersedes the old texture.
+        end
+        if current ~= value then frame[key] = value end
+        saved.applied = value
+    end
+    function Map.restore()
+        local state, failed = App.fpsMapState
+        App.fpsMapCount = 0
+        if not state then return true end
+        for frame, record in pairs(state.records) do
+            local ok, issue = pcall(restoreFrame, frame, record)
+            if ok then state.records[frame] = nil else failed = tostring(issue) end
+        end
+        if state.lowChanged then
+            local ok, issue = pcall(function()
+                if state.world.lowGfx == true then state.world.lowGfx = state.lowOriginal end
+            end)
+            if ok then state.lowChanged = nil else failed = tostring(issue) end
+        end
+        if failed then App.fpsMapError = "Could not restore map visuals: " .. failed; return false end
+        App.fpsMapState = nil
+        return true
+    end
+    function Map.poll(force)
+        if not App.alive or not App.config.options.fpsGreyMap then
+            if Map.restore() then App.fpsMapError = nil end
+            return
+        end
+        local r = App.runtime
+        if not r or App.fpsMapBusy then return end
+        if not force and os.clock() < (App.nextFPSMapScan or 0) then return end
+        App.fpsMapBusy = true
+        local ok, issue = pcall(function()
+            local state = App.fpsMapState
+            if not state or state.world ~= r.world or state.root.Parent == nil then
+                assert(Map.restore(), App.fpsMapError)
+                local root, values = discover(r)
+                state = {world = r.world, root = root, values = values, records = {}}
+                App.fpsMapState = state
+                -- Native low graphics limits distant tree drawings and cosmetic effects.
+                -- Assign the local flag only; the game's server-backed setting is untouched.
+                if type(r.world.lowGfx) == "boolean" and not r.world.lowGfx then
+                    state.lowOriginal, state.lowChanged = r.world.lowGfx, true
+                    r.world.lowGfx = true
+                end
+            end
+            local work, lastYield, count = 0, os.clock(), 0
+            local function checkpoint()
+                work = work + 1
+                if work >= 512 or os.clock() - lastYield >= 0.006 then
+                    task.wait()
+                    work, lastYield = 0, os.clock()
+                end
+                return App.alive and App.config.options.fpsGreyMap and App.runtime == r and App.fpsMapState == state
+            end
+            local targets = {}
+            for _, frame in ipairs(state.root:GetChildren()) do
+                if not checkpoint() then return end
+                local id, z = tile(frame)
+                if id and id >= 0 then
+                    local item = r.items and r.items[id]
+                    if not (item and (item.display or item.displayOne or item.door or item.entrance
+                        or item.vip or item.lock or item.area)) then targets[frame] = z end
+                end
+            end
+            -- Tree sprites lack tile attributes. Only inspect confirmed native tree frames,
+            -- never the avatar, HUD, sky, dropped items or Display Box contents.
+            for _, value in pairs(state.values) do
+                if type(value) == "table" and value ~= r.world and value ~= r.items then
+                    for _, tree in pairs(value) do
+                        if not checkpoint() then return end
+                        if type(tree) == "table" and type(tree.tree) == "table" and type(tree.id) == "number"
+                            and gui(tree.frame, "GuiObject") and tree.frame.Parent == state.root then
+                            for _, frame in ipairs(tree.frame:GetDescendants()) do
+                                if not checkpoint() then return end
+                                if gui(frame, "ImageLabel") then targets[frame] = frame.ZIndex end
+                            end
+                        end
+                    end
+                end
+            end
+            for frame, record in pairs(state.records) do
+                if not checkpoint() then return end
+                if not targets[frame] or frame.Parent == nil then
+                    restoreFrame(frame, record)
+                    state.records[frame] = nil
+                end
+            end
+            for frame, z in pairs(targets) do
+                if not checkpoint() then return end
+                if frame.Parent ~= nil then
+                    local record = state.records[frame] or {}
+                    state.records[frame] = record
+                    override(frame, record, "Image", "")
+                    local shade = z == 2 and 90 or 140
+                    override(frame, record, "BackgroundColor3", Color3.fromRGB(shade, shade, shade))
+                    override(frame, record, "BackgroundTransparency", z == 3 and 1 or frame.ImageTransparency)
+                    count = count + 1
+                end
+            end
+            App.fpsMapCount = count
+        end)
+        App.fpsMapBusy, App.nextFPSMapScan = false, os.clock() + 1
+        App.fpsMapError = not ok and tostring(issue) or nil
+        if not ok then Map.restore() end -- Cosmetic failure must not stop rotation.
+    end
+    return Map
+end
+
+end)())(App, upvalues)
+restoreFPSBooster = function()
+    local dropsOK, mapOK = restoreFloatingDrops(), greyMap.restore()
+    return dropsOK and mapOK
+end
+pollFPSBooster = function(force)
+    pollFloatingDrops(force)
+    greyMap.poll(force)
+end
+App.restoreFPSBooster = restoreFPSBooster
 end
 local function position()
     local r = runtime()
@@ -5599,19 +5761,20 @@ for _, info in ipairs({
     {"antiAFK", "Anti-AFK", "Keep the session active when Roblox detects idle time."},
     {"autoRejoin", "Rejoin world and return to PNB", "Re-enter the saved world from the world picker, then walk and jump back to the breaking spot."},
     {"fpsBooster", "FPS booster: hide floating drops", "Hide loose blocks, seeds and gems and stop their bobbing. Collection continues; Display Boxes stay visible. Turn Off to restore visuals."},
+    {"fpsGreyMap", "FPS booster: Grey map", "Replace map and nearby tree textures with grey shapes and reduce distant tree visuals. Keep the sky, avatar, controls, doors and Display Boxes. Turn Off to restore textures."},
 }) do
     local key = info[1]
     settingsControls[key] = settingsTab:Toggle({Title = info[2], Desc = info[3], Value = App.config.options[key],
         Callback = function(value)
             if App.syncingUI then return end
-            if key ~= "fpsBooster" and (App.job or App.configuring or App.pending > 0) then
+            if key ~= "fpsBooster" and key ~= "fpsGreyMap" and (App.job or App.configuring or App.pending > 0) then
                 notify("Stop the task before changing settings.")
                 settingsControls[key]:Set(App.config.options[key], false, false)
                 return
             end
             App.config.options[key] = value
             if key == "antiAFK" and value then installAntiAFK() end
-            if key == "fpsBooster" then
+            if key == "fpsBooster" or key == "fpsGreyMap" then
                 pollFPSBooster(true)
                 local ok, issue = pcall(saveFPSPreference)
                 App.fpsSaveError = not ok and tostring(issue) or nil
@@ -5666,6 +5829,8 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nAnti-AFK: " .. (App.antiAFKError or "ready")
         .. "\nFPS booster: " .. (App.config.options.fpsBooster and "On" or "Off")
         .. "; hidden loose sprites: " .. (App.fpsHidden or 0) .. "; " .. (App.fpsBoosterError or "ready")
+        .. "\nGrey map: " .. (App.config.options.fpsGreyMap and "On" or "Off")
+        .. "; simplified sprites: " .. (App.fpsMapCount or 0) .. "; " .. (App.fpsMapError or "ready")
         .. "\nFPS setting save: " .. (App.fpsSaveError or "ready")
         .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
         .. "\nLast refused harvest pickup: " .. (App.lastHarvestRefusal or "none")

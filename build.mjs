@@ -11,11 +11,13 @@ const readText = path => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
 const core = readText(join(root, 'src/core.lua'));
 const main = readText(join(root, 'src/main.lua'));
 const navigation = readText(join(root, 'src/navigation.lua'));
+const fps = readText(join(root, 'src/fps.lua'));
 const wind = readText(join(windRoot, 'dist/main.lua'));
 const license = readText(join(windRoot, 'LICENSE'));
 const bundle = main.replace('__CLARIS_CORE__', `(function()\n${core}\nend)()`)
-    .replace('__CLARIS_NAV__', `(function()\n${navigation}\nend)()`);
-if (/__CLARIS_(CORE|NAV)__/.test(bundle)) throw new Error('Unresolved bundle marker');
+    .replace('__CLARIS_NAV__', `(function()\n${navigation}\nend)()`)
+    .replace('__CLARIS_FPS__', `(function()\n${fps}\nend)()`);
+if (/__CLARIS_(CORE|NAV|FPS)__/.test(bundle)) throw new Error('Unresolved bundle marker');
 const digest = data => createHash('sha256').update(data).digest('hex');
 const revision = digest(bundle + '\n' + wind).slice(0, 20);
 const repo = 'https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/';

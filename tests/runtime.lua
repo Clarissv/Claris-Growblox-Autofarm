@@ -1339,6 +1339,197 @@ test("An unavailable drop list preserves FPS restore records until cleanup can r
     assert(drop.frame.Parent == parent and f.app.fpsState == nil and not f.app.fpsBoosterError)
 end)
 
+local function attachMapVisuals(f)
+    local app = f.env.ClarisGrowbloxApp
+    typeof = function(value) return type(value) == "table" and value.mockInstance and "Instance" or type(value) end
+    Color3 = {fromRGB = function(r, g, b) return r .. ":" .. g .. ":" .. b end}
+    local function frame(class, parent, id, z)
+        local data = {mockInstance = true, Parent = parent, children = {}, attrs = {id = id, z = z},
+            Image = "atlas-original", BackgroundColor3 = "original-color", BackgroundTransparency = 1,
+            ImageTransparency = 0, Visible = true, ZIndex = z or 4, Position = "original-position", Size = "original-size"}
+        local object = setmetatable({}, {__index = data, __newindex = function(_, key, value)
+            assert(not data.deny or key ~= data.deny, "Visual write denied: " .. key)
+            data[key] = value
+        end})
+        function object:IsA(name) return name == class or name == "GuiObject" end
+        function object:GetAttribute(name) return self.attrs[name] end
+        function object:GetChildren() return self.children end
+        function object:GetDescendants()
+            local all = {}
+            local function visit(node)
+                for _, child in ipairs(node.children) do all[#all+1] = child; visit(child) end
+            end
+            visit(self)
+            return all
+        end
+        if parent and parent.children then parent.children[#parent.children + 1] = object end
+        return object
+    end
+    local sky = frame("Frame")
+    local root = frame("Frame", sky)
+    local foreground = frame("ImageLabel", root, 954, 4)
+    local background = frame("ImageLabel", root, 954, 2)
+    local shadow = frame("ImageLabel", root, 954, 3)
+    local boxes, infrastructure = {}, {}
+    for _, spec in ipairs({{1422, "display"}, {6001, "displayOne"}, {6002, "door"}, {6003, "entrance"},
+        {6004, "vip"}, {6005, "lock"}, {6006, "area"}}) do
+        app.runtime.items[spec[1]] = {[spec[2]] = true}
+        boxes[#boxes+1] = frame("ImageLabel", root, spec[1], 4)
+    end
+    for _, box in ipairs(boxes) do infrastructure[#infrastructure+1] = box end
+    local tree = frame("Frame", root)
+    local leaves = frame("ImageLabel", tree)
+    local shade = frame("ImageLabel", tree, nil, 3)
+    local records = {[10] = {id = 955, tree = {p = 2, f = 3}, frame = tree}}
+    local avatar = frame("ImageLabel", root)
+    local hud = frame("ImageLabel", sky)
+    local contents = frame("ImageLabel", boxes[1])
+    f.world.lowGfx = false
+    function f.world.treeLook() return root, records end -- Matches native renderer upvalues.
+    return {root = root, frame = frame, foreground = foreground, background = background, shadow = shadow,
+        tree = tree, leaves = leaves, shade = shade, records = records, avatar = avatar, hud = hud,
+        sky = sky, contents = contents, infrastructure = infrastructure}
+end
+
+test("Grey map simplifies native tiles and trees while keeping sky, avatar, HUD and infrastructure", function()
+    local f = pickupFixture()
+    local m = attachMapVisuals(f)
+    local drop = f.addDrop(1, 954, 10)
+    attachDropVisual(drop, m.root)
+    f.app.config.options.fpsGreyMap = true
+    f.hooks.pollFPSBooster(true)
+    assert(not f.app.fpsMapError and f.app.fpsMapCount == 5 and f.world.lowGfx)
+    assert(m.foreground.Image == "" and m.foreground.BackgroundColor3 == "140:140:140")
+    assert(m.background.BackgroundColor3 == "90:90:90" and m.shadow.BackgroundTransparency == 1)
+    assert(m.leaves.Image == "" and m.shade.BackgroundTransparency == 1)
+    for _, image in ipairs(m.infrastructure) do assert(image.Image == "atlas-original" and image.BackgroundTransparency == 1) end
+    for _, image in ipairs({m.avatar, m.hud, m.sky, m.contents}) do assert(image.Image == "atlas-original") end
+    assert(drop.frame.Parent == m.root and #f.requests == 0 and f.app.config.options.fpsBooster == false)
+    assert(m.foreground.Visible and m.foreground.Position == "original-position" and m.foreground.Size == "original-size")
+    assert(f.world.fg[8][12] == 1422 and m.records[10].tree.p == 2 and m.records[10].tree.f == 3)
+    f.app.config.options.fpsGreyMap = false
+    f.hooks.pollFPSBooster(true)
+    for _, image in ipairs({m.foreground, m.background, m.shadow, m.leaves, m.shade}) do
+        assert(image.Image == "atlas-original" and image.BackgroundColor3 == "original-color" and image.BackgroundTransparency == 1)
+    end
+    assert(not f.world.lowGfx and not f.app.fpsMapState)
+end)
+
+test("Grey map follows native pooled tile repainting, new trees and conversion to a Display Box", function()
+    local f = pickupFixture()
+    local m = attachMapVisuals(f)
+    f.app.config.options.fpsGreyMap = true
+    f.hooks.pollFPSBooster(true)
+    m.foreground.attrs.id, m.foreground.Image = 955, "current-atlas"
+    local newTree = m.frame("Frame", m.root)
+    local fruit = m.frame("ImageLabel", newTree)
+    m.records[11] = {id = 955, tree = {p = 3}, frame = newTree}
+    f.hooks.pollFPSBooster(true)
+    assert(m.foreground.Image == "" and fruit.Image == "")
+    m.background.attrs.id, m.background.Image = 1422, "display-atlas"
+    f.hooks.pollFPSBooster(true)
+    assert(m.background.Image == "display-atlas" and m.background.BackgroundTransparency == 1)
+    f.app.config.options.fpsGreyMap = false
+    f.hooks.pollFPSBooster(true)
+    assert(m.foreground.Image == "current-atlas" and fruit.Image == "atlas-original")
+    assert(m.background.Image == "display-atlas")
+end)
+
+test("Grey map preserves independent native visual updates and previously enabled low graphics", function()
+    local f = pickupFixture()
+    local m = attachMapVisuals(f)
+    f.world.lowGfx = true
+    f.app.config.options.fpsGreyMap = true
+    f.hooks.pollFPSBooster(true)
+    m.foreground.Image, m.foreground.BackgroundColor3 = "native-image", "native-color"
+    f.app.config.options.fpsGreyMap = false
+    f.hooks.pollFPSBooster(true)
+    assert(m.foreground.Image == "native-image" and m.foreground.BackgroundColor3 == "native-color" and f.world.lowGfx)
+end)
+
+test("Grey map and floating drop booster toggle independently and restore together on unload", function()
+    local f = pickupFixture()
+    local m = attachMapVisuals(f)
+    local drop = f.addDrop(1, 954, 10)
+    attachDropVisual(drop, m.root)
+    f.app.config.options.fpsGreyMap, f.app.config.options.fpsBooster = true, true
+    f.hooks.pollFPSBooster(true)
+    assert(drop.frame.Parent == nil and m.foreground.Image == "")
+    f.app.config.options.fpsBooster = false
+    f.hooks.pollFPSBooster(true)
+    assert(drop.frame.Parent == m.root and m.foreground.Image == "" and f.world.lowGfx)
+    f.app.config.options.fpsBooster, f.app.config.options.fpsGreyMap = true, false
+    f.hooks.pollFPSBooster(true)
+    assert(drop.frame.Parent == nil and m.foreground.Image == "atlas-original" and not f.world.lowGfx)
+    f.app.config.options.fpsGreyMap = true
+    f.hooks.pollFPSBooster(true)
+    f.app:destroy()
+    assert(drop.frame.Parent == m.root and m.foreground.Image == "atlas-original" and not f.world.lowGfx)
+end)
+
+test("Grey map restores old worlds and safely handles destroyed renderer pools", function()
+    local f = pickupFixture()
+    local old = attachMapVisuals(f)
+    f.app.config.options.fpsGreyMap = true
+    f.hooks.pollFPSBooster(true)
+    old.leaves.Parent, old.records[10] = nil, nil -- Native culling destroys a tree.
+    f.hooks.pollFPSBooster(true)
+    assert(f.app.fpsMapState.records[old.leaves] == nil)
+    local oldWorld = f.world
+    local nextWorld = {dropList = function() return {} end, lowGfx = false}
+    f.world, f.app.runtime.world = nextWorld, nextWorld
+    local nextMap = attachMapVisuals(f)
+    f.hooks.pollFPSBooster(true)
+    assert(old.foreground.Image == "atlas-original" and not oldWorld.lowGfx)
+    assert(nextMap.foreground.Image == "" and nextWorld.lowGfx)
+    f.app.config.options.fpsGreyMap = false
+    f.hooks.pollFPSBooster(true)
+    assert(nextMap.foreground.Image == "atlas-original" and not nextWorld.lowGfx)
+end)
+
+test("Grey map catches new tile pools on its yielded periodic scan", function()
+    local f = pickupFixture()
+    local m = attachMapVisuals(f)
+    f.app.config.options.fpsGreyMap = true
+    f.hooks.pollFPSBooster(true)
+    for i = 1, 2000 do m.frame("ImageLabel", m.root, 954, 4) end
+    f.hooks.pollFPSBooster()
+    assert(f.app.fpsMapCount == 5)
+    task.wait(1.1)
+    local before = f.waits or 0
+    f.hooks.pollFPSBooster()
+    assert((f.waits or 0) > before and f.app.fpsMapCount == 2005 and not f.app.fpsMapError)
+end)
+
+test("Grey map renderer and property failures report diagnostics while keeping rotation alive", function()
+    local f = pickupFixture()
+    f.app.config.options.fpsGreyMap = true
+    f.hooks.pollFPSBooster(true)
+    assert(f.app.fpsMapError and not f.app.fpsMapState and f.app.alive)
+    local m = attachMapVisuals(f)
+    m.foreground.deny = "BackgroundColor3"
+    f.hooks.pollFPSBooster(true)
+    assert(f.app.fpsMapError:find("Visual write denied", 1, true) and f.app.job == "transfer" and f.app.alive)
+    assert(not f.world.lowGfx and m.foreground.Image == "atlas-original")
+    m.foreground.deny = nil
+    f.hooks.pollFPSBooster(true)
+    assert(not f.app.fpsMapError and m.foreground.Image == "")
+end)
+
+test("Grey map restores textures before script reload and retains the account preference", function()
+    local f = pickupFixture()
+    local m = attachMapVisuals(f)
+    f.app.config.options.fpsGreyMap = true
+    f.hooks.pollFPSBooster(true)
+    local next = f.reload(true)
+    assert(m.foreground.Image == "atlas-original" and not f.world.lowGfx and next.App.config.options.fpsGreyMap)
+    next.App.runtime = f.app.runtime
+    next.pollFPSBooster(true)
+    assert(m.foreground.Image == "")
+    next.restoreFPSBooster()
+    assert(m.foreground.Image == "atlas-original" and not f.world.lowGfx)
+end)
+
 test("Floating PNB drops are claimed by UID without walking or double credit", function()
     local f = pickupFixture()
     f.addDrop(101, 954, 12, 9.3, 7.1)
@@ -5112,6 +5303,26 @@ test("The FPS toggle applies during an active task and saves its choice without 
     controls["FPS booster: hide floating drops"]:Set(false)
     assert(not app.config.options.fpsBooster and drop.frame.Parent == parent and app.job == "rotation" and app.pending == 1)
     assert(not f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/accounts/1234/rotation-resume.json"]).config.options.fpsBooster)
+end)
+
+test("Grey map UI persists the active account checkpoint without changing pending rotation cargo", function()
+    local f, app, controls = actualUIFixture()
+    local m = attachMapVisuals(f)
+    app.job, app.pending = "rotation", 1
+    local checkpoint = {version = 1, active = true, userId = f.player.UserId, profile = app.profile,
+        config = f.hooks.Core.validate(app.config), updatedAt = 123,
+        state = {phase = "seedDepositPending", seedCargo = 10, cycle = 2, worldIndex = 1}}
+    f.files["ClarisGrowblox/accounts/1234/rotation-resume.json"] = f.services.HttpService:JSONEncode(checkpoint)
+    local token = app.token
+    controls["FPS booster: Grey map"]:Set(true)
+    assert(app.config.options.fpsGreyMap and m.foreground.Image == "" and app.token == token and app.pending == 1)
+    local session = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/accounts/1234/session.json"])
+    local saved = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/accounts/1234/rotation-resume.json"])
+    assert(session.config.options.fpsGreyMap and saved.config.options.fpsGreyMap and not saved.config.options.fpsBooster)
+    assert(saved.updatedAt == 123 and saved.state.phase == "seedDepositPending" and saved.state.seedCargo == 10)
+    controls["FPS booster: Grey map"]:Set(false)
+    saved = f.services.HttpService:JSONDecode(f.files["ClarisGrowblox/accounts/1234/rotation-resume.json"])
+    assert(not saved.config.options.fpsGreyMap and m.foreground.Image == "atlas-original" and app.job == "rotation" and app.pending == 1)
 end)
 
 test("Use PNB seeds updates the real UI after entering farms with Select-only WindUI dropdowns", function()
