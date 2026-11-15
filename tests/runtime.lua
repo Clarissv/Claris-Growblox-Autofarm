@@ -5505,6 +5505,32 @@ test("A large discovery snapshot yields and reads each function's upvalues at mo
         "Full attachment should index the snapshot once and scan only functions for ownership")
     for _, n in pairs(reads) do assert(n == 1, "A function's upvalues were repeatedly scanned") end
 end)
+test("Deferred farming attachment reuses the live runtime and skips unrelated function upvalues",function()
+    local f=fixture()
+    prepareDiscovery(f,true)
+    local handlers=attachWorldHandlers(f,f.app.runtime.items)
+    local noise={}
+    for n=1,5000 do
+        local value=n
+        local fn=function()return value end
+        noise[fn]=true;f.discoveryObjects[#f.discoveryObjects+1]=fn
+    end
+    local r=f.hooks.connectGame({transferOnly=true})
+    local world,body,inventory,items=r.world,r.body,r.inventory,r.items
+    local reads=0
+    getupvalues=function(fn)
+        assert(not noise[fn],"Attachment inspected unrelated function upvalues")
+        reads=reads+1
+        local values={}
+        for i=1,100 do local name,value=debug.getupvalue(fn,i);if not name then break end;values[i]=value end
+        return values
+    end
+    assert(f.hooks.attachFarming(r)==r and r.ready and not r.farmingDeferred)
+    assert(r.world==world and r.body==body and r.inventory==inventory and r.items==items and r.handlers.hit==handlers.hit)
+    assert(reads<20,"Named handler attachment should not repeat the full game scan")
+    getgc=function()error("Already-attached farming must reuse its hooks")end
+    assert(f.hooks.attachFarming(r)==r)
+end)
 
 test("Transfer attachment skips unrelated function upvalues and defers punching hooks", function()
     local f = fixture()
@@ -7123,6 +7149,12 @@ do
         local planned=B.schedule(board,m,c,now)
         for _,job in pairs(planned.jobs) do assert(job.kind~="harvest") end
     end)
+    test("A fresh farm observation without growth hooks schedules inspection instead of waiting a minute",function()
+        local B,c,m,board,now=planning()
+        board.stock.blocks=10000
+        board.farms.FARM.ripe,board.farms.FARM.growing,board.farms.FARM.maturityKnown=nil,nil,false
+        assert(B.schedule(board,m,c,now).jobs["1"].kind=="inspect")
+    end)
     test("Botting supports one harvester, two collection partitions and one planter on the same farm", function()
         local B,c,m,board,now=planning()
         m[4].role="rotation"
@@ -7292,6 +7324,18 @@ do
         f.app.job,f.app.botState="botting",{active=true}
         return f
     end
+    test("A dedicated Botting Collector starts with movement and storage without loading Planting hooks",function()
+        local f=sharedAccount(1001,nil,"collector",2)
+        f.app.config.botting.expectedAccounts=1
+        f.app.job,f.app.botState=nil,nil
+        f.app.runtime.farmingDeferred,f.app.runtime.handlers=true,{}
+        getgc=function()error("Collector startup unnecessarily scanned farming hooks")end
+        local collected=0
+        f.app.botting.api.collectBNS=function()collected=collected+1;f.app:stop()end
+        f.hooks.start("botting")
+        assert(collected==1 and not f.app.lastError,f.app.lastError)
+        assert(f.app.runtime.farmingDeferred and not f.app.runtime.handlers.plantSeed)
+    end)
     local function resumeAssignedBottingJob(role, kind, world, progress)
         local f=sharedAccount(1001,nil,role,1)
         f.app.config.botting.expectedAccounts=1
@@ -7383,6 +7427,17 @@ do
         f.app.botting.save()
         rejects(function()f.app.botting.run(1,f.app.botting.readResume())end,"interrupted Botting storage request")
         assert(f.withdrawals==0 and f.app.botting.readResume().state.storage.id==955)
+    end)
+    test("Botting fills seeds before a farm teleport without loading farm controls in BNS",function()
+        local f=bottingPlantFixture(0)
+        f.world.name,f.world.fg="STOCK",f.grids.STOCK
+        f.app.runtime.farmingDeferred=true
+        f.app.botState.plant={phase="stock",worldIndex=1,skipped={}}
+        getgc=function()error("Stock refill should not scan Planting hooks")end
+        f.onEnter=function(name)if name=="FARM1"then f.app:stop()end;return true end
+        rejects(function()f.app.botting.api.plant({world="FARM1"},1)end,"Stopped")
+        assert(f.withdrawals==1 and f.serverSeeds==100 and f.app.botState.plant.phase=="farm")
+        assert(f.app.runtime.farmingDeferred)
     end)
     test("Botting shared instances see each other and elect exactly one leader", function()
         local a=sharedAccount(1001,nil,"breaker",1)
@@ -7616,6 +7671,73 @@ do
         assert(f.app.stats.trips==3 and f.app.stats.moved==600 and #f.storageCalls==9)
         assert(f.storageCalls[1].id==nil and f.storageCalls[2].amount==200 and f.storageCalls[3].amount==200)
         assert(f.inventory:count(954)==0 and f.inventory:count(955)==0 and not f.app.botState.storage)
+    end)
+    test("Botting retries explicitly distant withdrawals and deposits from closer supported positions",function()
+        local f=dualFixture()
+        local server,refusals=f.server,0
+        f.server=function(name,x,y,...)
+            if name=="DisplayItem" and math.abs(f.avatar.x-(x+0.5))>=0.75 then
+                refusals=refusals+1
+                return false,"Get closer to the Display Box."
+            end
+            return server(name,x,y,...)
+        end
+        f.app.botting.api.transferBoth({world="FARM"},1)
+        assert(refusals>0 and f.boxes[12][1][2]==600 and f.boxes[8][1][2]==450 and f.app.stats.trips==3)
+        assert(not f.app.botState.storage and f.app.pending==0 and f.app.storageApproachDebug)
+        assert(#f.storageCalls==9,"Confirmed deposits must not be duplicated")
+    end)
+    test("Repeated Display Box proximity refusals stop after three requests without claiming a deposit",function()
+        local f=dualFixture()
+        f.world.name="BREAK";f.inventory:add(954,10)
+        local server,requests=f.server,0
+        f.server=function(name,...)
+            if name=="DisplayItem" then requests=requests+1;return false,"Get closer to the Display Box." end
+            return server(name,...)
+        end
+        rejects(function()f.hooks.deposit(f.app.config.points.blockBox,954,10,1)end,"Get closer")
+        assert(requests==3 and f.inventory:count(954)==10 and not f.app.botState.storage)
+        assert(#f.boxes[12]==0 and f.app.pending==0)
+    end)
+    test("A closer storage approach stays on the adjacent support when the box column has no floor",function()
+        local f=dualFixture()
+        f.world.name="BREAK";f.inventory:add(954,10)
+        f.avatar.x,f.avatar.y=11.5,9
+        f.world.fg[9][12]=0
+        f.app.runtime.body.solidAt=function(x,y)return y==9 and x~=12 end
+        local server,requests=f.server,0
+        f.server=function(name,x,y,...)
+            if name=="DisplayItem" then
+                requests=requests+1
+                if math.abs(f.avatar.x-(x+0.5))>=0.95 then return false,"Get closer to the Display Box." end
+            end
+            return server(name,x,y,...)
+        end
+        f.hooks.deposit(f.app.config.points.blockBox,954,10,1)
+        assert(requests==2 and f.avatar.x>11.5 and f.avatar.x<11.7 and f.avatar.y==9)
+        assert(f.boxes[12][1][2]==10 and f.inventory:count(954)==0)
+    end)
+    test("A saved Botting delivery unloads in BNS without connecting farm hooks",function()
+        local f=dualFixture()
+        f.world.name="BREAK";f.boxes[20]={}
+        f.inventory:add(954,200);f.inventory:add(955,200)
+        f.app.botState.phase="deliver"
+        f.app.runtime.farmingDeferred=true
+        getgc=function()error("Cargo delivery should not scan farm hooks")end
+        f.app.botting.api.collectFarm({world="FARM",partition=1,partitions=2},1)
+        assert(f.boxes[12][1][2]==200 and f.boxes[8][1][2]==200 and f.app.runtime.farmingDeferred)
+        assert(f.app.stats.trips==1 and not f.app.botState.phase and not f.app.botState.storage)
+    end)
+    test("A lost Display Box reply retains the storage checkpoint without a proximity retry",function()
+        local f=dualFixture()
+        f.world.name="BREAK";f.inventory:add(954,10)
+        local server,requests=f.server,0
+        f.server=function(name,...)
+            if name=="DisplayItem" then requests=requests+1;error("Connection lost waiting for Display Box")end
+            return server(name,...)
+        end
+        rejects(function()f.hooks.deposit(f.app.config.points.blockBox,954,10,1)end,"Connection lost")
+        assert(requests==1 and f.app.botState.storage.id==954 and f.inventory:count(954)==10)
     end)
     test("Botting preserves an interrupted seed deposit after the paired blocks have been delivered", function()
         local f=dualFixture();f.interruptSeed=true

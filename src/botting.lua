@@ -48,7 +48,7 @@ function Botting.schedule(previous, members, c, now)
             if c.rotation.farms[sensor.world] then
                 local farm = board.farms[sensor.world] or {}
                 if not farm.at or sensor.at >= farm.at then
-                    for _, key in ipairs({"at", "empty", "ripe", "growing", "remaining", "loose", "gems", "stored"}) do farm[key] = sensor[key] end
+                    for _, key in ipairs({"at", "empty", "ripe", "growing", "remaining", "loose", "gems", "stored", "maturityKnown"}) do farm[key] = sensor[key] end
                     board.farms[sensor.world] = farm
                 end
             end
@@ -173,7 +173,7 @@ function Botting.schedule(previous, members, c, now)
             if not assigned and farmWorker and level >= 10 and member.role ~= "collector" and stockFresh then
                 for _, world in ipairs(c.planting.worlds) do
                     local farm = board.farms[world]
-                    local due = not farm or not farm.at or now - farm.at >= math.min(60, math.max(5, farm.remaining or 60))
+                    local due = not farm or not farm.at or farm.maturityKnown==false or now - farm.at >= math.min(60, math.max(5, farm.remaining or 60))
                     if due and not locks["inspect:" .. world .. ":0"] then assigned = issue(member, "inspect", world); break end
                 end
             end
@@ -425,6 +425,7 @@ function Botting.new(App, api)
                             assert(self.level >= 10, "Level 1-9 accounts cannot collect or move farm blocks and seeds.")
                             api.collectFarm(job, token)
                         elseif job.kind == "plant" then api.plant(job, token)
+                        elseif job.kind == "inspect" and api.inspect then api.inspect(job,token)
                         end
                         sensor, nextSensor = api.observe(), os.clock() + 3
                         state.done, state.rotation, state.plant = job.id, nil, nil

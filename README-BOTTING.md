@@ -1,6 +1,6 @@
 # Botting setup and operation
 
-For **Claris Growblox 0.1.42**. Botting coordinates accounts on one cloudphone through a shared executor folder. Each account has its own role, breaker spot and recovery checkpoint. Export the emulator's layout once, import it into every account, then choose each account's role in **Botting**.
+For **Claris Growblox 0.1.43**. Botting coordinates accounts on one cloudphone through a shared executor folder. Each account has its own role, breaker spot and recovery checkpoint. Export the emulator's layout once, import it into every account, then choose each account's role in **Botting**.
 
 ## 1. Prepare the world and accounts
 
@@ -66,6 +66,8 @@ Being on the same cloudphone does not necessarily mean cloned apps share executo
 5. Enable **Continuous Botting** on each account. Starting is blocked if fewer than the configured number of accounts are detected.
 6. Watch one short breaking/collection cycle, a storage deposit and a farm handoff before leaving it unattended.
 
+Botting initially uses the connected movement and storage hooks. Dedicated collectors and accounts arriving to deliver cargo or refill seeds do not wait for Planting hooks. Farm controls attach when an assigned task actually needs them, reusing the current world and inventory. **Connecting hooks for the assigned Botting job** is this local attachment step; game-server travel and initial world discovery can still take time.
+
 If a different layout is already active under the same team name, Botting reports a mismatch instead of overwriting that team's assignments. Import the same layout or choose a different team name for the separate operation.
 
 ## 5. How the roles work
@@ -124,6 +126,8 @@ If only one type remains, it moves that type. Each worker receives its own serve
 The transfer phase and pending storage operation are saved privately before requests and world changes. If blocks were delivered but seeds are still held, resuming the delivery phase deposits the held seeds before taking another farm batch. An explicit server rejection can retry without repeating a deposit already confirmed.
 
 An interrupted request whose outcome cannot be confirmed remains paused with its pending storage checkpoint. Check backpack and both relevant boxes before using **Clear saved Botting**. This preserves the evidence needed to avoid duplicate withdrawals or deposits.
+
+An explicit **Get closer to the Display Box** rejection retries from a closer supported position, up to three storage requests total. The script can stand on the box tile when a route and floor support exist; otherwise it steps toward the box within a neighboring supported tile. It does not change the saved layout or duplicate a confirmed deposit. A timeout or unknown server outcome keeps the pending checkpoint instead of replaying the request. **Copy diagnostics → Storage approach** shows the last closer standing tile used.
 
 ## 8. Storage policy
 

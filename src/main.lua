@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.42"
+local VERSION = "0.1.43"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -748,6 +748,39 @@ local function connectGame(options)
     App.connectionError = nil
     return result
 end
+local function attachFarming(r)
+    if not r.farmingDeferred then return r end
+    assert(type(getgc)=="function","Delta must expose getgc(true) for farming hooks.")
+    local scan,startedAt=newScan(),os.clock()
+    local handlers,ambiguous={},{}
+    local wanted={setTile=true,hit=true,canPlace=true,plantSeed=true,setTree=true}
+    -- Reuse the connected world, backpack, navigation and item definitions.
+    -- Only named farming functions need ownership/upvalue checks; scanning
+    -- every unrelated function or rebuilding the registry adds load time.
+    for _,object in pairs(getgc(true)) do
+        scanStep(scan,"Connecting farming handlers")
+        if type(object)=="function" then
+            local name=functionName(object,scan)
+            if wanted[name] and owns(object,r.world,scan) then
+                if handlers[name] and handlers[name]~=object or ambiguous[name] then
+                    handlers[name],ambiguous[name]=nil,true
+                else handlers[name]=object end
+            end
+        end
+    end
+    assert(App.alive and App.runtime==r,"The connected world changed during farming attachment.")
+    local issues={}
+    for _,issue in ipairs(r.issues or {}) do issues[#issues+1]=issue end
+    for _,name in ipairs({"setTile","hit","canPlace"}) do
+        if not handlers[name] then issues[#issues+1]=(ambiguous[name] and "Ambiguous" or "Missing").." farming handler: "..name end
+    end
+    r.treeRipe,r.harvestGear,r.treeRemaining=treeGrowthHooks(r.world,r.items,handlers,scan)
+    r.handlers,r.issues,r.ready,r.farmingDeferred=handlers,issues,#issues==0,false
+    App.farmingDiscoveryPerformance={upvalueReads=scan.reads,steps=scan.steps,seconds=os.clock()-startedAt}
+    App.discoveryReport[#App.discoveryReport+1]="Farming attachment: reused world/backpack/items; "..scan.reads
+        .." function upvalue reads; "..string.format("%.2fs",App.farmingDiscoveryPerformance.seconds)
+    return r
+end
 
 local function runtime()
     assert(App.runtime, App.connectionError or "The script has not attached to Growblox yet. Use Reconnect in Settings.")
@@ -1172,19 +1205,86 @@ end
 local function storageCount(point, id, companionId)
     return Core.storageCount(boxRows(point), id, companionId)
 end
-local function withdraw(point, id, token, companionId, onReady)
+local withdraw, deposit
+do
+local function settleStorage(point, token, refused)
+    local hold = takeControls()
+    hold.direction, hold.jump = 0, false
+    local deadline=os.clock()+0.75
+    while math.abs(position().vx or 0)>0.2 and os.clock()<deadline do pause(0.025,token) end
+    if refused then pause(0.15,token) end -- Allow the closer movement to reach the server.
+    worldCheck(point.world, token)
+end
+local function closerStorage(point, token)
+    local r, state = worldCheck(point.world, token), position()
+    local map, goals = navigationMap(r), {}
+    for y = math.max(0, point.y - 1), math.min(r.world.h - 2, point.y + 1) do
+        for x = math.max(0, point.x - 1), math.min(r.world.w - 1, point.x + 1) do
+            goals[#goals + 1] = {x=x,y=y,score=(x-point.x)^2+(y-point.y)^2}
+        end
+    end
+    table.sort(goals,function(a,b)
+        if a.score~=b.score then return a.score<b.score end
+        local ad,bd=math.abs(a.x+0.5-state.x)+math.abs(a.y+1-state.y),math.abs(b.x+0.5-state.x)+math.abs(b.y+1-state.y)
+        if ad~=bd then return ad<bd end
+        return a.y==b.y and a.x<b.x or a.y<b.y
+    end)
+    local start={x=math.floor(state.x),y=math.floor(state.y-0.01)}
+    local goal
+    for _,candidate in ipairs(goals) do
+        local route=Navigation.plan(map,start,candidate,{fullWorld=true,maxNodes=math.min(12000,map.w*map.h),
+            step=function()pause(0,token);worldCheck(point.world,token)end})
+        if route then goal=candidate;break end
+    end
+    assert(goal,"No supported storage approach reaches this Display Box. Check the nearby floor or platform.")
+    moveTo(goal.x,goal.y,point.world,token)
+    if goal.x~=point.x then
+        -- Move within the supported tile toward the box. The avatar's full
+        -- body remains inside that tile, even when the box column has no floor.
+        local target=goal.x+0.5+(point.x>goal.x and 0.18 or -0.18)
+        local hold,deadline=takeControls(),os.clock()+2
+        while os.clock()<deadline do
+            state=position()
+            assert(state.grounded and math.abs(state.y-(goal.y+1))<0.25,"Storage approach left its supported tile.")
+            if math.abs(target-state.x)<0.075 and math.abs(state.vx or 0)<0.2 then break end
+            hold.direction,hold.jump=Navigation.steer(target-state.x,state.vx or 0),false
+            pause(0.025,token)
+            worldCheck(point.world,token)
+        end
+        hold.direction,hold.jump=0,false
+    end
+    App.storageApproachDebug=point.world.." box "..point.x..", "..point.y.."; closer stand "..goal.x..", "..goal.y
+    settleStorage(point,token,true)
+end
+local function storageRequest(point, token, request)
+    for attempt=1,3 do
+        local ok,result=request()
+        if ok then return ok,result end
+        if App.botting then App.botting.afterStorage() end
+        -- Only an explicit server proximity refusal is safe to replay. A
+        -- timeout/error still propagates with its pending storage checkpoint.
+        if type(result)~="string" or not result:find("Get closer to the Display Box.",1,true) or attempt==3 then
+            return ok,result
+        end
+        setStatus("Display Box requires a closer approach; retry "..(attempt+1).."/3...")
+        closerStorage(point,token)
+    end
+end
+withdraw = function(point, id, token, companionId, onReady)
     worldCheck(point.world, token)
     moveToPoint(point, token)
+    settleStorage(point, token)
     if storageCount(point, id, companionId) == 0
         and (not companionId or storageCount(point, companionId, id) == 0) then return 0, 0 end
     refreshInventory(token)
     assert(runtime().inventory:room(id) > 0, "Your backpack has no room for this block.")
     local before, companionBefore = count(id), companionId and count(companionId) or 0
     if onReady then onReady(before) end -- Movement can fail before any storage request exists.
-    if App.botting then App.botting.beforeStorage("withdraw", point, id, nil, companionId) end
-    local ok, result = bounded(runtime().world.call, App.config.options.actionTimeout, token,
-        "DisplayItem", point.x, point.y, nil)
-    if not ok and App.botting then App.botting.afterStorage() end
+    local ok, result = storageRequest(point,token,function()
+        if App.botting then App.botting.beforeStorage("withdraw", point, id, nil, companionId) end
+        return bounded(runtime().world.call, App.config.options.actionTimeout, token,
+            "DisplayItem", point.x, point.y, nil)
+    end)
     assert(ok and type(result) == "table", type(result) == "string" and result or "Storage withdrawal failed.")
     local taken, companionTaken = 0, 0
     for _, row in pairs(result.taken or {}) do
@@ -1201,24 +1301,27 @@ local function withdraw(point, id, token, companionId, onReady)
     if App.botting then App.botting.afterStorage() end
     return taken, companionTaken
 end
-local function deposit(point, id, amount, token, onReady, companionId)
+deposit = function(point, id, amount, token, onReady, companionId)
     worldCheck(point.world, token)
     moveToPoint(point, token)
+    settleStorage(point, token)
     storageCount(point, id, companionId)
     refreshInventory(token)
     if onReady then onReady(count(id)) end
     amount = math.min(math.floor(amount), count(id))
     assert(amount > 0, "No items are available to deposit.")
     local before = count(id)
-    if App.botting then App.botting.beforeStorage("deposit", point, id, amount, companionId) end
-    local ok, result = bounded(runtime().world.call, App.config.options.actionTimeout, token,
-        "DisplayItem", point.x, point.y, id, nil, nil, amount, point.x + 0.5)
-    if not ok and App.botting then App.botting.afterStorage() end
+    local ok, result = storageRequest(point,token,function()
+        if App.botting then App.botting.beforeStorage("deposit", point, id, amount, companionId) end
+        return bounded(runtime().world.call, App.config.options.actionTimeout, token,
+            "DisplayItem", point.x, point.y, id, nil, nil, amount, point.x + 0.5)
+    end)
     assert(ok, type(result) == "string" and result or "The storage deposit was rejected.")
     refreshInventory(token)
     assert(count(id) <= before - amount, "The server did not confirm the storage deposit.")
     if App.botting then App.botting.afterStorage() end
     return amount
+end
 end
 
 local function clearResume()
@@ -1582,7 +1685,7 @@ end
 local function suspendHarvestVehicle(token)
     local r = runtime()
     if not r.world.riding or not r.world.riding.harvest then return end
-    if r.farmingDeferred then r = connectGame() end
+    if r.farmingDeferred then r = attachFarming(r) end
     local gear = r.harvestGear
     assert(gear and gear.feet(), "Remove your harvesting vehicle; equipment hooks are unavailable.")
     rememberHarvestEquipment(gear)
@@ -1623,7 +1726,7 @@ local function runTreeHarvest(token)
     end
     if r.farmingDeferred then
         setStatus("Connecting tree harvesting hooks...")
-        r = connectGame()
+        r = attachFarming(r)
         worldCheck(name, token)
     end
     assert(type(r.treeRipe) == "function", "Tree growth hooks are unavailable. Reconnect and copy diagnostics.")
@@ -3227,6 +3330,12 @@ local function runPlant(token, saved, lastWorldIndex)
             end
             local name = settings.worlds[state.worldIndex]
             enterPlantWorld(name, state, token)
+            if runtime().farmingDeferred then
+                setStatus("Connecting planting hooks in "..name.."...")
+                attachFarming(runtime())
+            end
+            assert(runtime().handlers and type(runtime().handlers.canPlace)=="function" and type(runtime().handlers.plantSeed)=="function",
+                "The seed planting hooks are unavailable. Copy diagnostics from Settings.")
             reconcilePlant(state, token)
             local r, refill, streamedRows = runtime(), false, {}
             if not state.rows then state.rows = Core.farmRows(r.world, r.items); savePlantResume(state) end
@@ -3780,11 +3889,11 @@ end
 local function start(mode, saved)
     idle()
     local r = runtime()
-    if r.farmingDeferred and (mode == "pnb" or mode == "plant" or mode == "rotation" or mode == "botting") then
+    if r.farmingDeferred and (mode == "pnb" or mode == "plant" or mode == "rotation") then
         setStatus("Connecting " .. (mode == "pnb" and "Place & Break" or "Planting") .. " hooks...")
         releaseControls()
         App.configuring = true
-        local ok, result = pcall(connectGame)
+        local ok, result = pcall(attachFarming,r)
         App.configuring = false
         if not ok then error(result, 0) end
         r = result
@@ -3792,7 +3901,7 @@ local function start(mode, saved)
     if mode == "harvest" or mode == "plant" or mode == "rotation" or mode == "botting" then
         assert(r.body and r.controls and type(r.inventory.room) == "function" and type(r.inventory.add) == "function"
             and type(r.inventory.remove) == "function", "Collection and planting need the live backpack and movement hooks.")
-        if mode == "plant" or mode == "rotation" or mode == "botting" then assert(r.handlers and type(r.handlers.canPlace) == "function" and type(r.handlers.plantSeed) == "function",
+        if mode == "plant" or mode == "rotation" then assert(r.handlers and type(r.handlers.canPlace) == "function" and type(r.handlers.plantSeed) == "function",
             "The seed planting hooks are unavailable. Copy diagnostics from Settings.") end
     else
         assert(r.ready ~= false, "Inventory loaded, but farming hooks are unavailable: " .. table.concat(r.issues or {}, " "))
@@ -4330,6 +4439,15 @@ do
         end
         return false
     end
+    function api.farming()
+        local r=runtime()
+        if r.farmingDeferred then
+            local hold=takeControls();hold.direction,hold.jump=0,false
+            setStatus("Connecting hooks for the assigned Botting job...")
+            attachFarming(r)
+        end
+    end
+    function api.inspect()api.farming()end
     function api.observe()
         local r = App.runtime
         if not r or not r.body or not r.body.state().active then return end
@@ -4348,6 +4466,7 @@ do
                 for x = row.left, row.right do if Core.plantingTile(r.world, r.items, x, row.y) then sensor.empty = sensor.empty + 1 end end
             end
             local ok, growing, ripe, remaining = pcall(Core.treeGrowth, r.world, App.config.planting.seedId, r.treeRipe, r.treeRemaining)
+            sensor.maturityKnown = ok
             if ok then sensor.growing, sensor.ripe, sensor.remaining = growing, ripe, remaining end
             for _, drop in pairs(r.world.dropList()) do
                 if not drop.display and (drop.n or 0) > 0 and not harvestDropDeferred(name, drop) then
@@ -4451,6 +4570,7 @@ do
         return blocks, seeds
     end
     function api.breakStep(token, collectOwn)
+        api.farming()
         local spot = App.config.botting.spots[App.botting.preferences.spot]
         api.go(spot.world, token); moveToPoint(spot, token)
         refreshInventory(token)
@@ -4502,6 +4622,7 @@ do
         return table.unpack(result, 2, result.n)
     end
     function api.harvest(job, token)
+        api.farming()
         return farmScope(job, token, function()
             if job.approved and not App.rotationState.harvestPass then App.rotationState.harvestPass = {world = job.world, phase = "trees"} end
             return withoutPickups(function() return runTreeHarvest(token) end)
@@ -4534,6 +4655,7 @@ do
     end
     function api.collectFarm(job, token)
         if not App.botState.phase then
+            api.farming()
             farmScope(job, token, function()
                 App.rotationState.harvestPass = {world = job.world, phase = "collect"}
                 local rows = Core.farmRows(runtime().world, runtime().items)
@@ -4578,7 +4700,7 @@ if env.ClarisGrowbloxTest then
         withdraw = withdraw, deposit = deposit, releaseControls = releaseControls,
         takeControls = takeControls, collectDrops = collectDrops, enterDoor = enterDoor,
         settleTile = settleTile, placeTile = placeTile, breakTile = breakTile, resolveRegistry = resolveRegistry,
-        discover = discover, connectGame = connectGame, runtime = runtime, resolveItems = resolveItems,
+        discover = discover, connectGame = connectGame, attachFarming = attachFarming, runtime = runtime, resolveItems = resolveItems,
         syncRunToggles = syncRunToggles, setRunningEnabled = setRunningEnabled,
         Navigation = Navigation, navigationMap = navigationMap, moveTo = moveTo, worldCheck = worldCheck,
         recoverPNB = recoverPNB, recoverable = recoverable, installAntiAFK = installAntiAFK,
@@ -5426,6 +5548,7 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nBotting job: " .. (App.botState and App.botState.job and (App.botState.job.kind .. " in " .. App.botState.job.world) or "idle")
         .. "\nFPS setting save: " .. (App.fpsSaveError or "ready")
         .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
+        .. "\nStorage approach: " .. (App.storageApproachDebug or "saved standing tile")
         .. "\nLast refused harvest pickup: " .. (App.lastHarvestRefusal or "none")
         .. "\nHarvest collection recovery: " .. (App.harvestCollectionRecovery or "not requested")
         .. "\nMoving Drops item: " .. App.config.moving.item .. "; destination: " .. pointText("moveBox")
