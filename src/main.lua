@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.40"
+local VERSION = "0.1.41"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -4464,9 +4464,9 @@ do
         if collectOwn then pickupStep(spot, token, false, App.botting.level >= 10) end
     end
     function api.collectBNS(token, alsoBreak)
-        local anchor = collectorAnchor()
+        local anchor = alsoBreak and App.config.botting.spots[App.botting.preferences.spot] or collectorAnchor()
         moveToPoint(anchor, token)
-        if alsoBreak then api.breakStep(token, false); moveToPoint(anchor, token) end
+        if alsoBreak then api.breakStep(token, false) end
         pickupStep(anchor, token, true, true)
         if count(App.config.blockId) >= 200 or count(App.config.planting.seedId) >= App.config.options.seedThreshold then
             unloadBNS(token); moveToPoint(anchor, token)

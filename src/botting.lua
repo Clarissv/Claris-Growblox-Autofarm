@@ -370,7 +370,8 @@ function Botting.new(App, api)
         assert(App.config.botting.spots[self.preferences.spot], "Choose a saved Botting breaker spot for this account.")
         self.preferences.autoStart, connected = true, true
         self.savePreferences(); self.save(); api.queue()
-        api.go(App.config.botting.world, token)
+        -- Observe and renew the saved lease where the account arrived. Sending
+        -- every reload to BNS first loops forever when farm entry teleports.
         self.poll(true)
         assert(not self.error, self.error)
         if self.detectedCount < App.config.botting.expectedAccounts then
@@ -410,7 +411,12 @@ function Botting.new(App, api)
                         else api.breakStep(token, job.collectOwn) end
                     else
                         api.status("Botting " .. job.kind .. ": " .. job.world .. "...")
-                        api.go(job.world, token)
+                        -- Refill and delivery phases own their world travel.
+                        -- Forcing their farm destination before those phases
+                        -- runs creates another farm/BNS loop after a teleport.
+                        if job.kind ~= "plant" and not (job.kind == "collect" and state.phase) then
+                            api.go(job.world, token)
+                        end
                         self.guard()
                         if job.kind == "harvest" then
                             assert(self.level >= 10 and api.hasHarvester(), "Only level 10+ accounts owning a harvesting vehicle can harvest.")

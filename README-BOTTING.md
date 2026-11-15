@@ -1,6 +1,6 @@
 # Botting setup and operation
 
-For **Claris Growblox 0.1.40**. Botting coordinates accounts on one cloudphone through a shared executor folder. Each account has its own role, breaker spot and recovery checkpoint. Export the emulator's layout once, import it into every account, then choose each account's role in **Botting**.
+For **Claris Growblox 0.1.41**. Botting coordinates accounts on one cloudphone through a shared executor folder. Each account has its own role, breaker spot and recovery checkpoint. Export the emulator's layout once, import it into every account, then choose each account's role in **Botting**.
 
 ## 1. Prepare the world and accounts
 
@@ -49,6 +49,8 @@ Example for three breaker circles and four accounts:
 
 Each account chooses **This account's role** and **This account's breaker spot** locally. Role changes are saved immediately in that account's folder and survive reloads and subsequent config imports.
 
+Choose the spot as well as the role after importing: new accounts initially select spot 1. Give the two Breakers spots 1 and 3 and the Rotation account spot 2 for the example above. Keep **Collector also breaks** Off for a dedicated collector; it then places no blocks.
+
 The collector may stand at the same position as an idle rotation worker. A collector that also breaks reserves its selected breaker spot; another breaker choosing that spot waits instead of placing into the same tile. If you enable **Collector also breaks**, give other BNS workers different spots or let the rotation account wait while the lane is occupied.
 
 Save the shared profile again if you change layout, world list, team name, expected team size or FPS settings and want future profile loads/exports to retain them. A role change does not require exporting the shared layout again.
@@ -84,7 +86,7 @@ Farther drops or repeated refusals trigger a short approach to a supported picku
 
 Blocks, seeds and gems are collected in batches. At a full block stack or the configured seed threshold, the collector unloads blocks into the BNS block box and seeds into the BNS seed box, then returns. Gems belong to the account that picked them up.
 
-**Collector also breaks** adds a placement/breaking step at its free selected spot. It reduces the time available for collection, so start with it Off and enable it after observing pickup throughput.
+**Collector also breaks** adds a placement/breaking step at its free selected spot. The account stays at that reserved spot for breaking and nearby pickups instead of visiting the separate collector position between every block. Supported pickup approaches and storage trips can still move it. It reduces the time available for collection, so start with it Off and enable it after observing pickup throughput.
 
 A sole collector stays in BNS while breaker accounts are producing drops. It can help farms when supply is low and no free breaker is currently producing work there.
 
@@ -143,6 +145,7 @@ While Botting runs, it saves its account's config snapshot, assigned job, planti
 - Keep using the generated GitHub loader so the queued loader URL is available.
 - If your executor cannot queue execution on teleport, configure its own auto-execute feature with that loader. The script cannot make an executor support automatic execution.
 - A normal reload with a saved running Botting preference also resumes the saved account task.
+- Reloads resume in the arrival world without a mandatory BNS trip. A delivery resumes at BNS and a planting seed refill follows its saved stock phase; neither is sent back to the farm before continuing.
 - Turning **Continuous Botting** Off or unloading disables that account's automatic restart preference. Use **Resume saved Botting** to resume explicitly.
 - **Clear saved Botting** clears that account's progress and automatic restart preference while keeping its layout and role.
 - Importing a config clears old progress and disables its restart, while preserving the local role choice.
@@ -150,6 +153,8 @@ While Botting runs, it saves its account's config snapshot, assigned job, planti
 The lowest active account ID is the current file coordinator. Active workers publish heartbeats, and farm assignments stay with their owner while the job runs. Short file-write gaps use the last valid data rather than immediately replacing a worker. A worker missing for about **90 seconds** can lose its lease and have unfinished work reassigned. An account returning with held transfer cargo unloads that cargo before accepting a different assignment.
 
 Routing and ordinary operation failures retry after five seconds. Storage or planting requests with an unconfirmed outcome retain their checkpoint for review. Check **Copy diagnostics** for the job, role, level, leader, teammate count and last error.
+
+When upgrading from 0.1.40, update the loader on all team instances, then use **Resume saved Botting** if automatic execution is unavailable. Existing configs, roles and checkpoints are compatible; the update does not require resaving every location or clearing cargo evidence.
 
 ## 10. Stronger FPS mode
 

@@ -753,7 +753,7 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.40"
+local VERSION = "0.1.41"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -5606,7 +5606,8 @@ function Botting.new(App, api)
         assert(App.config.botting.spots[self.preferences.spot], "Choose a saved Botting breaker spot for this account.")
         self.preferences.autoStart, connected = true, true
         self.savePreferences(); self.save(); api.queue()
-        api.go(App.config.botting.world, token)
+        -- Observe and renew the saved lease where the account arrived. Sending
+        -- every reload to BNS first loops forever when farm entry teleports.
         self.poll(true)
         assert(not self.error, self.error)
         if self.detectedCount < App.config.botting.expectedAccounts then
@@ -5646,7 +5647,12 @@ function Botting.new(App, api)
                         else api.breakStep(token, job.collectOwn) end
                     else
                         api.status("Botting " .. job.kind .. ": " .. job.world .. "...")
-                        api.go(job.world, token)
+                        -- Refill and delivery phases own their world travel.
+                        -- Forcing their farm destination before those phases
+                        -- runs creates another farm/BNS loop after a teleport.
+                        if job.kind ~= "plant" and not (job.kind == "collect" and state.phase) then
+                            api.go(job.world, token)
+                        end
                         self.guard()
                         if job.kind == "harvest" then
                             assert(self.level >= 10 and api.hasHarvester(), "Only level 10+ accounts owning a harvesting vehicle can harvest.")
@@ -5843,9 +5849,9 @@ end)()
         if collectOwn then pickupStep(spot, token, false, App.botting.level >= 10) end
     end
     function api.collectBNS(token, alsoBreak)
-        local anchor = collectorAnchor()
+        local anchor = alsoBreak and App.config.botting.spots[App.botting.preferences.spot] or collectorAnchor()
         moveToPoint(anchor, token)
-        if alsoBreak then api.breakStep(token, false); moveToPoint(anchor, token) end
+        if alsoBreak then api.breakStep(token, false) end
         pickupStep(anchor, token, true, true)
         if count(App.config.blockId) >= 200 or count(App.config.planting.seedId) >= App.config.options.seedThreshold then
             unloadBNS(token); moveToPoint(anchor, token)

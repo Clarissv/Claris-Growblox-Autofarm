@@ -1,6 +1,6 @@
 # Full Rotation guide
 
-For **Claris Growblox 0.1.40**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
+For **Claris Growblox 0.1.41**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
 
 For coordinated accounts on one cloudphone, use the separate **Botting** tab and [Botting guide](README-BOTTING.md). Its imported layout is shared, while each account chooses a private role and breaker spot. It supports BNS boxes in different positions, shared farm jobs and paired block/seed transfers. The steps below describe the existing Full Rotation mode.
 

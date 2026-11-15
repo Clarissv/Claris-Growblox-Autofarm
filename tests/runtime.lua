@@ -7271,6 +7271,50 @@ do
         f.app.job,f.app.botState="botting",{active=true}
         return f
     end
+    local function resumeAssignedBottingJob(role, kind, world, progress)
+        local f=sharedAccount(1001,nil,role,1)
+        f.app.config.botting.expectedAccounts=1
+        f.app.botting.connect()
+        local job={id="1001:50",kind=kind,world="FARM",owner=1001,partition=1,partitions=2}
+        local board=f.app.botting.board
+        board.jobs["1001"]=job
+        f.files["ClarisGrowblox/teams/BNS/board.json"]=f.services.HttpService:JSONEncode(board)
+        f.app.botState={active=true,job=job,phase=progress and progress.phase,plant=progress and progress.plant}
+        f.app.botting.save()
+        local saved=f.app.botting.readResume()
+        local oldRuntime=f.app.runtime
+        local next=f.reload(true)
+        f.app,f.hooks=next.App,next
+        f.app.runtime,f.app.job,f.app.token=oldRuntime,"botting",1
+        f.world.name=world
+        local called=0
+        f.app.botting.api.go=function(name)
+            assert(name==world,"Reload tried to leave "..world.." for "..name.." before resuming "..kind)
+        end
+        f.app.botting.api.hasHarvester=function()return true end
+        f.app.botting.api[kind=="collect" and "collectFarm" or kind]=function(assigned)
+            assert(assigned.id==job.id and f.world.name==world)
+            assert(f.app.botState.phase==(progress and progress.phase))
+            assert((f.app.botState.plant and f.app.botState.plant.phase)==(progress and progress.plant and progress.plant.phase))
+            called=called+1
+            f.app:stop()
+        end
+        f.app.botting.api.observe=function()return {at=os.time(),world=world,empty=0,ripe=0,growing=1,remaining=600,loose=0,gems=0,stored=0}end
+        rejects(function()f.app.botting.run(1,saved)end,"Stopped")
+        assert(called==1,"Saved farm job did not run after arrival")
+    end
+    test("A reloaded assisting Breaker resumes farm harvest without returning to BNS first",function()
+        resumeAssignedBottingJob("breaker","harvest","FARM")
+    end)
+    test("A reloaded Rotation account resumes collection without returning to BNS first",function()
+        resumeAssignedBottingJob("rotation","collect","FARM")
+    end)
+    test("Botting resumes transfer delivery in BNS without revisiting the source farm",function()
+        resumeAssignedBottingJob("breaker","collect","BREAK",{phase="deliver"})
+    end)
+    test("Botting resumes planting seed refill in BNS without first returning to the farm",function()
+        resumeAssignedBottingJob("rotation","plant","BREAK",{plant={phase="stock",worldIndex=1,skipped={}}})
+    end)
     test("Botting shared instances see each other and elect exactly one leader", function()
         local a=sharedAccount(1001,nil,"breaker",1)
         a.app.botting.connect()
@@ -7334,6 +7378,33 @@ do
         assert(#f.requests==3 and #f.drops==0 and f.avatar.x==10.5 and f.avatar.y==9)
         assert(f.inventory:count(954)==10 and f.inventory:count(955)==10 and f.app.stats.gems==25)
         assert(f.app.controls.pausePickup)
+    end)
+    test("A Collector that also breaks stays at its reserved spot between placement and pickup",function()
+        local f=fixture();configureBot(f)
+        f.app.job,f.app.botState,f.app.botting.level="botting",{active=true},20
+        f.app.botting.preferences.spot=3
+        f.avatar.x,f.avatar.y=11.5,9
+        f.inventory:add(954,1)
+        for x=0,29 do f.world.fg[9][x]=2 end
+        f.app.runtime.body.solidAt=function(_,y)return y==9 end
+        local minX,maxX,blocks,placed=11.5,11.5,1,{}
+        f.onWait=function(seconds)
+            local dir=f.controls.dir()
+            f.avatar.vx,f.avatar.x=dir*7.2,f.avatar.x+dir*7.2*seconds
+            minX,maxX=math.min(minX,f.avatar.x),math.max(maxX,f.avatar.x)
+        end
+        f.server=function(name)
+            assert(name=="GetInventory")
+            return {slots=blocks>0 and {{954,blocks}} or {},capacity=54}
+        end
+        f.app.runtime.handlers={canPlace=function()return true end,
+            setTile=function(_,x,y,id)
+                placed[#placed+1]={x=x,y=y};f.world.fg[y][x]=id;blocks=blocks-1
+            end,
+            hit=function(x,y)f.world.fg[y][x]=0 end}
+        f.app.botting.api.collectBNS(1,true)
+        assert(#placed==1 and placed[1].x==11 and placed[1].y==7 and f.app.stats.broken==1)
+        assert(minX==11.5 and maxX==11.5,"Collector unnecessarily crossed to its separate middle anchor")
     end)
     test("Botting Breaker completes its block without taking or waiting for the resulting drops", function()
         local f=fixture();configureBot(f)
