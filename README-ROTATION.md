@@ -1,6 +1,8 @@
 # Full Rotation guide
 
-For **Claris Growblox 0.1.39**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
+For **Claris Growblox 0.1.40**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
+
+For coordinated accounts on one cloudphone, use the separate **Botting** tab and [Botting guide](README-BOTTING.md). Its imported layout is shared, while each account chooses a private role and breaker spot. It supports BNS boxes in different positions, shared farm jobs and paired block/seed transfers. The steps below describe the existing Full Rotation mode.
 
 The usual flow is **fill planting space → collect existing farm stock if needed → PNB while trees grow → harvest a ready farm → transfer its blocks and seeds → replant that farm → repeat**. Planting and ready harvests normally take priority over breaking. When the planting seed supply is exhausted, rotation finishes the full PNB block stock first. A full farm skips planting even when seed storage contains thousands of seeds.
 
@@ -205,6 +207,8 @@ From v0.1.28, a refill or saved resume keeps moving planting on the unfinished r
 For worlds with many scattered drops, enable **Settings → FPS booster: hide floating drops**. It hides loose block, seed and gem sprites and stops their bobbing/pop visuals while automation keeps using their pickup data. Display Boxes remain visible. You can toggle it during rotation; it saves to the session and matching task checkpoints without changing pending cargo or progress, and applies after supported world-change resumes. Save the named profile to retain it when loading that profile or exporting to another device. New drops are hidden on a periodic scan, roughly once per second. Normal Stop keeps the boost active; switching it Off or unloading restores surviving visuals. Harvest collects selected blocks, matching seeds and gems; PNB also collects nearby gems. Live FPS improvement depends on the device and native client workload.
 
 For a plain grey map, also enable **Settings → FPS booster: Grey map**. It removes map and nearby tree textures, uses grey shapes, and temporarily enables native local low graphics to reduce distant tree rendering and cosmetic effects. Sky/background, avatar, controls, doors, locks, access areas, Display Boxes and their contents remain visible. Tree maturity, world collision, harvesting, planting and collection data stay intact. This toggle works independently of hiding drops and follows the same session, checkpoint, profile and export/import rules. Turn it Off, unload or reload to restore current surviving textures and the previous local graphics flag. Copy diagnostics shows the simplified sprite count and visual errors; visual failures retry without pausing rotation.
+
+For a stronger rendering reduction, enable **Settings → FPS booster: Hide game world**. The game viewport disappears while the script menu and native farming data remain available. Local low graphics remains enabled, and per-tile grey repainting stops while the whole view is hidden. Turn it Off before saving positions or playing manually; the surviving view is restored on Off, unload, reload and reconnect. With Grey map On, revealing the view returns to grey map rendering. Save/export your profile to retain the preference.
 
 - Planting skips rows without empty supported planting tiles.
 - Harvesting skips rows without ripe selected trees or matching drops to collect.

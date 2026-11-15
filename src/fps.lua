@@ -43,10 +43,20 @@ return function(App, upvalues)
         if current ~= value then frame[key] = value end
         saved.applied = value
     end
+    local function unhide(state)
+        if not state.wrapper then return end
+        local viewport = state.viewport
+        if viewport.Parent == state.wrapper then viewport.Parent = state.viewportParent end
+        state.wrapper:Destroy()
+        state.wrapper, state.viewport, state.viewportParent = nil, nil, nil
+        App.fpsWorldHidden = false
+    end
     function Map.restore()
         local state, failed = App.fpsMapState
         App.fpsMapCount = 0
         if not state then return true end
+        local revealed, revealIssue = pcall(unhide, state)
+        if not revealed then failed = tostring(revealIssue) end
         for frame, record in pairs(state.records) do
             local ok, issue = pcall(restoreFrame, frame, record)
             if ok then state.records[frame] = nil else failed = tostring(issue) end
@@ -62,7 +72,7 @@ return function(App, upvalues)
         return true
     end
     function Map.poll(force)
-        if not App.alive or not App.config.options.fpsGreyMap then
+        if not App.alive or not (App.config.options.fpsGreyMap or App.config.options.fpsHideWorld) then
             if Map.restore() then App.fpsMapError = nil end
             return
         end
@@ -84,6 +94,24 @@ return function(App, upvalues)
                     r.world.lowGfx = true
                 end
             end
+            if App.config.options.fpsHideWorld then
+                if not state.wrapper then
+                    local viewport = state.root.Parent
+                    if gui(viewport.Parent, "GuiObject") and viewport.Parent.Name == "World" then viewport = viewport.Parent end
+                    assert(viewport.Parent, "Game viewport unavailable; retrying.")
+                    local wrapper = Instance.new("Frame")
+                    wrapper.Name, wrapper.BackgroundTransparency, wrapper.Visible = "ClarisHiddenWorld", 1, false
+                    wrapper.Size, wrapper.Position, wrapper.AnchorPoint = viewport.Size, viewport.Position, viewport.AnchorPoint
+                    wrapper.ZIndex, wrapper.LayoutOrder = viewport.ZIndex, viewport.LayoutOrder
+                    state.wrapper, state.viewport, state.viewportParent = wrapper, viewport, viewport.Parent
+                    wrapper.Parent = viewport.Parent
+                    viewport.Parent = wrapper
+                end
+                App.fpsWorldHidden = true
+                for frame, record in pairs(state.records) do restoreFrame(frame, record); state.records[frame] = nil end
+                App.fpsMapCount = 0
+                return -- Entire viewport is hidden; no per-tile grey repaint work is needed.
+            elseif state.wrapper then unhide(state) end
             local work, lastYield, count = 0, os.clock(), 0
             local function checkpoint()
                 work = work + 1
@@ -91,7 +119,7 @@ return function(App, upvalues)
                     task.wait()
                     work, lastYield = 0, os.clock()
                 end
-                return App.alive and App.config.options.fpsGreyMap and App.runtime == r and App.fpsMapState == state
+                return App.alive and App.config.options.fpsGreyMap and not App.config.options.fpsHideWorld and App.runtime == r and App.fpsMapState == state
             end
             local targets = {}
             for _, frame in ipairs(state.root:GetChildren()) do

@@ -3,7 +3,7 @@ local Core = {}
 Core.VERSION = 1
 Core.REPO = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/"
 Core.POINTS = { "pnb", "blockBox", "seedBox", "farmBox", "moveBox", "farmDoor", "breakDoor", "plantBox" }
-Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest", "harvestRespawn", "fpsBooster", "fpsGreyMap", "harvestPlanting" }
+Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest", "harvestRespawn", "fpsBooster", "fpsGreyMap", "fpsHideWorld", "harvestPlanting" }
 Core.LIMITS = {
     placeDelay = { 0.15, 2 }, punchDelay = { 0.22, 2 },
     collectDelay = { 0, 5 }, actionTimeout = { 5, 30 },
@@ -15,13 +15,15 @@ function Core.defaults()
         version = Core.VERSION, blockId = 0, points = {},
         options = { placeDelay = 0.2, punchDelay = 0.24, collectDelay = 0.1,
             actionTimeout = 10, moveTimeout = 30, seedThreshold = 200, antiAFK = true, autoRejoin = true,
-            moveAfterHarvest = false, harvestRespawn = true, fpsBooster = false, fpsGreyMap = false, harvestPlanting = false },
+            moveAfterHarvest = false, harvestRespawn = true, fpsBooster = false, fpsGreyMap = false, fpsHideWorld = false, harvestPlanting = false },
         webhook = { url = "", enabled = false, intervalMinutes = 5, includeBoxes = true,
             discordId = "", failureAlerts = true },
         planting = {seedId = 0, storageWorld = "", worlds = {}},
         harvesting = {method = "fist"},
         moving = {item = "blocks"},
         rotation = {farms = {}},
+        botting = {team = "BNS", folder = "ClarisGrowblox/teams", world = "", spots = {}, collector = nil,
+            lowWater = 6000, highWater = 36000, expectedAccounts = 4},
     }
 end
 
@@ -118,6 +120,43 @@ function Core.validatePlanting(input)
     return out
 end
 
+function Core.validateBotting(input)
+    local out = Core.defaults().botting
+    if input == nil then return out end
+    assert(type(input) == "table", "Invalid Botting configuration.")
+    out.team = Core.profileName(input.team)
+    local android = type(input.folder) == "string" and (input.folder:match("^/sdcard/") or input.folder:match("^/storage/emulated/%d+/"))
+    assert(type(input.folder) == "string" and #input.folder <= 160
+        and input.folder:match("^[%w_/%-]+$") and (not input.folder:match("^/") or android)
+        and not input.folder:match("//$") and not input.folder:find("//", 1, true),
+        "Use a relative shared folder or Android shared-storage path with letters, digits, slashes, underscores or hyphens.")
+    out.folder = input.folder:gsub("/$", "")
+    assert(out.folder ~= "", "Enter the shared team folder.")
+    assert(type(input.world) == "string", "Invalid BNS world.")
+    out.world = input.world == "" and "" or Core.worldName(input.world)
+    assert(integer(input.lowWater, 0, 200000) and integer(input.highWater, 1, 1000000)
+        and input.lowWater < input.highWater, "Botting storage limits must satisfy low < high.")
+    out.lowWater, out.highWater = input.lowWater, input.highWater
+    assert(integer(input.expectedAccounts or 4, 1, 12), "Botting team size must be 1-12 accounts.")
+    out.expectedAccounts = input.expectedAccounts or 4
+    assert(type(input.spots) == "table" and #input.spots <= 12, "Save at most 12 Botting breaker spots.")
+    local function point(value)
+        assert(type(value) == "table" and value.world == out.world and integer(value.x, 0, 65535)
+            and integer(value.y, 1, 65535), "Invalid Botting spot or world.")
+        return {world = out.world, x = value.x, y = value.y}
+    end
+    local seen = {}
+    for index, value in pairs(input.spots) do
+        assert(integer(index, 1, #input.spots), "Invalid Botting spot list.")
+        local copy = point(value)
+        local key = copy.x .. ":" .. copy.y
+        assert(not seen[key], "Duplicate Botting breaker spot.")
+        seen[key], out.spots[index] = true, copy
+    end
+    if input.collector then out.collector = point(input.collector) end
+    return out
+end
+
 function Core.validate(input)
     assert(type(input) == "table" and input.version == Core.VERSION, "Unsupported or damaged profile.")
     assert(integer(input.blockId, 0, 65535), "Invalid block ID in profile.")
@@ -125,6 +164,7 @@ function Core.validate(input)
     local out = Core.defaults()
     out.webhook = Core.validateWebhook(input.webhook)
     out.planting = Core.validatePlanting(input.planting)
+    out.botting = Core.validateBotting(input.botting)
     if input.moving ~= nil then
         assert(type(input.moving) == "table" and (input.moving.item == "blocks" or input.moving.item == "seeds"),
             "Invalid Moving Drops item.")
@@ -358,7 +398,24 @@ function Core.transferDestination(config)
 end
 
 function Core.checkSetup(config, mode, items)
-    assert(mode == "pnb" or mode == "transfer" or mode == "harvest" or mode == "plant" or mode == "rotation", "Unknown farming task.")
+    assert(mode == "pnb" or mode == "transfer" or mode == "harvest" or mode == "plant" or mode == "rotation" or mode == "botting", "Unknown farming task.")
+    if mode == "botting" then
+        local b, p = Core.validateBotting(config.botting), config.points
+        assert(Core.farmable(items[config.blockId]), "Choose a farmable Botting block.")
+        assert(b.world ~= "" and #b.spots > 0, "Save the BNS world and breaker spots on Botting first.")
+        assert(p.blockBox and p.seedBox and p.blockBox.world == b.world and p.seedBox.world == b.world,
+            "Save both BNS Display Boxes in the Botting world.")
+        assert(p.blockBox.x ~= p.seedBox.x or p.blockBox.y ~= p.seedBox.y, "Use separate BNS block and seed boxes.")
+        if p.breakDoor then assert(p.breakDoor.world == b.world, "Save the BNS shortcut door in the BNS world.") end
+        Core.checkSetup(config, "plant", items)
+        assert(config.planting.seedId == Core.seedId(items, config.blockId), "Botting planting seed must match the selected block.")
+        assert(p.plantBox.world == b.world and p.plantBox.x == p.seedBox.x and p.plantBox.y == p.seedBox.y,
+            "Use the BNS seed box as planting storage.")
+        for _, name in ipairs(config.planting.worlds) do
+            assert(config.rotation.farms[name], "Save the farm harvest Display Box in " .. name)
+        end
+        return true
+    end
     if mode == "rotation" then
         Core.checkSetup(config, "plant", items)
         Core.checkSetup(config, "pnb", items)

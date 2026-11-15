@@ -541,4 +541,50 @@ test("Legacy webhook settings default to failure alerts without a ping and prese
     rejects(function() Core.validate(saved) end,"failure alert toggle")
 end)
 
+test("Botting accepts independent upper seed storage and portable multiple breaker spots", function()
+    local c = setup()
+    c.planting = {seedId = 955, storageWorld = "BREAK", worlds = {"FARM"}}
+    c.points.seedBox = box("BREAK", 24, 6)
+    c.points.blockBox = box("BREAK", 24, 8)
+    c.points.plantBox = c.points.seedBox
+    c.rotation.farms.FARM = c.points.farmBox
+    c.botting.world = "BREAK"
+    c.botting.spots = {{world="BREAK", x=19, y=8}, {world="BREAK", x=20, y=8}, {world="BREAK", x=21, y=8}}
+    c.botting.collector = {world="BREAK", x=20, y=8}
+    assert(Core.checkSetup(c, "botting", items))
+    rejects(function() Core.checkSetup(c, "pnb", items) end, "Layout")
+    local imported = Core.importConfig(Core.exportConfig(c, "Team", "0.1.40"))
+    assert(#imported.botting.spots == 3 and imported.botting.collector.x == 20 and imported.botting.role == nil)
+    imported.botting.spots[1].x = 5
+    assert(c.botting.spots[1].x == 19)
+end)
+test("Botting rejects duplicate spots, foreign storage, unsafe shared paths and invalid limits", function()
+    local c = Core.defaults()
+    c.botting.world = "BREAK"
+    c.botting.spots = {{world="BREAK",x=2,y=8},{world="BREAK",x=2,y=8}}
+    rejects(function() Core.validate(c) end, "Duplicate")
+    c.botting.spots = {}
+    for _, folder in ipairs({"../teams", "/teams", "C:/teams", "teams//group"}) do
+        c.botting.folder = folder; rejects(function() Core.validate(c) end, "relative shared folder")
+    end
+    c.botting.folder = "ClarisGrowblox/teams"
+    c.botting.highWater = c.botting.lowWater
+    rejects(function() Core.validate(c) end, "low < high")
+end)
+test("Botting can use an executor-supported Android shared folder without changing private account storage", function()
+    local c=Core.defaults()
+    for _,path in ipairs({"/sdcard/ClarisGrowblox/teams","/storage/emulated/0/ClarisGrowblox/teams"}) do
+        c.botting.folder=path;assert(Core.validate(c).botting.folder==path)
+    end
+end)
+test("Older configs default to Botting disabled and both map FPS options remain portable", function()
+    local c = setup()
+    c.botting, c.options.fpsHideWorld = nil, nil
+    local old = Core.validate(c)
+    assert(#old.botting.spots == 0 and old.botting.world == "" and not old.options.fpsHideWorld)
+    c.options.fpsHideWorld = true
+    local imported = Core.importConfig(Core.exportConfig(c, "Hidden", "0.1.40"))
+    assert(imported.options.fpsHideWorld and not imported.options.fpsGreyMap)
+end)
+
 return string.format("%d configuration/layout/storage tests passed", passed)

@@ -5,7 +5,7 @@ local Core = {}
 Core.VERSION = 1
 Core.REPO = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/"
 Core.POINTS = { "pnb", "blockBox", "seedBox", "farmBox", "moveBox", "farmDoor", "breakDoor", "plantBox" }
-Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest", "harvestRespawn", "fpsBooster", "fpsGreyMap", "harvestPlanting" }
+Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest", "harvestRespawn", "fpsBooster", "fpsGreyMap", "fpsHideWorld", "harvestPlanting" }
 Core.LIMITS = {
     placeDelay = { 0.15, 2 }, punchDelay = { 0.22, 2 },
     collectDelay = { 0, 5 }, actionTimeout = { 5, 30 },
@@ -17,13 +17,15 @@ function Core.defaults()
         version = Core.VERSION, blockId = 0, points = {},
         options = { placeDelay = 0.2, punchDelay = 0.24, collectDelay = 0.1,
             actionTimeout = 10, moveTimeout = 30, seedThreshold = 200, antiAFK = true, autoRejoin = true,
-            moveAfterHarvest = false, harvestRespawn = true, fpsBooster = false, fpsGreyMap = false, harvestPlanting = false },
+            moveAfterHarvest = false, harvestRespawn = true, fpsBooster = false, fpsGreyMap = false, fpsHideWorld = false, harvestPlanting = false },
         webhook = { url = "", enabled = false, intervalMinutes = 5, includeBoxes = true,
             discordId = "", failureAlerts = true },
         planting = {seedId = 0, storageWorld = "", worlds = {}},
         harvesting = {method = "fist"},
         moving = {item = "blocks"},
         rotation = {farms = {}},
+        botting = {team = "BNS", folder = "ClarisGrowblox/teams", world = "", spots = {}, collector = nil,
+            lowWater = 6000, highWater = 36000, expectedAccounts = 4},
     }
 end
 
@@ -120,6 +122,43 @@ function Core.validatePlanting(input)
     return out
 end
 
+function Core.validateBotting(input)
+    local out = Core.defaults().botting
+    if input == nil then return out end
+    assert(type(input) == "table", "Invalid Botting configuration.")
+    out.team = Core.profileName(input.team)
+    local android = type(input.folder) == "string" and (input.folder:match("^/sdcard/") or input.folder:match("^/storage/emulated/%d+/"))
+    assert(type(input.folder) == "string" and #input.folder <= 160
+        and input.folder:match("^[%w_/%-]+$") and (not input.folder:match("^/") or android)
+        and not input.folder:match("//$") and not input.folder:find("//", 1, true),
+        "Use a relative shared folder or Android shared-storage path with letters, digits, slashes, underscores or hyphens.")
+    out.folder = input.folder:gsub("/$", "")
+    assert(out.folder ~= "", "Enter the shared team folder.")
+    assert(type(input.world) == "string", "Invalid BNS world.")
+    out.world = input.world == "" and "" or Core.worldName(input.world)
+    assert(integer(input.lowWater, 0, 200000) and integer(input.highWater, 1, 1000000)
+        and input.lowWater < input.highWater, "Botting storage limits must satisfy low < high.")
+    out.lowWater, out.highWater = input.lowWater, input.highWater
+    assert(integer(input.expectedAccounts or 4, 1, 12), "Botting team size must be 1-12 accounts.")
+    out.expectedAccounts = input.expectedAccounts or 4
+    assert(type(input.spots) == "table" and #input.spots <= 12, "Save at most 12 Botting breaker spots.")
+    local function point(value)
+        assert(type(value) == "table" and value.world == out.world and integer(value.x, 0, 65535)
+            and integer(value.y, 1, 65535), "Invalid Botting spot or world.")
+        return {world = out.world, x = value.x, y = value.y}
+    end
+    local seen = {}
+    for index, value in pairs(input.spots) do
+        assert(integer(index, 1, #input.spots), "Invalid Botting spot list.")
+        local copy = point(value)
+        local key = copy.x .. ":" .. copy.y
+        assert(not seen[key], "Duplicate Botting breaker spot.")
+        seen[key], out.spots[index] = true, copy
+    end
+    if input.collector then out.collector = point(input.collector) end
+    return out
+end
+
 function Core.validate(input)
     assert(type(input) == "table" and input.version == Core.VERSION, "Unsupported or damaged profile.")
     assert(integer(input.blockId, 0, 65535), "Invalid block ID in profile.")
@@ -127,6 +166,7 @@ function Core.validate(input)
     local out = Core.defaults()
     out.webhook = Core.validateWebhook(input.webhook)
     out.planting = Core.validatePlanting(input.planting)
+    out.botting = Core.validateBotting(input.botting)
     if input.moving ~= nil then
         assert(type(input.moving) == "table" and (input.moving.item == "blocks" or input.moving.item == "seeds"),
             "Invalid Moving Drops item.")
@@ -360,7 +400,24 @@ function Core.transferDestination(config)
 end
 
 function Core.checkSetup(config, mode, items)
-    assert(mode == "pnb" or mode == "transfer" or mode == "harvest" or mode == "plant" or mode == "rotation", "Unknown farming task.")
+    assert(mode == "pnb" or mode == "transfer" or mode == "harvest" or mode == "plant" or mode == "rotation" or mode == "botting", "Unknown farming task.")
+    if mode == "botting" then
+        local b, p = Core.validateBotting(config.botting), config.points
+        assert(Core.farmable(items[config.blockId]), "Choose a farmable Botting block.")
+        assert(b.world ~= "" and #b.spots > 0, "Save the BNS world and breaker spots on Botting first.")
+        assert(p.blockBox and p.seedBox and p.blockBox.world == b.world and p.seedBox.world == b.world,
+            "Save both BNS Display Boxes in the Botting world.")
+        assert(p.blockBox.x ~= p.seedBox.x or p.blockBox.y ~= p.seedBox.y, "Use separate BNS block and seed boxes.")
+        if p.breakDoor then assert(p.breakDoor.world == b.world, "Save the BNS shortcut door in the BNS world.") end
+        Core.checkSetup(config, "plant", items)
+        assert(config.planting.seedId == Core.seedId(items, config.blockId), "Botting planting seed must match the selected block.")
+        assert(p.plantBox.world == b.world and p.plantBox.x == p.seedBox.x and p.plantBox.y == p.seedBox.y,
+            "Use the BNS seed box as planting storage.")
+        for _, name in ipairs(config.planting.worlds) do
+            assert(config.rotation.farms[name], "Save the farm harvest Display Box in " .. name)
+        end
+        return true
+    end
     if mode == "rotation" then
         Core.checkSetup(config, "plant", items)
         Core.checkSetup(config, "pnb", items)
@@ -696,7 +753,7 @@ end
 return Navigation
 
 end)()
-local VERSION = "0.1.39"
+local VERSION = "0.1.40"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -796,7 +853,7 @@ local function saveFPSPreference()
     saveSession()
     -- A queued resume reads its own configuration snapshot. Update only this
     -- visual preference, preserving pending cargo, tile evidence and timestamps.
-    for _, path in ipairs({RESUME_FILE, PNB_RESUME_FILE, PLANT_RESUME_FILE, ROTATION_RESUME_FILE}) do
+    for _, path in ipairs({RESUME_FILE, PNB_RESUME_FILE, PLANT_RESUME_FILE, ROTATION_RESUME_FILE, ROOT .. "/botting-resume.json"}) do
         if exists(path) then
             local record = decode(readfile(path))
             if type(record) == "table" and record.active and record.userId == ACCOUNT_ID
@@ -804,6 +861,7 @@ local function saveFPSPreference()
                 record.config = Core.validate(record.config)
                 record.config.options.fpsBooster = App.config.options.fpsBooster
                 record.config.options.fpsGreyMap = App.config.options.fpsGreyMap
+                record.config.options.fpsHideWorld = App.config.options.fpsHideWorld
                 writeJSON(path, record)
             end
         end
@@ -892,9 +950,10 @@ local function idle()
     assert(not App.job and not App.configuring and App.pending == 0,
         "Stop the current task and wait for pending requests before changing setup.")
 end
-local function checkpoint(token)
+local function checkpoint(token, settling)
     assert(App.alive and App.job and token == App.token, "Stopped.")
     assert(player.UserId == ACCOUNT_ID, "The Roblox account changed. Reload the script for this account.")
+    if App.botting then App.botting.guard(settling) end
 end
 local function pause(seconds, token)
     local deadline = os.clock() + seconds
@@ -916,7 +975,7 @@ local function beginRequest(fn, ...)
 end
 local function awaitRequest(request, deadline, token)
     while not request.done do
-        if token then checkpoint(token) end
+        if token then checkpoint(token, true) end
         assert(App.alive, "Script unloaded.")
         assert(os.clock() < deadline, "Request timed out. Wait for it to finish before restarting.")
         task.wait(0.05)
@@ -1590,10 +1649,20 @@ return function(App, upvalues)
         if current ~= value then frame[key] = value end
         saved.applied = value
     end
+    local function unhide(state)
+        if not state.wrapper then return end
+        local viewport = state.viewport
+        if viewport.Parent == state.wrapper then viewport.Parent = state.viewportParent end
+        state.wrapper:Destroy()
+        state.wrapper, state.viewport, state.viewportParent = nil, nil, nil
+        App.fpsWorldHidden = false
+    end
     function Map.restore()
         local state, failed = App.fpsMapState
         App.fpsMapCount = 0
         if not state then return true end
+        local revealed, revealIssue = pcall(unhide, state)
+        if not revealed then failed = tostring(revealIssue) end
         for frame, record in pairs(state.records) do
             local ok, issue = pcall(restoreFrame, frame, record)
             if ok then state.records[frame] = nil else failed = tostring(issue) end
@@ -1609,7 +1678,7 @@ return function(App, upvalues)
         return true
     end
     function Map.poll(force)
-        if not App.alive or not App.config.options.fpsGreyMap then
+        if not App.alive or not (App.config.options.fpsGreyMap or App.config.options.fpsHideWorld) then
             if Map.restore() then App.fpsMapError = nil end
             return
         end
@@ -1631,6 +1700,24 @@ return function(App, upvalues)
                     r.world.lowGfx = true
                 end
             end
+            if App.config.options.fpsHideWorld then
+                if not state.wrapper then
+                    local viewport = state.root.Parent
+                    if gui(viewport.Parent, "GuiObject") and viewport.Parent.Name == "World" then viewport = viewport.Parent end
+                    assert(viewport.Parent, "Game viewport unavailable; retrying.")
+                    local wrapper = Instance.new("Frame")
+                    wrapper.Name, wrapper.BackgroundTransparency, wrapper.Visible = "ClarisHiddenWorld", 1, false
+                    wrapper.Size, wrapper.Position, wrapper.AnchorPoint = viewport.Size, viewport.Position, viewport.AnchorPoint
+                    wrapper.ZIndex, wrapper.LayoutOrder = viewport.ZIndex, viewport.LayoutOrder
+                    state.wrapper, state.viewport, state.viewportParent = wrapper, viewport, viewport.Parent
+                    wrapper.Parent = viewport.Parent
+                    viewport.Parent = wrapper
+                end
+                App.fpsWorldHidden = true
+                for frame, record in pairs(state.records) do restoreFrame(frame, record); state.records[frame] = nil end
+                App.fpsMapCount = 0
+                return -- Entire viewport is hidden; no per-tile grey repaint work is needed.
+            elseif state.wrapper then unhide(state) end
             local work, lastYield, count = 0, os.clock(), 0
             local function checkpoint()
                 work = work + 1
@@ -1638,7 +1725,7 @@ return function(App, upvalues)
                     task.wait()
                     work, lastYield = 0, os.clock()
                 end
-                return App.alive and App.config.options.fpsGreyMap and App.runtime == r and App.fpsMapState == state
+                return App.alive and App.config.options.fpsGreyMap and not App.config.options.fpsHideWorld and App.runtime == r and App.fpsMapState == state
             end
             local targets = {}
             for _, frame in ipairs(state.root:GetChildren()) do
@@ -1859,7 +1946,7 @@ local function walkTo(x, y, worldName, token, onStep)
     local hold = takeControls()
     local targetX, targetY = x + 0.5, y + 1
     local rotationPhase = App.rotationState and App.rotationState.phase
-    local farmNavigation = App.job == "plant" or App.job == "harvest" or App.job == "rotation"
+    local farmNavigation = App.job == "plant" or App.job == "harvest" or App.job == "rotation" or App.job == "botting"
         and (rotationPhase == "plant" or rotationPhase == "replant" or rotationPhase == "harvest"
             or rotationPhase == "harvestStock" or rotationPhase == "harvestPickupPending")
     local timeout = farmNavigation and math.max(90, App.config.options.moveTimeout) or App.config.options.moveTimeout
@@ -1981,7 +2068,7 @@ local function moveTo(x,y,worldName,token,onStep)
         local state=App.rotationState
         local pending=App.plantState and App.plantState.pending
             or state and (state.plant and state.plant.pending or state.harvestPlant and state.harvestPlant.pending)
-        if App.job~="rotation" or App.pending>0 or pending or not transientRouteFault(result[2]) or attempt==3 then
+        if (App.job~="rotation" and App.job~="botting") or App.pending>0 or pending or not transientRouteFault(result[2]) or attempt==3 then
             error(result[2],0)
         end
         worldCheck(worldName,token)
@@ -2023,8 +2110,10 @@ local function withdraw(point, id, token, companionId)
     refreshInventory(token)
     assert(runtime().inventory:room(id) > 0, "Your backpack has no room for this block.")
     local before, companionBefore = count(id), companionId and count(companionId) or 0
+    if App.botting then App.botting.beforeStorage("withdraw", point, id, nil, companionId) end
     local ok, result = bounded(runtime().world.call, App.config.options.actionTimeout, token,
         "DisplayItem", point.x, point.y, nil)
+    if not ok and App.botting then App.botting.afterStorage() end
     assert(ok and type(result) == "table", type(result) == "string" and result or "Storage withdrawal failed.")
     local taken, companionTaken = 0, 0
     for _, row in pairs(result.taken or {}) do
@@ -2038,6 +2127,7 @@ local function withdraw(point, id, token, companionId)
         "The server did not confirm blocks in your backpack.")
     if companionId then assert(count(companionId) == companionBefore + companionTaken,
         "The server did not confirm seeds in your backpack.") end
+    if App.botting then App.botting.afterStorage() end
     return taken, companionTaken
 end
 local function deposit(point, id, amount, token, onReady, companionId)
@@ -2049,11 +2139,14 @@ local function deposit(point, id, amount, token, onReady, companionId)
     amount = math.min(math.floor(amount), count(id))
     assert(amount > 0, "No items are available to deposit.")
     local before = count(id)
+    if App.botting then App.botting.beforeStorage("deposit", point, id, amount, companionId) end
     local ok, result = bounded(runtime().world.call, App.config.options.actionTimeout, token,
         "DisplayItem", point.x, point.y, id, nil, nil, amount, point.x + 0.5)
+    if not ok and App.botting then App.botting.afterStorage() end
     assert(ok, type(result) == "string" and result or "The storage deposit was rejected.")
     refreshInventory(token)
     assert(count(id) <= before - amount, "The server did not confirm the storage deposit.")
+    if App.botting then App.botting.afterStorage() end
     return amount
 end
 
@@ -2451,7 +2544,7 @@ local function runTreeHarvest(token)
     local rotation, pass = App.rotationState, App.rotationState and App.rotationState.harvestPass
     assert(not pass or pass.world == name and pass.phase == "trees", "The saved tree pass belongs to another farm or harvest stage.")
     local seedId = Core.seedId(r.items, id)
-    local planter = App.rotationState and App.config.options.harvestPlanting and makeHarvestPlanter(token) or nil
+    local planter = App.job ~= "botting" and App.rotationState and App.config.options.harvestPlanting and makeHarvestPlanter(token) or nil
     if not Core.hasTrees(r.world, seedId) then
         App.harvestMaturity = name .. ": no selected trees"
         suspendHarvestVehicle(token)
@@ -2760,7 +2853,7 @@ local function runTreeHarvest(token)
 end
 
 local function harvestDropDeferred(name, drop)
-    local rotation = App.rotationState
+    local rotation = App.rotationState or (App.job == "botting" and App.botState)
     local deferred = rotation and rotation.deferredHarvest and rotation.deferredHarvest[name]
     local key = tostring(drop.uid)
     local saved = deferred and deferred[key]
@@ -2814,6 +2907,7 @@ local function runHarvest(token)
                 and type(drop.uid) == "number" and type(drop.n) == "number" and drop.n > 0
                 and type(drop.x) == "number" and type(drop.y) == "number"
                 and not harvestDropDeferred(box.world, drop)
+                and (not App.botDropFilter or App.botDropFilter(drop))
         end
         local function deferDrop(drop, message)
             assert(rotation and App.pending == 0, message)
@@ -3567,6 +3661,7 @@ local function savePlantResume(state)
     writeJSON(PLANT_RESUME_FILE, {version = 1, active = true, userId = ACCOUNT_ID, updatedAt = os.time(),
         config = Core.validate(App.config), profile = App.profile, state = copy})
     App.plantState = state
+    if App.job == "botting" and App.botState then App.botState.plant = state; App.botting.save() end
     if App.rotationState then
         App.rotationState.plant = state
         saveRotationResume(App.rotationState)
@@ -3664,7 +3759,8 @@ enterPlantWorld = function(name, state, token, moving)
             attempts = attempts + 1
             assert(attempts <= 3, "World entry repeatedly returned to the picker: " .. name)
             assert(type(r.world.enter) == "function", "The world entry hook is unavailable.")
-            if App.rotationState then saveRotationResume(App.rotationState)
+            if App.job == "botting" then App.botting.save()
+            elseif App.rotationState then saveRotationResume(App.rotationState)
             elseif moving then
                 assert(App.resume, "Moving Drops checkpoint is missing before world entry.")
                 saveResume(App.resume.phase, App.resume.cargo, App.resume.item)
@@ -3704,6 +3800,7 @@ enterPlantWorld = function(name, state, token, moving)
     -- movement or returning to the unfinished planting/harvest position.
     suspendHarvestVehicle(token)
     takeControls()
+    if App.job == "botting" and App.botting and App.botting.shortcut and name == App.config.botting.world then App.botting.shortcut(token) end
     if not moving then refreshInventory(token) end
 end
 local function deferPlantTile(state, point, reason)
@@ -4174,6 +4271,10 @@ local function clearRotationResume()
     end
 end
 saveRotationResume = function(state)
+    if App.job == "botting" and App.botState then
+        App.botState.rotation, App.botState.deferredHarvest = state, state.deferredHarvest
+        App.rotationState = state; App.botting.save(); return
+    end
     local function copy(value)
         if type(value) ~= "table" then return value end
         local result = {}
@@ -4577,6 +4678,7 @@ function App:stop()
     self.recovering = false
     syncRunToggles()
     releaseControls()
+    if self.botting then self.botting.stop() end
     clearResume()
     clearPNBResume()
     clearPlantResume()
@@ -4596,7 +4698,7 @@ end
 local function start(mode, saved)
     idle()
     local r = runtime()
-    if r.farmingDeferred and (mode == "pnb" or mode == "plant" or mode == "rotation") then
+    if r.farmingDeferred and (mode == "pnb" or mode == "plant" or mode == "rotation" or mode == "botting") then
         setStatus("Connecting " .. (mode == "pnb" and "Place & Break" or "Planting") .. " hooks...")
         releaseControls()
         App.configuring = true
@@ -4605,10 +4707,10 @@ local function start(mode, saved)
         if not ok then error(result, 0) end
         r = result
     end
-    if mode == "harvest" or mode == "plant" or mode == "rotation" then
+    if mode == "harvest" or mode == "plant" or mode == "rotation" or mode == "botting" then
         assert(r.body and r.controls and type(r.inventory.room) == "function" and type(r.inventory.add) == "function"
             and type(r.inventory.remove) == "function", "Collection and planting need the live backpack and movement hooks.")
-        if mode == "plant" or mode == "rotation" then assert(r.handlers and type(r.handlers.canPlace) == "function" and type(r.handlers.plantSeed) == "function",
+        if mode == "plant" or mode == "rotation" or mode == "botting" then assert(r.handlers and type(r.handlers.canPlace) == "function" and type(r.handlers.plantSeed) == "function",
             "The seed planting hooks are unavailable. Copy diagnostics from Settings.") end
     else
         assert(r.ready ~= false, "Inventory loaded, but farming hooks are unavailable: " .. table.concat(r.issues or {}, " "))
@@ -4656,6 +4758,8 @@ local function start(mode, saved)
                 end
             elseif mode == "rotation" then
                 runRotation(token, saved)
+            elseif mode == "botting" then
+                harvestEquipmentScope(function() suspendHarvestVehicle(token); App.botting.run(token, saved) end)
             elseif mode == "plant" then
                 local progress = saved
                 while true do
@@ -4685,6 +4789,11 @@ local function start(mode, saved)
         App.job = nil
         App.jobToken = nil
         App.recovering = false
+        if mode == "botting" then
+            App.rotationState, App.botDropFilter = nil, nil
+            if App.botState then App.botState.active = false end
+            App.botting.poll(true)
+        end
         syncRunToggles()
         if not ok and token == App.token and App.alive then
             App.lastError = message
@@ -4801,9 +4910,14 @@ local function webhookPayload(config, profile, metrics, event)
     local job = event and event.mode or App.job
     local mode = job == "pnb" and "Place & Break" or job == "transfer" and "Moving Drops"
         or job == "harvest" and "Harvesting" or job == "plant" and "Planting" or job == "rotation" and "Full Rotation"
+        or job == "botting" and "Botting"
         or job == "connection" and "Game connection" or job == "resume" and "Resume saved task" or "Off"
     field("Farm status", mode .. (App.recovering and " (recovering)" or "") .. "\n" .. reportText(event and event.message or App.status, 600))
     field("Harvest method", config.harvesting.method == "tractor" and "Dear John Tractor" or "Fist", true)
+    if job == "botting" and App.botting then
+        field("Botting team", "Role: " .. App.botting.preferences.role .. "; spot " .. App.botting.preferences.spot
+            .. "\n" .. reportText(App.botting.debug or "Connecting", 500))
+    end
     if job == "rotation" and App.rotationState then
         local progress = App.rotationState
         field("Rotation progress", "Cycle: " .. progress.cycle .. "\nPhase: " .. progress.phase
@@ -5110,11 +5224,713 @@ local function importConfiguration(text, name)
     clearPNBResume()
     clearPlantResume()
     clearRotationResume()
+    if App.botting then App.botting.resetImport() end
     App.config, App.profile = config, profile
     App.sessionSignature, App.sessionSaveError, App.sessionRestoreError = signature, nil, nil
     resetWebhookSchedule()
     setStatus("Imported and saved profile: " .. profile .. ". Check locations, then start your task.")
     return profile
+end
+
+do
+    local Botting = (function()
+-- Shared-device job coordination. Each account owns one heartbeat file; only the
+-- elected leader publishes assignments. Cargo and role preferences stay private.
+local Botting = {}
+local roles = {breaker = true, collector = true, rotation = true}
+local function copy(value)
+    if type(value) ~= "table" then return value end
+    local out = {}
+    for key, child in pairs(value) do out[key] = copy(child) end
+    return out
+end
+function Botting.fingerprint(c)
+    local b, p = c.botting, c.points
+    local parts = {tostring(c.blockId), tostring(c.planting.seedId), b.world, tostring(b.lowWater), tostring(b.highWater), tostring(b.expectedAccounts)}
+    local function point(value)
+        parts[#parts + 1] = value and table.concat({value.world, value.x, value.y}, ":") or "-"
+    end
+    point(p.blockBox); point(p.seedBox); point(p.breakDoor); point(b.collector)
+    for _, spot in ipairs(b.spots) do point(spot) end
+    for _, world in ipairs(c.planting.worlds) do parts[#parts + 1] = world; point(c.rotation.farms[world]) end
+    return table.concat(parts, "|")
+end
+function Botting.members(records, fingerprint, now)
+    local members = {}
+    for _, record in pairs(records) do
+        if type(record) == "table" and record.version == 1 and record.fingerprint == fingerprint
+            and type(record.id) == "number" and record.id > 0 and record.id == math.floor(record.id)
+            and roles[record.role] and type(record.at) == "number" and record.at <= now + 5 and record.at >= now - 90
+            and type(record.level) == "number" and record.level >= 0 and type(record.pending or 0) == "number"
+            and (record.active == true or (record.pending or 0) > 0) then
+            members[#members + 1] = copy(record)
+        end
+    end
+    table.sort(members, function(a, b) return a.id < b.id end)
+    return members
+end
+function Botting.schedule(previous, members, c, now)
+    local board = copy(previous or {version = 1, sequence = 0, farms = {}, jobs = {}, drain = false})
+    board.version, board.at, board.leader = 1, now, members[1] and members[1].id
+    board.jobs, board.farms = board.jobs or {}, board.farms or {}
+    local previousJobs = copy(board.jobs)
+    local byId, newestStock = {}, board.stock
+    for _, member in ipairs(members) do
+        byId[tostring(member.id)] = member
+        local sensor = member.sensor
+        if type(sensor) == "table" and type(sensor.at) == "number" and sensor.at >= now - 90 then
+            if sensor.world == c.botting.world and type(sensor.blocks) == "number" and type(sensor.seeds) == "number"
+                and (not newestStock or sensor.at >= newestStock.at) then newestStock = copy(sensor) end
+            if c.rotation.farms[sensor.world] then
+                local farm = board.farms[sensor.world] or {}
+                if not farm.at or sensor.at >= farm.at then
+                    for _, key in ipairs({"at", "empty", "ripe", "growing", "remaining", "loose", "gems", "stored"}) do farm[key] = sensor[key] end
+                    board.farms[sensor.world] = farm
+                end
+            end
+        end
+    end
+    board.stock = newestStock
+    local stockFresh = newestStock and newestStock.at >= now - 90
+    local blocks, seeds = stockFresh and newestStock.blocks or nil, stockFresh and newestStock.seeds or 0
+    local seedsInTransit, heldBlocks = false, stockFresh and (newestStock.breakingTiles or 0) or 0
+    for _, member in ipairs(members) do
+        if (member.carriedSeeds or 0) > 0 then seedsInTransit = true end
+        heldBlocks = heldBlocks + (member.carriedBlocks or 0)
+    end
+    if blocks then
+        if blocks >= c.botting.highWater then board.drain = true
+        elseif blocks <= c.botting.lowWater then board.drain = false end
+        if seeds == 0 and blocks + heldBlocks > 0 and not seedsInTransit then board.seedDrain = true end
+        if blocks == 0 and heldBlocks == 0 then board.seedDrain = false end
+    end
+    local busy, locks = {}, {}
+    for owner, job in pairs(board.jobs) do
+        local member = byId[owner]
+        if not member or member.done == job.id or member.abandoned == job.id then
+            if member and member.done == job.id and job.kind == "harvest" then
+                local farm = board.farms[job.world] or {}
+                farm.harvesting, farm.harvestedAt = false, now
+                board.farms[job.world] = farm
+            end
+            if member and member.done == job.id and job.kind == "plant" then
+                local farm = board.farms[job.world] or {}
+                farm.plantAfter = now + 60; board.farms[job.world] = farm
+            end
+            if member and member.done == job.id and job.kind == "collect" then
+                local farm = board.farms[job.world] or {}
+                farm.collectTurn = (job.partition or 1) % 2 + 1; board.farms[job.world] = farm
+            end
+            board.jobs[owner] = nil
+        elseif job.kind ~= "break" and job.kind ~= "collector" and job.kind ~= "wait" then
+            busy[owner] = true
+            locks[job.kind .. ":" .. job.world .. ":" .. (job.partition or 0)] = true
+        elseif (member.pending or 0) > 0 then busy[owner] = true
+        else board.jobs[owner] = nil end
+    end
+    local activeCollector, occupied = false, {}
+    for _, member in ipairs(members) do
+        if member.active and member.role == "collector" and (member.level or 0) >= 10
+            and (not busy[tostring(member.id)] or board.jobs[tostring(member.id)].kind == "collector") then activeCollector = true end
+        if busy[tostring(member.id)] and board.jobs[tostring(member.id)].kind == "break" then occupied[member.spot or 1] = member.id end
+        if busy[tostring(member.id)] and board.jobs[tostring(member.id)].kind == "harvest" then
+            local farm = board.farms[board.jobs[tostring(member.id)].world] or {}
+            farm.harvesting = true; board.farms[board.jobs[tostring(member.id)].world] = farm
+        end
+        if member.active and member.role == "collector" and member.collectBreak and not busy[tostring(member.id)] then occupied[member.spot or 1] = member.id end
+    end
+    local function issue(member, kind, world, partition)
+        local old = previousJobs[tostring(member.id)]
+        if (kind == "break" or kind == "collector" or kind == "wait") and old and old.kind == kind and old.world == world then
+            local job = copy(old); board.jobs[tostring(member.id)] = job; return job
+        end
+        board.sequence = (board.sequence or 0) + 1
+        local job = {id = tostring(board.leader) .. ":" .. board.sequence, kind = kind, world = world,
+            owner = member.id, partition = partition, partitions = partition and 2 or nil}
+        board.jobs[tostring(member.id)] = job
+        if kind == "harvest" then job.approved = board.farms[world].harvesting == true; board.farms[world].harvesting = true end
+        locks[kind .. ":" .. world .. ":" .. (partition or 0)] = true
+        return job
+    end
+    -- Harvest-capable rotation workers get first choice of ripe farms. Other
+    -- workers can collect existing stock while this account makes new drops.
+    local ordered = copy(members)
+    table.sort(ordered, function(a, b)
+        local ap = a.role == "rotation" and a.harvester and 0 or a.role == "rotation" and 1 or 2
+        local bp = b.role == "rotation" and b.harvester and 0 or b.role == "rotation" and 1 or 2
+        return ap == bp and a.id < b.id or ap < bp
+    end)
+    for _, member in ipairs(ordered) do
+        local owner = tostring(member.id)
+        if not busy[owner] and member.active and not ((member.pending or 0) > 0) then
+            local level = member.level or 0
+            local help = blocks and blocks <= c.botting.lowWater
+            local farmWorker = member.role == "rotation" or help and member.role == "breaker"
+            -- Keep a sole collector at BNS whenever breakers are producing drops.
+            local hasBreaker = false
+            for _, other in ipairs(members) do if other.active and other.role == "breaker" and not busy[tostring(other.id)] then hasBreaker = true end end
+            if member.role == "collector" and help and not hasBreaker then farmWorker = true end
+            local assigned
+            if level >= 10 and farmWorker and stockFresh then
+                -- Drain mode still finishes loose drops and occupied farm boxes.
+                for _, world in ipairs(c.planting.worlds) do
+                    local farm = board.farms[world]
+                    if farm and ((farm.loose or 0) > 0 or (farm.gems or 0) > 0 or (farm.stored or 0) > 0
+                        or farm.harvesting and locks["harvest:" .. world .. ":0"]) then
+                        for offset = 0, 1 do
+                            local partition = ((farm.collectTurn or 1) + offset - 1) % 2 + 1
+                            if not locks["collect:" .. world .. ":" .. partition] then assigned = issue(member, "collect", world, partition); break end
+                        end
+                    end
+                    if assigned then break end
+                end
+                if not assigned and member.harvester then
+                    for _, world in ipairs(c.planting.worlds) do
+                        local farm = board.farms[world]
+                        if farm and farm.at and farm.at >= now - 90 and (farm.ripe or 0) > 0
+                            and (farm.harvesting or farm.growing == 0 and not board.drain and not board.seedDrain)
+                            and not locks["harvest:" .. world .. ":0"] then
+                            assigned = issue(member, "harvest", world); break
+                        end
+                    end
+                end
+            end
+            -- Planting is last priority. A filling/draining farm still gets its
+            -- empty dirt planted; low-level accounts are eligible for this only.
+            local canPlant = farmWorker or level < 10 or board.drain and member.role ~= "collector"
+            if not assigned and canPlant and stockFresh and seeds > 0 and not board.seedDrain then
+                for _, world in ipairs(c.planting.worlds) do
+                    local farm = board.farms[world]
+                    if farm and (farm.empty or 0) > 0 and now >= (farm.plantAfter or 0) and not locks["plant:" .. world .. ":0"] then
+                        assigned = issue(member, "plant", world); break
+                    end
+                end
+            end
+            if not assigned and farmWorker and level >= 10 and member.role ~= "collector" and stockFresh then
+                for _, world in ipairs(c.planting.worlds) do
+                    local farm = board.farms[world]
+                    local due = not farm or not farm.at or now - farm.at >= math.min(60, math.max(5, farm.remaining or 60))
+                    if due and not locks["inspect:" .. world .. ":0"] then assigned = issue(member, "inspect", world); break end
+                end
+            end
+            if not assigned then
+                if member.role == "collector" and level >= 10 then assigned = issue(member, "collector", c.botting.world)
+                elseif occupied[member.spot or 1] then assigned = issue(member, "wait", c.botting.world)
+                else
+                    occupied[member.spot or 1] = member.id
+                    assigned = issue(member, "break", c.botting.world)
+                    assigned.collectOwn = not activeCollector -- Preserve seeds/gems if the collector is unavailable.
+                end
+            end
+        end
+    end
+    return board
+end
+
+function Botting.new(App, api)
+    local self = {core = Botting, preferences = {role = "breaker", spot = 1, collectBreak = false, autoStart = false}}
+    local member, board, sensor, nextPoll, nextLevel, nextSensor, connected, polling, leaseReady
+    local memberCache = {}
+    local function path() return App.config.botting.folder .. "/" .. App.config.botting.team end
+    local function ensure()
+        api.filesystem()
+        assert(type(listfiles) == "function", "Shared Botting needs listfiles in the executor.")
+        local current = path():sub(1, 1) == "/" and "/" or ""
+        for part in path():gmatch("[^/]+") do
+            current = current == "" and part or current == "/" and current .. part or current .. "/" .. part
+            if not isfolder(current) then makefolder(current) end
+        end
+    end
+    local function read(pathname)
+        local ok, value = pcall(function() if isfile(pathname) then return api.decode(readfile(pathname)) end end)
+        if ok and type(value) == "table" then return value end
+    end
+    local function members()
+        local records = {}
+        local prior = read(path() .. "/board.json") or read(path() .. "/board.json.bak") or board
+        if prior and prior.fingerprint == Botting.fingerprint(App.config) then
+            for id, peer in pairs(prior.peers or {}) do
+                if type(peer) == "table" and type(peer.at) == "number" and (not memberCache[id] or peer.at > memberCache[id].at) then memberCache[id] = peer end
+            end
+        end
+        for _, filename in ipairs(listfiles(path())) do
+            local normalized = filename:gsub("\\", "/")
+            local id = normalized:match("([^/]+)$"):match("^(%d+)%.json$")
+            if id then
+                local value = read(normalized:find("/", 1, true) and normalized or path() .. "/" .. normalized)
+                if value and value.version == 1 and type(value.at) == "number" and tostring(value.id) == id then
+                    assert(not (value.fingerprint ~= Botting.fingerprint(App.config) and value.active and value.at >= os.time() - 90),
+                        "This team name is active with a different layout. Import the same setup or choose another team name.")
+                    if value.fingerprint == Botting.fingerprint(App.config) then memberCache[id] = value end
+                end
+            end
+        end
+        for id, record in pairs(memberCache) do
+            if record.fingerprint == Botting.fingerprint(App.config) and record.at >= os.time() - 90 then records[#records + 1] = record
+            else memberCache[id] = nil end
+        end
+        local fingerprint, now = Botting.fingerprint(App.config), os.time()
+        local live = Botting.members(records, fingerprint, now)
+        local registered = copy(records)
+        for _, record in ipairs(registered) do record.active = true end
+        self.detectedCount = #Botting.members(registered, fingerprint, now)
+        return live
+    end
+    local preferences = read(api.roleFile)
+    if preferences and preferences.userId == App.userId and roles[preferences.role] and type(preferences.spot) == "number" then
+        self.preferences = {role = preferences.role, spot = preferences.spot,
+            collectBreak = preferences.collectBreak == true, autoStart = preferences.autoStart == true}
+    end
+    function self.savePreferences()
+        local record = copy(self.preferences); record.userId = App.userId
+        api.write(api.roleFile, record)
+    end
+    function self.setRole(role, spot, collectBreak)
+        api.idle()
+        assert(roles[role], "Choose Breaker, Collector or Rotation.")
+        if spot then assert(spot >= 1 and spot == math.floor(spot) and spot <= 12, "Choose a valid breaker spot number.") end
+        self.preferences.role, self.preferences.spot = role, spot or self.preferences.spot
+        if collectBreak ~= nil then self.preferences.collectBreak = collectBreak == true end
+        self.preferences.autoStart = false
+        self.savePreferences()
+        self.stop()
+    end
+    function self.save()
+        if not App.botState then return end
+        api.saveSession()
+        api.write(api.resumeFile, {version = 1, active = true, userId = App.userId, at = os.time(),
+            config = api.validate(App.config), profile = App.profile, state = copy(App.botState)})
+    end
+    function self.readResume()
+        local record = read(api.resumeFile)
+        if not record or not record.active then return end
+        assert(record.version == 1 and record.userId == App.userId and type(record.state) == "table", "Invalid account Botting checkpoint.")
+        record.config = api.validate(record.config)
+        return record
+    end
+    function self.poll(force)
+        if polling or not App.alive or not (connected or App.job == "botting") then return end
+        if not force and os.clock() < (nextPoll or 0) then return end
+        polling, nextPoll = true, os.clock() + 2
+        local ok, issue = pcall(function()
+            ensure()
+            if not nextLevel or os.clock() >= nextLevel then
+                local queried, level = pcall(api.level)
+                if queried and type(level) == "number" and level >= 1 then
+                    self.level, nextLevel, self.levelError = math.floor(level), os.clock() + 60, nil
+                else
+                    self.levelError, nextLevel = "Account level refresh unavailable; using last confirmed level.", os.clock() + 10
+                    assert(self.level, "Account level is unavailable; Botting farm collection is disabled.")
+                end
+            end
+            if not nextSensor or os.clock() >= nextSensor then sensor = api.observe(); nextSensor = os.clock() + 3 end
+            local state = App.botState
+            member = {version = 1, id = App.userId, fingerprint = Botting.fingerprint(App.config), at = os.time(),
+                role = self.preferences.role, spot = self.preferences.spot, level = self.level,
+                collectBreak = self.preferences.collectBreak,
+                carriedSeeds = api.count(App.config.planting.seedId),
+                carriedBlocks = api.count(App.config.blockId),
+                harvester = api.hasHarvester(), active = App.job == "botting" and (not state or state.active ~= false), pending = App.pending,
+                sensor = sensor, done = state and state.done, abandoned = state and state.abandoned}
+            api.write(path() .. "/" .. App.userId .. ".json", member)
+            local live = members()
+            self.teamCount, self.teamMembers = #live, live
+            local existing = read(path() .. "/board.json") or read(path() .. "/board.json.bak") or board
+            if existing and (existing.version ~= 1 or existing.fingerprint ~= member.fingerprint) then existing = nil end
+            if live[1] and live[1].id == App.userId then
+                local nextBoard = Botting.schedule(existing, live, App.config, os.time())
+                nextBoard.fingerprint = member.fingerprint
+                nextBoard.peers = {}
+                for _, peer in ipairs(live) do nextBoard.peers[tostring(peer.id)] = peer end
+                -- Recheck election immediately before publishing after observation yields.
+                local confirm = members()
+                if confirm[1] and confirm[1].id == App.userId then api.write(path() .. "/board.json", nextBoard); existing = nextBoard end
+            end
+            if existing and live[1] and existing.leader == live[1].id and existing.at >= os.time() - 90 then board = existing
+            else board = nil end
+            self.board = board
+            self.debug = "Detected " .. self.detectedCount .. " accounts; " .. #live .. " active; " .. (board and ("leader " .. board.leader
+                .. "; storage " .. (board.stock and board.stock.blocks or "unknown") .. "; " .. (board.drain and "draining" or "supplying")) or "waiting for team leader")
+        end)
+        polling = false
+        self.error = not ok and tostring(issue) or nil
+    end
+    function self.connect()
+        connected = true; self.poll(true)
+        assert(not self.error, self.error)
+        return self.debug
+    end
+    function self.guard(settling)
+        if not leaseReady or App.job ~= "botting" or not App.botState or not App.botState.job or settling and App.pending > 0 then return end
+        local job = App.botState.job
+        if job.kind == "break" or job.kind == "collector" or job.kind == "wait" then return end
+        local current = board and board.jobs[tostring(App.userId)]
+        assert(board and board.at >= os.time() - 90 and current and current.id == job.id,
+            "Botting team lease is unavailable; waiting before continuing farm actions.")
+    end
+    function self.stop()
+        if not connected and not App.botState and not self.preferences.autoStart then return end
+        self.preferences.autoStart = false
+        pcall(self.savePreferences)
+        if App.botState then
+            App.botState.active = false
+            if App.pending == 0 and App.botState.job then App.botState.abandoned = App.botState.job.id end
+            pcall(self.save)
+        end
+        if member then member.active, member.at, member.pending = false, os.time(), App.pending; pcall(api.write, path() .. "/" .. App.userId .. ".json", member) end
+    end
+    function self.beforeStorage(action, point, id, amount, companionId)
+        if App.job ~= "botting" then return end
+        local state = App.botState
+        state.storage = {action = action, point = copy(point), id = id, amount = amount,
+            before = api.count(id), companionId = companionId, companionBefore = companionId and api.count(companionId)}
+        self.save()
+    end
+    function self.afterStorage()
+        if App.job == "botting" then
+            App.botState.storage = nil; self.save()
+            sensor, nextSensor = api.observe(), os.clock() + 3
+            self.poll(true)
+        end
+    end
+    function self.resetImport()
+        if not App.botState and not read(api.resumeFile) and not self.preferences.autoStart then return end
+        self.stop(); App.botState = nil
+        api.write(api.resumeFile, {version = 1, active = false, userId = App.userId})
+    end
+    function self.run(token, saved)
+        App.botState = saved and copy(saved.state) or {active = true, retries = 0}
+        local state = App.botState
+        state.active, leaseReady = true, false
+        assert(not state.storage, "An interrupted Botting storage request needs inventory/box review. Use Clear saved Botting after checking cargo.")
+        assert(App.config.botting.spots[self.preferences.spot], "Choose a saved Botting breaker spot for this account.")
+        self.preferences.autoStart, connected = true, true
+        self.savePreferences(); self.save(); api.queue()
+        api.go(App.config.botting.world, token)
+        self.poll(true)
+        assert(not self.error, self.error)
+        if self.detectedCount < App.config.botting.expectedAccounts then
+            self.preferences.autoStart = false; self.savePreferences()
+            error("Botting sees " .. self.detectedCount .. "/" .. App.config.botting.expectedAccounts
+                .. " accounts. Connect every instance first and verify they share the same team folder.")
+        end
+        while true do
+            leaseReady = false
+            api.checkpoint(token)
+            self.poll()
+            local assignment = board and board.jobs[tostring(App.userId)]
+            if assignment and state.done == assignment.id then
+                api.pause(2, token)
+            elseif not assignment or self.error then
+                api.status(self.error or "Botting: waiting for shared team assignments..."); api.pause(2, token)
+            else
+                if not state.job or state.job.id ~= assignment.id then
+                    if state.job and (state.phase == "deliver" or state.phase == "source") then
+                        assert(not state.storage, "Review interrupted Botting storage before changing jobs.")
+                        api.flushCargo(token)
+                    end
+                    state.job, state.phase, state.rotation, state.plant, state.done, state.abandoned = copy(assignment), nil, nil, nil, nil, nil
+                    state.retries = 0; self.save()
+                else state.job = copy(assignment) end
+                local job = state.job
+                leaseReady = true
+                local ok, issue = pcall(function()
+                    self.guard()
+                    if job.kind == "wait" then
+                        api.status("Botting: breaker spot is already assigned to another account; select another spot.")
+                        api.pause(2, token)
+                    elseif job.kind == "break" or job.kind == "collector" then
+                        api.go(App.config.botting.world, token)
+                        if job.kind == "collector" then
+                            api.collectBNS(token, self.preferences.collectBreak)
+                        else api.breakStep(token, job.collectOwn) end
+                    else
+                        api.status("Botting " .. job.kind .. ": " .. job.world .. "...")
+                        api.go(job.world, token)
+                        self.guard()
+                        if job.kind == "harvest" then
+                            assert(self.level >= 10 and api.hasHarvester(), "Only level 10+ accounts owning a harvesting vehicle can harvest.")
+                            api.harvest(job, token)
+                        elseif job.kind == "collect" then
+                            assert(self.level >= 10, "Level 1-9 accounts cannot collect or move farm blocks and seeds.")
+                            api.collectFarm(job, token)
+                        elseif job.kind == "plant" then api.plant(job, token)
+                        end
+                        sensor, nextSensor = api.observe(), os.clock() + 3
+                        state.done, state.rotation, state.plant = job.id, nil, nil
+                        self.save(); self.poll(true)
+                        api.report("work", "Botting finished " .. job.kind .. " in " .. job.world)
+                    end
+                end)
+                if not ok then
+                    leaseReady = false
+                    api.checkpoint(token)
+                    api.halt()
+                    state.retries = (state.retries or 0) + 1
+                    self.error = tostring(issue)
+                    api.report("failure", "Botting " .. job.kind .. ": " .. tostring(issue))
+                    self.save()
+                    assert(App.pending == 0 and not state.storage and not (state.plant and state.plant.pending),
+                        "Botting paused with an unconfirmed request: " .. tostring(issue))
+                    api.status("Botting retry in 5s: " .. tostring(issue))
+                    api.pause(5, token)
+                else api.pause(0.05, token) end
+            end
+        end
+    end
+    return self
+end
+return Botting
+
+end)()
+    local api = {roleFile = ROOT .. "/botting-role.json", resumeFile = ROOT .. "/botting-resume.json",
+        filesystem = filesystem, decode = decode, write = writeJSON, saveSession = saveSession, validate = Core.validate,
+        idle = idle, count = count, checkpoint = checkpoint, pause = pause, queue = queueResume, status = setStatus,
+        report = function(kind, text) if queueWebhookEvent then queueWebhookEvent(kind, text, "botting") end end,
+        halt = function() if App.controls then App.controls.direction, App.controls.jump = 0, false end end,
+        level = function() return bounded(runtime().world.call, App.config.options.actionTimeout, nil, "GetLevel") end}
+    function api.hasHarvester()
+        local r = App.runtime
+        if not r then return false end
+        for id, item in pairs(r.items) do
+            if item.name == "Dear John Tractor" and item.ride == "tractor" and count(id) > 0 then return true end
+        end
+        return false
+    end
+    function api.observe()
+        local r = App.runtime
+        if not r or not r.body or not r.body.state().active then return end
+        local name, b = r.world.name, App.config.botting
+        local sensor = {world = name, at = os.time()}
+        if name == b.world then
+            sensor.blocks = storageCount(App.config.points.blockBox, App.config.blockId)
+            sensor.seeds = storageCount(App.config.points.seedBox, App.config.planting.seedId)
+            sensor.breakingTiles = 0
+            for _, spot in ipairs(b.spots) do
+                if r.world.fg[spot.y - 1] and r.world.fg[spot.y - 1][spot.x] == App.config.blockId then sensor.breakingTiles = sensor.breakingTiles + 1 end
+            end
+        elseif App.config.rotation.farms[name] then
+            sensor.empty, sensor.loose, sensor.gems = 0, 0, 0
+            for _, row in ipairs(Core.farmRows(r.world, r.items)) do
+                for x = row.left, row.right do if Core.plantingTile(r.world, r.items, x, row.y) then sensor.empty = sensor.empty + 1 end end
+            end
+            local ok, growing, ripe, remaining = pcall(Core.treeGrowth, r.world, App.config.planting.seedId, r.treeRipe, r.treeRemaining)
+            if ok then sensor.growing, sensor.ripe, sensor.remaining = growing, ripe, remaining end
+            for _, drop in pairs(r.world.dropList()) do
+                if not drop.display and (drop.n or 0) > 0 and not harvestDropDeferred(name, drop) then
+                    if drop.id == App.config.blockId or drop.id == App.config.planting.seedId then sensor.loose = sensor.loose + drop.n
+                    elseif drop.id == 112 then sensor.gems = sensor.gems + drop.n end
+                end
+            end
+            local box = App.config.rotation.farms[name]
+            sensor.stored = storageCount(box, App.config.blockId, App.config.planting.seedId)
+                + storageCount(box, App.config.planting.seedId, App.config.blockId)
+        end
+        return sensor
+    end
+    local shortcutAt = 0
+    function api.shortcut(token)
+        local door, b, r = App.config.points.breakDoor, App.config.botting, runtime()
+        if not door or r.world.name ~= b.world or os.clock() < shortcutAt then return end
+        local state, distance = position(), math.huge
+        for _, spot in ipairs(b.spots) do distance = math.min(distance, math.abs(state.x - (spot.x + 0.5)) + math.abs(state.y - (spot.y + 1))) end
+        if distance < 8 then return end
+        shortcutAt = os.clock() + 10
+        local ok, issue = pcall(function()
+            moveToPoint(door, token)
+            local metadata = r.items[tileAt(door.x, door.y)]
+            assert(metadata and (metadata.door or metadata.entrance or metadata.vip), "Saved BNS shortcut is no longer a door.")
+            App.botting.save()
+            local accepted, response = bounded(r.world.call, App.config.options.actionTimeout, token, "UseDoor", door.x, door.y)
+            assert(accepted and type(response) == "table" and type(response.go) == "table", "BNS door must lead to the breaking lane in this same world.")
+            r.world.goTo(response.go[1], response.go[2]); pause(0.15, token)
+            App.doorReadyDebug = "BNS same-world shortcut used"
+        end)
+        checkpoint(token)
+        if not ok then App.doorReadyDebug = "BNS door unavailable; walking: " .. tostring(issue) end
+    end
+    function api.go(name, token)
+        suspendHarvestVehicle(token)
+        local r = runtime()
+        if r.world.name ~= name or pickerOpen(r) or not r.body.state().active or r.body.state().dead then
+            enterPlantWorld(name, App.botState and App.botState.plant or {worldIndex = 1, phase = "farm", skipped = {}}, token)
+        else takeControls() end
+        if name == App.config.botting.world then api.shortcut(token) end
+        takeControls().pausePickup = true -- All Botting pickups have one explicit owner.
+    end
+    local collectAttempts, collectRetry, collectDeferred = {}, {}, {}
+    local function collectorAnchor()
+        local b = App.config.botting
+        if b.collector then return b.collector end
+        local sorted = {}
+        for _, spot in ipairs(b.spots) do sorted[#sorted + 1] = spot end
+        table.sort(sorted, function(a, b) return a.x < b.x end)
+        return sorted[math.ceil(#sorted / 2)]
+    end
+    local function pickupStep(anchor, token, fallback, includeSeeds)
+        local r, blockId, seedId = runtime(), App.config.blockId, App.config.planting.seedId
+        local function selected(drop)
+            return not drop.display and not drop.pending and not drop.taking and (drop.n or 0) > 0
+                and (drop.id == 112 or drop.id == blockId or includeSeeds and drop.id == seedId)
+                and os.clock() >= (collectDeferred[drop.uid] or 0)
+                and type(drop.x) == "number" and type(drop.y) == "number"
+                and drop.y >= anchor.y - 1.5 and drop.y <= anchor.y + 1.25
+        end
+        local minX, maxX = anchor.x - 1.25, anchor.x + 1.75
+        if fallback then
+            for _, spot in ipairs(App.config.botting.spots) do minX = math.min(minX, spot.x - 0.75); maxX = math.max(maxX, spot.x + 1.75) end
+        end
+        local targets, far
+        targets = {}
+        local state = position()
+        for _, drop in pairs(r.world.dropList()) do
+            if selected(drop) and drop.x >= minX and drop.x <= maxX then
+                local near = math.abs(drop.x - state.x) <= 1.25 and drop.y >= state.y - 2.5 and drop.y <= state.y + 0.25
+                if near and (collectAttempts[drop.uid] or 0) < 3 and os.clock() >= math.max(drop.readyAt or 0, collectRetry[drop.uid] or 0) then
+                    targets[#targets + 1] = drop
+                elseif fallback and (not near or (collectAttempts[drop.uid] or 0) >= 3) then far = far or drop end
+            end
+        end
+        if #targets > 0 then
+            takeDropBatch(anchor, targets, collectAttempts, collectRetry, selected, token)
+            refreshInventory(token)
+        elseif far then
+            local goal = Navigation.pickupGoal(navigationMap(r), state, far, {nativeOnly = true})
+            if goal then
+                moveTo(goal.x, goal.y, anchor.world, token)
+                collectAttempts[far.uid], collectRetry[far.uid] = 0, 0
+                local results = takeDropBatch(anchor, {far}, collectAttempts, collectRetry, selected, token)
+                if results[1] and results[1].amount == 0 then collectDeferred[far.uid] = os.clock() + 5 end
+                refreshInventory(token)
+            else
+                collectDeferred[far.uid] = os.clock() + 300
+                App.harvestCollectionRecovery = "BNS drop " .. far.uid .. " deferred; no reachable supported pickup spot"
+            end
+        end
+    end
+    local function unloadBNS(token, seedsOnly)
+        local p, id, seed = App.config.points, App.config.blockId, App.config.planting.seedId
+        api.go(App.config.botting.world, token)
+        refreshInventory(token)
+        local blocks, seeds = count(id), count(seed)
+        if not seedsOnly and blocks > 0 then deposit(p.blockBox, id, blocks, token) end
+        if seeds > 0 and App.botting.level >= 10 then deposit(p.seedBox, seed, seeds, token) end
+        return blocks, seeds
+    end
+    function api.breakStep(token, collectOwn)
+        local spot = App.config.botting.spots[App.botting.preferences.spot]
+        api.go(spot.world, token); moveToPoint(spot, token)
+        refreshInventory(token)
+        if App.botting.level >= 10 and count(App.config.planting.seedId) >= App.config.options.seedThreshold then
+            unloadBNS(token, true); moveToPoint(spot, token)
+        end
+        local id, target = App.config.blockId, {x = spot.x, y = spot.y - 1}
+        if tileAt(target.x, target.y) == 0 and count(id) == 0 then
+            local taken = withdraw(App.config.points.blockBox, id, token)
+            if taken == 0 then setStatus("Botting: BNS block storage is empty; waiting for farm supply."); pause(1, token); return end
+            moveToPoint(spot, token)
+        end
+        local oldPNB = App.config.points.pnb
+        App.config.points.pnb = spot
+        local ok, issue = pcall(function()
+            local cell = tileAt(target.x, target.y)
+            assert(cell == 0 or cell == id, "Clear the tile above this Botting breaker spot.")
+            if cell == 0 then placeTile(target, id, token) end
+            if tileAt(target.x, target.y) == id then breakTile(target, id, token) end
+        end)
+        App.config.points.pnb = oldPNB
+        if not ok then error(issue, 0) end
+        if collectOwn then pickupStep(spot, token, false, App.botting.level >= 10) end
+    end
+    function api.collectBNS(token, alsoBreak)
+        local anchor = collectorAnchor()
+        moveToPoint(anchor, token)
+        if alsoBreak then api.breakStep(token, false); moveToPoint(anchor, token) end
+        pickupStep(anchor, token, true, true)
+        if count(App.config.blockId) >= 200 or count(App.config.planting.seedId) >= App.config.options.seedThreshold then
+            unloadBNS(token); moveToPoint(anchor, token)
+        end
+        if App.status ~= "Botting Collector: collecting nearby blocks, seeds and gems; breakers continue." then
+            setStatus("Botting Collector: collecting nearby blocks, seeds and gems; breakers continue.")
+        end
+        pause(0.1, token)
+    end
+    local function farmScope(job, token, fn)
+        local oldBox, oldRotation, oldFilter = App.config.points.farmBox, App.rotationState, App.botDropFilter
+        App.config.points.farmBox = App.config.rotation.farms[job.world]
+        local state = App.botState
+        state.rotation = state.rotation or {phase = "harvest", cycle = 1, worldIndex = 1, work = 0, seedCargo = 0}
+        state.rotation.deferredHarvest = state.deferredHarvest or state.rotation.deferredHarvest or {}
+        for index, world in ipairs(App.config.planting.worlds) do if world == job.world then state.rotation.worldIndex = index end end
+        App.rotationState = state.rotation
+        local result = table.pack(pcall(function() return harvestEquipmentScope(function() suspendHarvestVehicle(token); return fn() end) end))
+        App.config.points.farmBox, App.rotationState, App.botDropFilter = oldBox, oldRotation, oldFilter
+        if not result[1] then error(result[2], 0) end
+        return table.unpack(result, 2, result.n)
+    end
+    function api.harvest(job, token)
+        return farmScope(job, token, function()
+            if job.approved and not App.rotationState.harvestPass then App.rotationState.harvestPass = {world = job.world, phase = "trees"} end
+            return withoutPickups(function() return runTreeHarvest(token) end)
+        end)
+    end
+    function api.transferBoth(job, token)
+        local source = App.config.rotation.farms[job.world]
+        local state, id, seed = App.botState, App.config.blockId, App.config.planting.seedId
+        state.phase = state.phase or "source"
+        while true do
+            checkpoint(token)
+            if state.phase == "source" then
+                api.go(source.world, token); refreshInventory(token)
+                if count(id) > 0 or count(seed) > 0 then state.phase = "deliver"
+                else
+                    local blocks, seeds = storageCount(source, id, seed), storageCount(source, seed, id)
+                    if blocks == 0 and seeds == 0 then state.phase = nil; App.botting.save(); return end
+                    local primary, companion = blocks > 0 and id or seed, blocks > 0 and seed or id
+                    withdraw(source, primary, token, companion)
+                    state.phase = "deliver"
+                end
+                App.botting.save()
+            elseif state.phase == "deliver" then
+                local blocks = unloadBNS(token)
+                App.stats.moved = App.stats.moved + blocks
+                App.stats.trips = App.stats.trips + 1
+                state.phase = "source"; App.botting.save()
+            else error("Invalid Botting mixed transfer phase.") end
+        end
+    end
+    function api.collectFarm(job, token)
+        if not App.botState.phase then
+            farmScope(job, token, function()
+                App.rotationState.harvestPass = {world = job.world, phase = "collect"}
+                local rows = Core.farmRows(runtime().world, runtime().items)
+                App.botDropFilter = function(drop)
+                    local nearest, distance
+                    for index, row in ipairs(rows) do
+                        local delta = math.abs(drop.y - (row.y + 0.5))
+                        if not distance or delta < distance then nearest, distance = index, delta end
+                    end
+                    local group = nearest and distance <= 1.5 and nearest - 1 or drop.uid
+                    return group % job.partitions == job.partition - 1
+                end
+                runHarvest(token)
+            end)
+            App.botState.phase = "source"; App.botting.save()
+        end
+        api.transferBoth(job, token)
+    end
+    function api.plant(job, token)
+        local index
+        for i, world in ipairs(App.config.planting.worlds) do if world == job.world then index = i end end
+        local state = App.botState.plant or {worldIndex = index, phase = "farm", skipped = {}}
+        App.rotationState = nil
+        local result = runPlant(token, {state = state}, index)
+        App.plantState = nil
+        return result
+    end
+    App.botting = Botting.new(App, api)
+    api.flushCargo = unloadBNS
+    App.botting.shortcut, App.botting.api = api.shortcut, api
 end
 
 local migrationOK, migrationProblem = pcall(migrateLegacyStorage)
@@ -5170,6 +5986,7 @@ local harvestTab = window:Tab({ Title = "Harvest Drops", Icon = "package" })
 local plantTab = window:Tab({ Title = "Planting", Icon = "sprout" })
 local transferTab = window:Tab({ Title = "Moving Drops", Icon = "truck" })
 local rotationTab = window:Tab({ Title = "Full Rotation", Icon = "repeat" })
+ui.bottingTab = window:Tab({ Title = "Botting", Icon = "users" })
 local profileTab = window:Tab({ Title = "Configurations", Icon = "save" })
 local webhookTab = window:Tab({ Title = "Discord Webhook", Icon = "bell" })
 local settingsTab = window:Tab({ Title = "Settings", Icon = "settings" })
@@ -5508,6 +6325,7 @@ local function syncUI()
         resetWebhookSchedule()
         syncWebhookControls()
         pollFPSBooster(true)
+        if App.botting.syncUI then App.botting.syncUI() end
     end)
     App.syncingUI = previous
     if not ok then error(issue, 0) end
@@ -5542,11 +6360,13 @@ end) })
 profileTab:Button({ Title = "Load selected profile", Callback = uiAction(function()
     assert(selectedProfile, "Choose a saved profile first.")
     local nextConfig = Core.validate(decode(readfile(profilePath(selectedProfile))))
+    App.botting.resetImport()
     App.config, App.profile = nextConfig, selectedProfile
     syncUI()
     setStatus("Loaded profile: " .. App.profile)
 end) })
 profileTab:Button({ Title = "New empty configuration", Callback = uiAction(function()
+    App.botting.resetImport()
     App.config, App.profile = Core.defaults(), "New Farm"
     syncUI()
     setStatus("New configuration. Save the locations, then save it under a new name.")
@@ -5609,6 +6429,140 @@ do
             importText(text)
             configText:Set(text)
         end) })
+end
+
+do
+    local tab, controls = ui.bottingTab, {}
+    local previousSync = App.syncingUI
+    App.syncingUI = true
+    local labels = {breaker = "Breaker", collector = "Collector", rotation = "Rotation"}
+    local function saveSetup()
+        App.config = Core.validate(App.config); saveSession(); updatePoints()
+        if App.botting.syncUI then App.botting.syncUI() end
+    end
+    local function sameBNS()
+        local world = runtime().world.name
+        if App.config.botting.world == "" then App.config.botting.world = world end
+        assert(App.config.botting.world == world, "Visit the saved BNS world before saving its layout.")
+    end
+    local function anchor()
+        sameBNS()
+        local state = position()
+        assert(state.grounded, "Stand on the BNS floor before saving a spot.")
+        return {world = runtime().world.name, x = math.floor(state.x), y = math.floor(state.y - 0.01)}
+    end
+    tab:Paragraph({Title = "Shared cloudphone team", Desc = "Import the same farm setup into every account, then choose each account's role and breaker spot here. Roles and recovery stay private. Shared jobs require every instance to see the same team folder; Connect team shows detected accounts."})
+    controls.team = tab:Input({Title = "Botting team name", Value = App.config.botting.team, Callback = function(value)
+        if App.syncingUI then return end
+        local ok, issue = pcall(function() idle(); App.config.botting.team = Core.profileName(value); saveSetup() end)
+        if not ok then notify(tostring(issue)) end
+    end})
+    controls.folder = tab:Input({Title = "Shared team folder", Value = App.config.botting.folder,
+        Desc = "Folder visible to every instance. Default: ClarisGrowblox/teams. Android shared-storage paths also work when permitted by your executor.", Callback = function(value)
+            if App.syncingUI then return end
+            local old = App.config.botting.folder
+            local ok, issue = pcall(function() idle(); App.config.botting.folder = tostring(value); saveSetup() end)
+            if not ok then App.config.botting.folder = old; notify(tostring(issue)) end
+        end})
+    controls.expected = tab:Input({Title = "Expected team accounts", Value = tostring(App.config.botting.expectedAccounts),
+        Desc = "Default 4. Connect all instances before starting. Missing teammates block startup so isolated files cannot silently create competing farm jobs.", Callback = function(value)
+            if App.syncingUI then return end
+            local old = App.config.botting.expectedAccounts
+            local ok, issue = pcall(function() idle(); App.config.botting.expectedAccounts = tonumber(value); saveSetup() end)
+            if not ok then App.config.botting.expectedAccounts = old; notify(tostring(issue)) end
+        end})
+    controls.role = tab:Dropdown({Title = "This account's role", Values = {"Breaker", "Collector", "Rotation"},
+        Value = labels[App.botting.preferences.role], Callback = function(value)
+            if App.syncingUI then return end
+            local role
+            for key, label in pairs(labels) do if label == value then role = key end end
+            if not role then return end
+            local ok, issue = pcall(App.botting.setRole, role)
+            if not ok then notify(tostring(issue)) end
+        end})
+    controls.spot = tab:Dropdown({Title = "This account's breaker spot", Values = {"Save spots first"},
+        Callback = function(value)
+            if App.syncingUI or not tonumber(value) then return end
+            local ok, issue = pcall(App.botting.setRole, App.botting.preferences.role, tonumber(value))
+            if not ok then notify(tostring(issue)) end
+        end})
+    controls.collectBreak = tab:Toggle({Title = "Collector also breaks", Value = App.botting.preferences.collectBreak,
+        Desc = "Use a free saved breaker spot for this collector. A dedicated collector can spend more time collecting and unloading.", Callback = function(value)
+            if App.syncingUI then return end
+            local ok, issue = pcall(App.botting.setRole, App.botting.preferences.role, nil, value)
+            if not ok then notify(tostring(issue)) end
+        end})
+    ui.bottingLayout = tab:Paragraph({Title = "BNS layout", Desc = "Save the shortcut door, two boxes, breaker spots and collector position."})
+    tab:Button({Title = "Save BNS shortcut door", Callback = uiAction(function()
+        sameBNS(); captureNearby("breakDoor", "door"); saveSetup()
+    end)})
+    tab:Button({Title = "Save BNS block Display Box", Callback = uiAction(function()
+        sameBNS(); captureNearby("blockBox", "box"); saveSetup()
+    end)})
+    tab:Button({Title = "Save BNS seed Display Box", Callback = uiAction(function()
+        sameBNS(); captureNearby("seedBox", "box")
+        local box = App.config.points.seedBox
+        App.config.points.plantBox = {world = box.world, x = box.x, y = box.y, standX = box.standX, standY = box.standY}
+        App.config.planting.storageWorld = box.world
+        if Core.farmable(runtime().items[App.config.blockId]) then App.config.planting.seedId = Core.seedId(runtime().items, App.config.blockId) end
+        saveSetup()
+    end)})
+    tab:Button({Title = "Add BNS breaker spot", Desc = "Stand at each circle and add its spot, one at a time. Blocks are placed directly above it.", Callback = uiAction(function()
+        local point, spots = anchor(), App.config.botting.spots
+        assert(#spots < 12, "At most 12 breaker spots can be saved.")
+        for _, saved in ipairs(spots) do assert(saved.x ~= point.x or saved.y ~= point.y, "This breaker spot is already saved.") end
+        tileAt(point.x, point.y - 1); spots[#spots + 1] = point; saveSetup()
+        setStatus("Saved Botting breaker spot " .. #spots)
+    end)})
+    tab:Button({Title = "Save BNS collector position", Desc = "The middle of the breaking lane is recommended. Nearby pickups are attempted while stationary; refused or farther drops use a short walking fallback.", Callback = uiAction(function()
+        App.config.botting.collector = anchor(); saveSetup()
+    end)})
+    tab:Button({Title = "Clear BNS breaker spots", Callback = uiAction(function()
+        App.config.botting.spots, App.config.botting.collector = {}, nil; saveSetup()
+    end)})
+    tab:Button({Title = "Save this farm's Botting harvest box", Desc = "Use the Planting farm list. Visit each farm and stand beside its mixed block/seed Display Box.", Callback = uiAction(function()
+        captureNearby("farmBox", "box"); saveSetup()
+    end)})
+    tab:Paragraph({Title = "Storage policy", Desc = "At 6,000 blocks or less, breakers help farm jobs. At 36,000, finish existing farm cleanup and transfers, fill empty dirt, then break until 6,000 remain. Planting is last priority. Level 1-9 accounts can only plant on farms; only level 10+ accounts owning a Tractor can harvest."})
+    tab:Button({Title = "Connect team / refresh teammates", Callback = uiAction(function()
+        Core.checkSetup(App.config, "botting", runtime().items)
+        setStatus(App.botting.connect())
+    end)})
+    App.runToggles.botting = tab:Toggle({Title = "Continuous Botting", Value = false,
+        Desc = "Run this account's role with shared farm assignments. Role choice survives importing configs. World changes queue the loader and resume this account's Botting checkpoint.",
+        Callback = function(value) setRunningEnabled("botting", value) end})
+    function App.botting.resume()
+        idle()
+        local saved = App.botting.readResume()
+        assert(saved, "No saved Botting session is available.")
+        App.config, App.profile = saved.config, Core.profileName(saved.profile)
+        syncUI(); start("botting", saved)
+    end
+    tab:Button({Title = "Resume saved Botting", Callback = function()
+        local ok, issue = pcall(App.botting.resume); if not ok then notify(tostring(issue)) end
+    end})
+    tab:Button({Title = "Clear saved Botting", Desc = "Review backpack and boxes first if a storage request was interrupted. Keeps the imported layout and this account's role.", Callback = uiAction(function()
+        App.botting.resetImport(); setStatus("Cleared this account's saved Botting progress.")
+    end)})
+    ui.bottingStatus = tab:Paragraph({Title = "Team status", Desc = "Not connected"})
+    function App.botting.syncUI()
+        local previous = App.syncingUI
+        App.syncingUI = true
+        controls.team:Set(App.config.botting.team); controls.folder:Set(App.config.botting.folder)
+        controls.expected:Set(tostring(App.config.botting.expectedAccounts))
+        controls.role:Select(labels[App.botting.preferences.role]); controls.collectBreak:Set(App.botting.preferences.collectBreak)
+        local values, lines = {}, {"World: " .. (App.config.botting.world ~= "" and App.config.botting.world or "not saved")}
+        for index, point in ipairs(App.config.botting.spots) do values[#values + 1] = tostring(index); lines[#lines + 1] = index .. ": " .. point.x .. ", " .. point.y end
+        controls.spot:Refresh(#values > 0 and values or {"Save spots first"})
+        controls.spot:Select(values[App.botting.preferences.spot] or "Save spots first")
+        local collector = App.config.botting.collector
+        lines[#lines + 1] = "Collector: " .. (collector and (collector.x .. ", " .. collector.y) or "middle saved breaker spot")
+        lines[#lines + 1] = "Shared folder: " .. App.config.botting.folder .. "/" .. App.config.botting.team
+        paragraphSet(ui.bottingLayout, "BNS layout", table.concat(lines, "\n"))
+        App.syncingUI = previous
+    end
+    App.botting.syncUI()
+    App.syncingUI = previousSync
 end
 
 rotationTab:Paragraph({ Title = "Plant, harvest, break, repeat", Desc = "Use the full Planting farm list. Fill empty rows and break PNB stock while trees grow. Ready farms normally interrupt PNB for harvest, transfer and replant. If planting seed supply runs out, finish all remaining PNB blocks first, storing produced seeds, then resume farms. Full farms skip planting. Account-specific progress resumes across supported world changes." })
@@ -5762,19 +6716,20 @@ for _, info in ipairs({
     {"autoRejoin", "Rejoin world and return to PNB", "Re-enter the saved world from the world picker, then walk and jump back to the breaking spot."},
     {"fpsBooster", "FPS booster: hide floating drops", "Hide loose blocks, seeds and gems and stop their bobbing. Collection continues; Display Boxes stay visible. Turn Off to restore visuals."},
     {"fpsGreyMap", "FPS booster: Grey map", "Replace map and nearby tree textures with grey shapes and reduce distant tree visuals. Keep the sky, avatar, controls, doors and Display Boxes. Turn Off to restore textures."},
+    {"fpsHideWorld", "FPS booster: Hide game world", "Hide the game viewport, map, avatars, weather and effects while automation continues. The script menu stays usable. Turn Off to restore the view before saving locations or playing manually."},
 }) do
     local key = info[1]
     settingsControls[key] = settingsTab:Toggle({Title = info[2], Desc = info[3], Value = App.config.options[key],
         Callback = function(value)
             if App.syncingUI then return end
-            if key ~= "fpsBooster" and key ~= "fpsGreyMap" and (App.job or App.configuring or App.pending > 0) then
+            if key ~= "fpsBooster" and key ~= "fpsGreyMap" and key ~= "fpsHideWorld" and (App.job or App.configuring or App.pending > 0) then
                 notify("Stop the task before changing settings.")
                 settingsControls[key]:Set(App.config.options[key], false, false)
                 return
             end
             App.config.options[key] = value
             if key == "antiAFK" and value then installAntiAFK() end
-            if key == "fpsBooster" or key == "fpsGreyMap" then
+            if key == "fpsBooster" or key == "fpsGreyMap" or key == "fpsHideWorld" then
                 pollFPSBooster(true)
                 local ok, issue = pcall(saveFPSPreference)
                 App.fpsSaveError = not ok and tostring(issue) or nil
@@ -5831,6 +6786,11 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "; hidden loose sprites: " .. (App.fpsHidden or 0) .. "; " .. (App.fpsBoosterError or "ready")
         .. "\nGrey map: " .. (App.config.options.fpsGreyMap and "On" or "Off")
         .. "; simplified sprites: " .. (App.fpsMapCount or 0) .. "; " .. (App.fpsMapError or "ready")
+        .. "\nHidden game world: " .. (App.config.options.fpsHideWorld and "On" or "Off") .. "; hidden: " .. tostring(App.fpsWorldHidden == true)
+        .. "\nBotting role: " .. App.botting.preferences.role .. "; spot " .. App.botting.preferences.spot
+        .. "; level " .. (App.botting.level or "unknown") .. "; " .. (App.botting.debug or "not connected")
+        .. "\nBotting error: " .. (App.botting.error or "none")
+        .. "\nBotting job: " .. (App.botState and App.botState.job and (App.botState.job.kind .. " in " .. App.botState.job.world) or "idle")
         .. "\nFPS setting save: " .. (App.fpsSaveError or "ready")
         .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
         .. "\nLast refused harvest pickup: " .. (App.lastHarvestRefusal or "none")
@@ -5874,6 +6834,9 @@ task.spawn(function()
         reconnect()
         listProfiles()
         if App.sessionRestoreError then notify(App.sessionRestoreError) end
+        local botOK, bot = pcall(App.botting.readResume)
+        if botOK and bot then setStatus("Saved Botting found. Use Resume saved Botting on Botting.")
+        elseif not botOK then notify(tostring(bot)) end
         local rotationOK, rotation = pcall(readRotationResume)
         if rotationOK and rotation then setStatus("Saved rotation found. Use Resume saved rotation on Full Rotation.")
         elseif not rotationOK then notify(tostring(rotation)) end
@@ -5899,10 +6862,11 @@ task.spawn(function()
         setStatus(tostring(message))
         notify(tostring(message))
         queueWebhookEvent("failure", "Could not connect the script: " .. tostring(message), "connection")
-    elseif env.ClarisGrowbloxAutoResume then
+    elseif env.ClarisGrowbloxAutoResume or App.botting.preferences.autoStart then
         env.ClarisGrowbloxAutoResume = nil
         local resumed, problem = pcall(function()
-            if readRotationResume() then resumeRotation()
+            if App.botting.preferences.autoStart and App.botting.readResume() then App.botting.resume()
+            elseif readRotationResume() then resumeRotation()
             elseif readPlantResume() then resumePlant()
             elseif readPNBResume() then resumeFarm()
             elseif App.resume then resumeTransfer() end
@@ -5923,6 +6887,7 @@ task.spawn(function()
             App.recoverySaveError = not ok and tostring(issue) or nil
         end
         pollSession()
+        App.botting.poll()
         pollFPSBooster()
         pollWebhook()
         local suffix = "\nProfile: " .. App.profile .. "  |  Blocks broken: " .. App.stats.broken
@@ -5939,6 +6904,8 @@ task.spawn(function()
             paragraphSet(ui.harvestStatus, "Status", App.status .. suffix)
             paragraphSet(ui.plantStatus, "Status", App.status .. suffix)
             paragraphSet(ui.rotationStatus, "Status", App.status .. suffix)
+            paragraphSet(ui.bottingStatus, "Team status", (App.botting.debug or "Not connected") .. "\nRole: " .. App.botting.preferences.role
+                .. "; breaker spot " .. App.botting.preferences.spot .. "\n" .. App.status .. "\n" .. (App.botting.error or ""))
             local farms = {}
             for _, name in ipairs(App.config.planting.worlds) do
                 local box = App.config.rotation.farms[name]

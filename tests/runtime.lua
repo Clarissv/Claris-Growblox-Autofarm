@@ -7073,4 +7073,487 @@ test("A failure preempts periodic stat queries and can post while those read-onl
     assert(f.app.webhookState.pending == 0 and #f.app.webhookState.events == 0 and f.app.pending == 0)
 end)
 
+do
+    local function configureBot(f)
+        local c = f.app.config
+        c.botting.world, c.botting.spots = "BREAK", {{world="BREAK",x=9,y=8},{world="BREAK",x=10,y=8},{world="BREAK",x=11,y=8}}
+        c.botting.collector = {world="BREAK",x=10,y=8}
+        c.planting = {seedId=955,storageWorld="BREAK",worlds={"FARM"}}
+        c.points.plantBox = c.points.seedBox
+        c.points.breakDoor = nil
+        c.rotation.farms.FARM = c.points.farmBox
+        return c
+    end
+    local function planning()
+        local f = fixture()
+        local c, now = configureBot(f), 100
+        local members = {
+            {id=1,role="rotation",level=20,harvester=true,spot=3,active=true,at=now,pending=0},
+            {id=2,role="breaker",level=20,harvester=false,spot=1,active=true,at=now,pending=0},
+            {id=3,role="breaker",level=5,harvester=false,spot=2,active=true,at=now,pending=0},
+            {id=4,role="collector",level=20,harvester=false,spot=2,active=true,at=now,pending=0},
+        }
+        local board = {version=1,sequence=0,farms={FARM={at=now,empty=0,ripe=100,growing=0,loose=0,gems=0,stored=0}},
+            jobs={},stock={at=now,world="BREAK",blocks=5000,seeds=7500},drain=false}
+        return f.app.botting.core, c, members, board, now
+    end
+    test("Botting assigns ripe harvest only to a level 10+ worker owning a Tractor", function()
+        local B,c,m,board,now = planning()
+        local planned = B.schedule(board,m,c,now)
+        assert(planned.jobs["1"].kind == "harvest" and planned.jobs["4"].kind == "collector")
+        m[1].harvester=false
+        planned=B.schedule(board,m,c,now)
+        for _,job in pairs(planned.jobs) do assert(job.kind~="harvest") end
+        m[1].harvester,m[1].level=true,9
+        planned=B.schedule(board,m,c,now)
+        for _,job in pairs(planned.jobs) do assert(job.kind~="harvest") end
+    end)
+    test("Botting will not harvest a farm with even one growing tree", function()
+        local B,c,m,board,now=planning()
+        board.farms.FARM.growing=1
+        local planned=B.schedule(board,m,c,now)
+        for _,job in pairs(planned.jobs) do assert(job.kind~="harvest") end
+    end)
+    test("Botting supports one harvester, two collection partitions and one planter on the same farm", function()
+        local B,c,m,board,now=planning()
+        m[4].role="rotation"
+        board.jobs["1"]={id="1:1",kind="harvest",world="FARM",owner=1}
+        board.sequence,board.farms.FARM.harvesting=1,true
+        board.farms.FARM.loose,board.farms.FARM.empty=500,100
+        local planned=B.schedule(board,m,c,now)
+        assert(planned.jobs["1"].id=="1:1" and planned.jobs["2"].kind=="collect" and planned.jobs["4"].kind=="collect")
+        assert(planned.jobs["2"].partition~=planned.jobs["4"].partition and planned.jobs["2"].partitions==2)
+        assert(planned.jobs["3"].kind=="plant")
+    end)
+    test("Botting prioritizes existing farm drops and mixed box stock before harvesting or planting", function()
+        local B,c,m,board,now=planning()
+        board.farms.FARM.stored,board.farms.FARM.empty=8000,100
+        local planned=B.schedule(board,m,c,now)
+        assert(planned.jobs["1"].kind=="collect" and planned.jobs["2"].kind=="collect")
+        assert(planned.jobs["3"].kind=="plant" and planned.jobs["4"].kind=="collector")
+    end)
+    test("Botting breakers help at low storage and continue breaking above 6000", function()
+        local B,c,m,board,now=planning()
+        board.farms.FARM.loose=100
+        local low=B.schedule(board,m,c,now)
+        assert(low.jobs["2"].kind=="collect")
+        board.stock.blocks=6001
+        local high=B.schedule(board,m,c,now)
+        assert(high.jobs["2"].kind=="break" and high.jobs["4"].kind=="collector")
+    end)
+    test("Botting preserves draining hysteresis, cleans farm stock and plants empty dirt at high storage", function()
+        local B,c,m,board,now=planning()
+        board.stock.blocks,board.farms.FARM.empty=36000,100
+        local drain=B.schedule(board,m,c,now)
+        assert(drain.drain and drain.jobs["1"].kind=="plant")
+        for _,job in pairs(drain.jobs) do assert(job.kind~="harvest") end
+        board.farms.FARM.stored=1000
+        drain=B.schedule(board,m,c,now)
+        assert(drain.jobs["1"].kind=="collect")
+        drain.jobs,drain.stock.blocks={},12000
+        drain=B.schedule(drain,m,c,now)
+        assert(drain.drain)
+        drain.jobs,drain.stock.blocks={},6000
+        assert(not B.schedule(drain,m,c,now).drain)
+    end)
+    test("Botting finishes assigned work when storage crosses the high-water threshold", function()
+        local B,c,m,board,now=planning()
+        board.jobs["2"]={id="1:20",kind="collect",world="FARM",partition=1,partitions=2,owner=2}
+        board.stock.blocks=36000
+        local drain=B.schedule(board,m,c,now)
+        assert(drain.drain and drain.jobs["2"].id=="1:20")
+    end)
+    test("Botting low-level accounts can plant but never receive harvest or farm collection jobs", function()
+        local B,c,m,board,now=planning()
+        board.farms.FARM.empty,board.farms.FARM.loose=100,1000
+        m[3].role="rotation"
+        local planned=B.schedule(board,m,c,now)
+        assert(planned.jobs["3"].kind=="plant")
+        board.farms.FARM.empty=0
+        planned=B.schedule(board,m,c,now)
+        assert(planned.jobs["3"].kind=="break" or planned.jobs["3"].kind=="wait")
+    end)
+    test("Botting seed exhaustion drains remaining blocks before assigning fresh harvest or planting", function()
+        local B,c,m,board,now=planning()
+        board.stock.seeds=0
+        board.farms.FARM.empty=100
+        local drain=B.schedule(board,m,c,now)
+        assert(drain.seedDrain)
+        for _,job in pairs(drain.jobs) do assert(job.kind~="harvest" and job.kind~="plant") end
+        drain.jobs,drain.stock.seeds={},200
+        assert(B.schedule(drain,m,c,now).seedDrain)
+        drain.jobs,drain.stock.blocks={},0
+        assert(not B.schedule(drain,m,c,now).seedDrain)
+    end)
+    test("Seed-exhaustion draining waits for the breakers' final backpack stacks and placed blocks", function()
+        local B,c,m,board,now=planning()
+        board.seedDrain,board.stock.blocks,board.stock.seeds=true,0,200
+        m[2].carriedBlocks=200
+        assert(B.schedule(board,m,c,now).seedDrain)
+        m[2].carriedBlocks=0;board.stock.breakingTiles=1
+        assert(B.schedule(board,m,c,now).seedDrain)
+        board.stock.breakingTiles=0
+        assert(not B.schedule(board,m,c,now).seedDrain)
+    end)
+    test("Botting gives each breaker a distinct occupied spot and supports collector breaking", function()
+        local B,c,m,board,now=planning()
+        board.stock.blocks=10000
+        m[2].spot,m[3].spot=1,1
+        local planned=B.schedule(board,m,c,now)
+        assert(planned.jobs["2"].kind=="break" and planned.jobs["3"].kind=="wait")
+        m[4].spot,m[4].collectBreak=1,true
+        planned=B.schedule(board,m,c,now)
+        assert(planned.jobs["4"].kind=="collector" and planned.jobs["2"].kind=="wait")
+    end)
+    test("Botting does not latch seed exhaustion while matching seeds are being delivered", function()
+        local B,c,m,board,now=planning()
+        board.stock.seeds=0;m[2].carriedSeeds=200
+        assert(not B.schedule(board,m,c,now).seedDrain)
+    end)
+    test("Botting breaks safely without a collector and changes pickup ownership when one appears", function()
+        local B,c,m,board,now=planning()
+        board.stock.blocks=10000
+        m[4].active=false
+        local first=B.schedule(board,m,c,now)
+        assert(first.jobs["2"].collectOwn)
+        local id=first.jobs["2"].id
+        m[4].active=true
+        local next=B.schedule(first,m,c,now+2)
+        assert(next.jobs["2"].id==id and not next.jobs["2"].collectOwn)
+    end)
+    test("Botting retains a farm lease through retries and reassigns it after the owner expires", function()
+        local B,c,m,board,now=planning()
+        board.jobs["1"]={id="1:10",kind="harvest",world="FARM",owner=1}
+        board.farms.FARM.harvesting=true
+        assert(B.schedule(board,m,c,now).jobs["1"].id=="1:10")
+        table.remove(m,1);m[1].harvester=true
+        local next=B.schedule(board,m,c,now)
+        -- Cleanup partitions take priority; once no loose stock remains, the approved tree pass can resume.
+        next.jobs={};next.farms.FARM.harvesting=true;next.farms.FARM.growing=10
+        for _,member in ipairs(m) do if member.role~="collector" then member.role="rotation" end end
+        local resumed=B.schedule(next,m,c,now)
+        assert(resumed.jobs["1"]==nil and resumed.jobs["2"].kind=="harvest" and resumed.jobs["2"].approved)
+    end)
+    test("A lone eligible farm collector alternates partitions so the second half cannot starve", function()
+        local B,c,m,board,now=planning()
+        m[2].level=5
+        board.farms.FARM.loose=100
+        local first=B.schedule(board,m,c,now)
+        assert(first.jobs["1"].kind=="collect" and first.jobs["1"].partition==1)
+        m[1].done=first.jobs["1"].id
+        local second=B.schedule(first,m,c,now+2)
+        assert(second.jobs["1"].kind=="collect" and second.jobs["1"].partition==2)
+    end)
+    test("Botting ignores stale workers and mismatched configs without importing role preferences", function()
+        local B,c,m,board,now=planning()
+        local fingerprint=B.fingerprint(c)
+        for _,member in ipairs(m) do member.version=1;member.fingerprint=fingerprint end
+        m[1].at,m[2].fingerprint=now-91,"other"
+        local live=B.members(m,fingerprint,now)
+        assert(#live==2 and live[1].id==3)
+        c.botting.spots[1].x=2
+        assert(B.fingerprint(c)~=fingerprint)
+    end)
+
+    local function sharedAccount(id, storage, role, spot)
+        local f=fixture(id,storage)
+        configureBot(f)
+        f.world.name="BREAK"
+        f.boxes[12],f.boxes[8]={{954,10000}},{{955,7500}}
+        f.server=function(name) assert(name=="GetLevel");return 20 end
+        listfiles=function(folder)
+            local out={}
+            for path in pairs(f.files) do if path:sub(1,#folder+1)==folder.."/" then out[#out+1]=path end end
+            return out
+        end
+        f.app.job=nil
+        f.app.botting.setRole(role,spot)
+        f.app.job,f.app.botState="botting",{active=true}
+        return f
+    end
+    test("Botting shared instances see each other and elect exactly one leader", function()
+        local a=sharedAccount(1001,nil,"breaker",1)
+        a.app.botting.connect()
+        local b=sharedAccount(1002,a.storage,"collector",2)
+        b.app.botting.connect()
+        a.activate();a.app.botting.poll(true)
+        b.activate();b.app.botting.poll(true)
+        assert(a.app.botting.detectedCount==2 and b.app.botting.detectedCount==2)
+        assert(a.app.botting.board.leader==1001 and b.app.botting.board.leader==1001)
+        assert(a.app.botting.board.jobs["1001"].kind=="break" and b.app.botting.board.jobs["1002"].kind=="collector")
+    end)
+    test("Botting keeps live peers during partial file writes and elects a replacement only after lease expiry", function()
+        local a=sharedAccount(1001,nil,"breaker",1);a.app.botting.connect()
+        local b=sharedAccount(1002,a.storage,"collector",2);b.app.botting.connect()
+        a.activate();a.app.botting.poll(true)
+        b.activate();b.app.botting.poll(true)
+        a.files["ClarisGrowblox/teams/BNS/1001.json"]="partial-write"
+        b.app.botting.poll(true)
+        assert(b.app.botting.teamCount==2 and b.app.botting.board.leader==1001)
+        local realTime=os.time
+        local future=realTime()+100
+        os.time=function() return future end
+        local ok,issue=pcall(b.app.botting.poll,true)
+        os.time=realTime
+        assert(ok,issue)
+        assert(b.app.botting.teamCount==1 and b.app.botting.board.leader==1002)
+    end)
+    test("Botting refuses to overwrite another active team's layout under the same name", function()
+        local a=sharedAccount(1001,nil,"breaker",1);a.app.botting.connect()
+        local b=sharedAccount(1002,a.storage,"collector",2)
+        b.app.config.botting.spots[1].x=2
+        rejects(b.app.botting.connect,"different layout")
+        local board=a.services.HttpService:JSONDecode(a.files["ClarisGrowblox/teams/BNS/board.json"])
+        assert(board.leader==1001)
+    end)
+    test("Botting roles survive import and reload while another account gets its own role defaults", function()
+        local f=fixture();configureBot(f);f.app.job=nil
+        f.app.botting.setRole("collector",2,true)
+        local text=f.services.HttpService:JSONEncode(f.hooks.Core.exportConfig(f.app.config,"Shared","0.1.40"))
+        f.hooks.importConfiguration(text,"")
+        assert(f.app.botting.preferences.role=="collector" and f.app.botting.preferences.spot==2 and f.app.botting.preferences.collectBreak)
+        assert(f.app.config.botting.role==nil)
+        local next=f.reload(true)
+        assert(next.App.botting.preferences.role=="collector" and next.App.botting.preferences.spot==2)
+        local other=fixture(5678,f.storage)
+        assert(other.app.botting.preferences.role=="breaker" and other.app.botting.preferences.spot==1)
+    end)
+    test("Botting blocks startup when separate files cannot see the configured four accounts", function()
+        local f=sharedAccount(1001,nil,"breaker",1)
+        rejects(function()f.app.botting.run(1)end,"Botting sees 1/4")
+        assert(not f.app.botting.preferences.autoStart and f.app.stats.broken==0)
+    end)
+
+    test("Botting Collector takes adjacent bots' blocks, seeds and gems while standing still", function()
+        local f=pickupFixture();configureBot(f)
+        f.world.name="BREAK";f.avatar.x,f.avatar.y=10.5,9
+        f.app.job,f.app.botState,f.app.botting.level="botting",{active=true},20
+        f.addDrop(1,954,10,9.5,8.5);f.addDrop(2,955,10,11.5,8.5);f.addDrop(3,112,25,10.5,8.5)
+        f.hooks.takeControls().pausePickup=true
+        f.app.botting.api.collectBNS(1,false)
+        assert(#f.requests==3 and #f.drops==0 and f.avatar.x==10.5 and f.avatar.y==9)
+        assert(f.inventory:count(954)==10 and f.inventory:count(955)==10 and f.app.stats.gems==25)
+        assert(f.app.controls.pausePickup)
+    end)
+    test("Botting Breaker completes its block without taking or waiting for the resulting drops", function()
+        local f=fixture();configureBot(f)
+        f.world.name="BREAK";f.avatar.x,f.avatar.y=9.5,9
+        f.app.job,f.app.botState,f.app.botting.level="botting",{active=true},20
+        f.inventory:add(954,1)
+        local blocks=1
+        f.server=function(name) assert(name=="GetInventory");return {slots=blocks>0 and {{954,blocks}} or {},capacity=54} end
+        f.world.takeDrop=function() error("Breaker must not take drops") end
+        f.app.runtime.handlers={canPlace=function()return true end,setTile=function(_,x,y,id)f.world.fg[y][x]=id;blocks=blocks-1 end,
+            hit=function(x,y)f.world.fg[y][x]=0;f.drops[1]={uid=1,id=955,n=1,x=9.5,y=8.5};assert(f.world.takeDrop(1,1)==0) end}
+        f.app.botting.api.breakStep(1,false)
+        assert(f.app.stats.broken==1 and #f.drops==1 and f.inventory:count(954)==0 and f.app.controls.pausePickup)
+    end)
+    test("Continuous Botting runs its breaker role and stops with private auto-resume disabled", function()
+        local f=fixture();configureBot(f)
+        f.app.config.botting.expectedAccounts=1
+        f.app.job=nil;f.world.name="BREAK";f.avatar.x,f.avatar.y=9.5,9
+        f.boxes[12]={{954,10000}}
+        f.inventory:add(954,2)
+        local blocks=2
+        f.server=function(name)
+            if name=="GetLevel" then return 20 end
+            assert(name=="GetInventory",name)
+            return {slots=blocks>0 and {{954,blocks}} or {},capacity=54}
+        end
+        listfiles=function(folder)
+            local out={};for path in pairs(f.files) do if path:sub(1,#folder+1)==folder.."/" then out[#out+1]=path end end;return out
+        end
+        f.app.runtime.handlers={canPlace=function()return true end,plantSeed=function()error("Breaker must not plant while BNS stock is high")end,
+            setTile=function(_,x,y,id)f.world.fg[y][x]=id;blocks=blocks-1 end,hit=function(x,y)f.world.fg[y][x]=0 end}
+        f.onWait=function()if f.app.stats.broken>=2 and f.app.job then f.app:stop()end end
+        f.hooks.start("botting")
+        assert(f.app.stats.broken==2 and f.app.job==nil and not f.app.lastError,f.app.lastError)
+        assert(not f.app.botting.preferences.autoStart)
+    end)
+    test("Botting harvester leaves blocks and seeds for collectors while harvesting and taking gems", function()
+        local f=treeHarvestFixture("tractor");configureBot(f)
+        f.app.job,f.app.botState,f.app.botting.level="botting",{active=true},20
+        f.app.config.options.harvestPlanting=true
+        addTreeCurrency(f)
+        for _,y in ipairs({2,4,6}) do for _,x in ipairs({2,7,13}) do f.addTree(x,y)end end
+        f.expectedTrees=9
+        f.hooks.takeControls().pausePickup=true
+        f.app.botting.api.harvest({world="FARM",kind="harvest"},1)
+        local blocks,seeds,gems=0,0,0
+        for _,drop in ipairs(f.drops)do if drop.id==954 then blocks=blocks+drop.n elseif drop.id==955 then seeds=seeds+drop.n elseif drop.id==112 then gems=gems+drop.n end end
+        assert(#f.treeActions==9 and blocks==90 and seeds==18 and gems==0 and f.app.stats.gems==27)
+        assert(f.app.stats.planted==0 and not f.app.botState.storage)
+    end)
+    test("Botting collectors split supported farm rows even when every row has an even tile Y", function()
+        local f=zigzagHarvestFixture();configureBot(f)
+        f.app.job,f.app.botState,f.app.botting.level="botting",{active=true},20
+        local server=f.server
+        f.server=function(name,...)if name=="GetLevel"then return 20 end;return server(name,...)end
+        f.addDrop(1,954,10,5.5,2.5);f.addDrop(2,955,10,5.5,4.5);f.addDrop(3,112,25,5.5,6.5)
+        local transfers=0
+        f.app.botting.api.transferBoth=function()transfers=transfers+1;f.app.botState.phase=nil end
+        f.hooks.takeControls().pausePickup=true
+        f.app.botting.api.collectFarm({world="FARM",partition=1,partitions=2},1)
+        assert(#f.drops==1 and f.drops[1].uid==2 and f.app.stats.gems==25)
+        f.app.botting.api.collectFarm({world="FARM",partition=2,partitions=2},1)
+        assert(#f.drops==0 and transfers==2 and f.app.stats.harvested==10 and f.app.stats.harvestSeeds==10)
+    end)
+    test("Botting keeps deferred farm drops across job switches and retries them after moving", function()
+        local f=zigzagHarvestFixture();configureBot(f)
+        local deferred=f.addDrop(1,954,10,5.5,2.5)
+        f.addDrop(2,955,10,5.5,4.5)
+        f.app.job,f.app.botState,f.app.botting.level="botting",{active=true,
+            deferredHarvest={FARM={["1"]={id=954,x=5.5,y=2.5,retryAt=os.clock()+300}}}},20
+        local server=f.server
+        f.server=function(name,...)if name=="GetLevel"then return 20 end;return server(name,...)end
+        f.app.botting.api.transferBoth=function()f.app.botState.phase=nil end
+        f.hooks.takeControls().pausePickup=true
+        f.app.botting.api.collectFarm({world="FARM",partition=2,partitions=2},1)
+        assert(#f.drops==1 and f.drops[1]==deferred and f.app.stats.harvestSeeds==10)
+        local saved=f.app.botting.readResume().state
+        assert(saved.deferredHarvest.FARM["1"] and saved.rotation.deferredHarvest.FARM["1"])
+        f.app.botState=saved
+        f.app.botState.rotation=nil -- The engine clears per-job progress after completion.
+        assert(f.app.botting.api.observe().loose==0,"Deferred drops must not schedule another cleanup job")
+        f.app.botting.api.collectFarm({world="FARM",partition=1,partitions=2},1)
+        assert(#f.drops==1 and f.app.stats.harvested==0 and f.app.botState.deferredHarvest.FARM["1"])
+        deferred.y=4.5
+        assert(f.app.botting.api.observe().loose==10,"A moved drop must become eligible again")
+        f.app.botting.api.collectFarm({world="FARM",partition=2,partitions=2},1)
+        assert(#f.drops==0 and f.app.stats.harvested==10 and not f.app.botState.deferredHarvest.FARM["1"])
+    end)
+
+    local function dualFixture()
+        local f=fixture();configureBot(f)
+        f.app.job,f.app.botState,f.app.botting.level="botting",{active=true},20
+        f.world.name="FARM"
+        f.app.config.points.farmBox.standX=19
+        f.app.config.rotation.farms.FARM=f.app.config.points.farmBox
+        f.app.config.points.blockBox.standX=11
+        f.app.config.points.seedBox.standX=9
+        f.app.config.points.seedBox.y=7
+        f.app.config.points.plantBox=f.app.config.points.seedBox
+        f.world.fg[7][8]=1422
+        for x=0,29 do f.world.fg[9][x]=2 end
+        f.app.runtime.body.solidAt=function(x,y)return y==9 end
+        f.onWait=function(seconds)
+            local dir=f.controls.dir();f.avatar.vx=dir*7.2;f.avatar.x=f.avatar.x+dir*7.2*seconds;f.avatar.y=9;f.avatar.grounded=true
+        end
+        f.world.enter=function(name)f.world.name=name;return true end
+        f.boxes[12],f.boxes[8],f.boxes[20]={},{},{{954,600},{955,450}}
+        f.storageCalls={}
+        f.server=function(name,x,y,id,_,_,amount)
+            if name=="GetInventory" then
+                local slots={};for _,slot in ipairs(f.inventory.slots) do if slot.n>0 then slots[#slots+1]={slot.id,slot.n} end end
+                return {slots=slots,capacity=54}
+            end
+            assert(name=="DisplayItem",name)
+            f.storageCalls[#f.storageCalls+1]={world=f.world.name,x=x,id=id,amount=amount}
+            local rows=f.boxes[x]
+            if id then
+                if f.rejectSeeds and id==955 then return false,"Seed box temporarily refused deposit" end
+                f.inventory:remove(id,amount)
+                local found=false
+                for _,row in ipairs(rows) do if row[1]==id then row[2]=row[2]+amount;found=true end end
+                if not found then rows[#rows+1]={id,amount} end
+                if f.interruptSeed and id==955 then error("Connection lost after depositing seeds") end
+                return true,{}
+            end
+            local taken={}
+            for _,row in ipairs(rows) do
+                local n=math.min(row[2],f.inventory:room(row[1]))
+                if n>0 then row[2]=row[2]-n;f.inventory:add(row[1],n);taken[#taken+1]={row[1],n} end
+            end
+            return true,{taken=taken}
+        end
+        return f
+    end
+    test("Botting mixed transfers carry 200 blocks and 200 seeds together into separate BNS boxes", function()
+        local f=dualFixture()
+        f.app.botting.api.transferBoth({world="FARM"},1)
+        assert(f.boxes[20][1][2]==0 and f.boxes[20][2][2]==0)
+        assert(f.boxes[12][1][2]==600 and f.boxes[8][1][2]==450)
+        assert(f.app.stats.trips==3 and f.app.stats.moved==600 and #f.storageCalls==9)
+        assert(f.storageCalls[1].id==nil and f.storageCalls[2].amount==200 and f.storageCalls[3].amount==200)
+        assert(f.inventory:count(954)==0 and f.inventory:count(955)==0 and not f.app.botState.storage)
+    end)
+    test("Botting preserves an interrupted seed deposit after the paired blocks have been delivered", function()
+        local f=dualFixture();f.interruptSeed=true
+        rejects(function()f.app.botting.api.transferBoth({world="FARM"},1)end,"Connection lost")
+        local saved=f.app.botting.readResume()
+        assert(saved.state.phase=="deliver" and saved.state.storage.id==955 and saved.state.storage.action=="deposit")
+        assert(f.boxes[12][1][2]==200 and f.inventory:count(954)==0 and f.inventory:count(955)==0 and f.boxes[8][1][2]==200)
+        rejects(function()f.app.botting.run(1,saved)end,"interrupted Botting storage request")
+        assert(#f.storageCalls==3,"An ambiguous seed deposit must not be repeated automatically")
+    end)
+    test("An explicitly refused seed deposit can retry without repeating the paired block deposit", function()
+        local f=dualFixture();f.rejectSeeds=true
+        rejects(function()f.app.botting.api.transferBoth({world="FARM"},1)end,"temporarily refused")
+        assert(not f.app.botState.storage and f.app.botState.phase=="deliver" and f.inventory:count(955)==200)
+        f.rejectSeeds=false
+        f.app.botting.api.transferBoth({world="FARM"},1)
+        assert(f.boxes[12][1][2]==600 and f.boxes[8][1][2]==450 and #f.storageCalls==10)
+    end)
+    test("Botting resumes paired cargo after reload and deposits it before withdrawing another batch", function()
+        local f=dualFixture()
+        f.world.name="BREAK";f.inventory:add(954,200);f.inventory:add(955,200)
+        f.app.botState.phase="deliver";f.app.botting.save()
+        local runtime, saved=f.app.runtime,f.app.botting.readResume()
+        local next=f.reload(true)
+        f.app,f.hooks=next.App,next
+        f.app.runtime,f.app.job,f.app.token,f.app.botState,f.app.botting.level=runtime,"botting",1,saved.state,20
+        f.app.botting.api.transferBoth({world="FARM"},1)
+        assert(f.storageCalls[1].id==954 and f.storageCalls[2].id==955)
+        assert(f.boxes[12][1][2]==800 and f.boxes[8][1][2]==650 and f.inventory:count(955)==0)
+    end)
+
+    test("Hide game world keeps native GUI visibility updates hidden and restores the surviving viewport", function()
+        local f=pickupFixture();local m=attachMapVisuals(f)
+        local screen=m.frame("Frame")
+        m.sky.Parent,m.sky.Name=screen,"World"
+        local original=m.sky.Parent
+        Instance={new=function(class)
+            local wrapper=m.frame(class)
+            function wrapper:Destroy()self.Parent=nil;self.destroyed=true end
+            return wrapper
+        end}
+        f.app.config.options.fpsHideWorld=true
+        f.hooks.pollFPSBooster(true)
+        assert(f.app.fpsWorldHidden and f.world.lowGfx and not f.app.fpsMapError)
+        local wrapper=f.app.fpsMapState.wrapper
+        assert(not wrapper.Visible and m.sky.Parent==wrapper and wrapper.Parent==original)
+        m.sky.Visible=true -- Native draw loop continues to update its own Visible property.
+        assert(not wrapper.Visible and m.foreground.Image=="atlas-original" and m.hud.Image=="atlas-original")
+        f.app.config.options.fpsHideWorld=false
+        f.hooks.pollFPSBooster(true)
+        assert(m.sky.Parent==original and wrapper.destroyed and not f.world.lowGfx and not f.app.fpsWorldHidden)
+    end)
+    test("Hidden game world switches to grey map and restores before unload", function()
+        local f=pickupFixture();local m=attachMapVisuals(f)
+        local parent=m.frame("Frame");m.sky.Parent=parent
+        Instance={new=function(class)
+            local wrapper=m.frame(class)
+            function wrapper:Destroy()self.Parent=nil end
+            return wrapper
+        end}
+        f.app.config.options.fpsGreyMap=true;f.hooks.pollFPSBooster(true)
+        assert(m.foreground.Image=="")
+        f.app.config.options.fpsHideWorld=true;f.hooks.pollFPSBooster(true)
+        assert(f.app.fpsWorldHidden and m.foreground.Image=="atlas-original")
+        f.app.config.options.fpsHideWorld=false;f.hooks.pollFPSBooster(true)
+        assert(not f.app.fpsWorldHidden and m.foreground.Image=="")
+        f.app:destroy()
+        assert(m.foreground.Image=="atlas-original" and m.sky.Parent==parent and not f.world.lowGfx)
+    end)
+    test("The actual Botting UI restores role controls after importing the emulator setup", function()
+        local f,app,controls,workers=actualUIFixture()
+        controls["This account's role"]:Select("Collector")
+        assert(app.botting.preferences.role=="collector")
+        local record=f.hooks.Core.exportConfig(app.config,"Team Setup","0.1.40")
+        controls["Configuration text"].Value=f.services.HttpService:JSONEncode(record)
+        controls["Import config"].Props.Callback();workers[3]()
+        assert(app.botting.preferences.role=="collector" and controls["This account's role"].Value=="Collector")
+        assert(not app.syncingUI and not app.job)
+    end)
+end
 return string.format("%d actual-script runtime tests passed (mock services/server)", passed)
