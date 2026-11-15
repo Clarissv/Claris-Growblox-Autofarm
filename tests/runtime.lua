@@ -5055,6 +5055,15 @@ test("Denied seed storage retains an ambiguous withdrawal checkpoint and refuses
     assert(f.withdrawals == 1 and f.app.lastError:find("storage withdrawal was interrupted", 1, true))
 end)
 
+test("An unreachable seed box keeps planting in stock phase because no withdrawal was sent",function()
+    local f=plantingFixture(0,100)
+    for y=0,5 do f.grids.STOCK[y][2]=2 end
+    f.hooks.start("plant")
+    assert(f.app.lastError and f.app.lastError:find("route",1,true),f.app.lastError)
+    assert(f.withdrawals==0 and f.app.pending==0)
+    assert(f.hooks.readPlantResume().state.phase=="stock","Walking failure was incorrectly saved as a pending seed withdrawal")
+end)
+
 test("A server teleport stores farm index and restores the full configuration in a fresh instance", function()
     local f = plantingFixture(0, 100, {"FARM1", "FARM2"})
     f.app.profile = "Sugar Cane Farms"
@@ -7173,6 +7182,18 @@ do
         planned=B.schedule(board,m,c,now)
         assert(planned.jobs["3"].kind=="break" or planned.jobs["3"].kind=="wait")
     end)
+    test("A level-8 Breaker stays in BNS above low stock and plants only when helping or filling drain farms",function()
+        local B,c,m,board,now=planning()
+        m={m[3]};m[1].level=8
+        board.farms.FARM.empty,board.farms.FARM.ripe=100,0
+        board.stock.blocks=18371
+        assert(B.schedule(board,m,c,now).jobs["3"].kind=="break","A low-level Breaker left 18371 BNS blocks to plant")
+        board.stock.blocks=6000
+        assert(B.schedule(board,m,c,now).jobs["3"].kind=="plant")
+        board.stock.blocks=36000
+        local drain=B.schedule(board,m,c,now)
+        assert(drain.drain and drain.jobs["3"].kind=="plant")
+    end)
     test("Botting seed exhaustion drains remaining blocks before assigning fresh harvest or planting", function()
         local B,c,m,board,now=planning()
         board.stock.seeds=0
@@ -7314,6 +7335,54 @@ do
     end)
     test("Botting resumes planting seed refill in BNS without first returning to the farm",function()
         resumeAssignedBottingJob("rotation","plant","BREAK",{plant={phase="stock",worldIndex=1,skipped={}}})
+    end)
+    local function bottingPlantFixture(seeds)
+        local f=plantingFixture(seeds,100,{"FARM1"})
+        local c=f.app.config
+        c.botting.world,c.botting.expectedAccounts="STOCK",1
+        c.botting.spots={{world="STOCK",x=1,y=5}}
+        c.points.seedBox=c.points.plantBox
+        c.rotation.farms.FARM1={world="FARM1",x=6,y=4,standX=5,standY=5}
+        f.app.job,f.app.botState,f.app.botting.level="botting",{active=true},8
+        f.app.botting.api.observe=function()end
+        f.app.botting.api.level=function()return 8 end
+        listfiles=function()return {}end
+        f.shortcuts=0
+        f.app.botting.api.shortcut=function()f.shortcuts=f.shortcuts+1 end
+        return f
+    end
+    test("A level-8 Botting planter uses the BNS shortcut and checkpoints only the actual seed withdrawal",function()
+        local f=bottingPlantFixture(0)
+        f.app.botState.plant={phase="stock",worldIndex=1,skipped={}}
+        local server=f.server
+        f.server=function(name,...)
+            if name=="DisplayItem" then
+                assert(f.app.botState.plant.phase=="pickupPending" and f.app.botState.storage.action=="withdraw")
+            end
+            return server(name,...)
+        end
+        f.app.botting.api.plant({world="FARM1"},1)
+        assert(f.shortcuts==1 and f.withdrawals==1 and f.app.stats.planted==7 and not f.app.botState.storage)
+    end)
+    test("Botting recovers an old pending seed approach with no storage RPC and fills the farm",function()
+        local f=bottingPlantFixture(0)
+        f.app.botState.plant={phase="pickupPending",worldIndex=1,skipped={}}
+        f.app.botting.api.plant({world="FARM1"},1)
+        assert(f.withdrawals==1 and f.app.stats.planted==7 and f.app.plantingRecovery:find("Recovered Botting seed refill",1,true))
+    end)
+    test("Botting resumes a confirmed old seed refill from inventory without withdrawing again",function()
+        local f=bottingPlantFixture(7)
+        f.app.botState.plant={phase="pickupPending",worldIndex=1,skipped={}}
+        f.app.botting.api.plant({world="FARM1"},1)
+        assert(f.withdrawals==0 and f.app.stats.planted==7 and f.serverSeeds==0)
+    end)
+    test("An unconfirmed Botting seed withdrawal preserves its checkpoint and cannot replay",function()
+        local f=bottingPlantFixture(0)
+        f.app.botState.plant={phase="pickupPending",worldIndex=1,skipped={}}
+        f.app.botState.storage={action="withdraw",id=955,point=f.app.config.points.plantBox,before=0}
+        f.app.botting.save()
+        rejects(function()f.app.botting.run(1,f.app.botting.readResume())end,"interrupted Botting storage request")
+        assert(f.withdrawals==0 and f.app.botting.readResume().state.storage.id==955)
     end)
     test("Botting shared instances see each other and elect exactly one leader", function()
         local a=sharedAccount(1001,nil,"breaker",1)

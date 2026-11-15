@@ -1,6 +1,6 @@
 # Botting setup and operation
 
-For **Claris Growblox 0.1.41**. Botting coordinates accounts on one cloudphone through a shared executor folder. Each account has its own role, breaker spot and recovery checkpoint. Export the emulator's layout once, import it into every account, then choose each account's role in **Botting**.
+For **Claris Growblox 0.1.42**. Botting coordinates accounts on one cloudphone through a shared executor folder. Each account has its own role, breaker spot and recovery checkpoint. Export the emulator's layout once, import it into every account, then choose each account's role in **Botting**.
 
 ## 1. Prepare the world and accounts
 
@@ -62,7 +62,7 @@ Being on the same cloudphone does not necessarily mean cloned apps share executo
 1. Keep all four instances running and import the same layout into each.
 2. Press **Botting → Connect team / refresh teammates** on every account.
 3. Check **Team status**. All instances must report **Detected 4 accounts** with the same team folder and setup. Registered accounts can be detected before their Botting toggle is enabled; the active count rises as you start them.
-4. If an instance only detects itself, its executor files are isolated. Point every instance at a folder actually shared by the executor/app setup, then reconnect. An Android shared-storage location works only when the executor and Android permissions allow all instances to read/write it. This build uses local shared files; it does not synchronize across isolated folders or separate devices.
+4. If an instance only detects itself, first check that its team name, shared folder and imported layout match the others, including newly added breaker spots. If they match and it still only detects itself, its executor files may be isolated. Point every instance at a folder actually shared by the executor/app setup, then reconnect. An Android shared-storage location works only when the executor and Android permissions allow all instances to read/write it. This build uses local shared files; it does not synchronize across isolated folders or separate devices.
 5. Enable **Continuous Botting** on each account. Starting is blocked if fewer than the configured number of accounts are detected.
 6. Watch one short breaking/collection cycle, a storage deposit and a farm handoff before leaving it unattended.
 
@@ -77,6 +77,8 @@ The account repeatedly places and breaks the selected block directly above its s
 When an eligible BNS collector is active, native pickups on the breaker are suppressed so the collector owns the block, seed and gem pickups. If the collector is unavailable, the breaker can collect its own nearby returns and gems. A level 10+ breaker also collects and stores seeds; a level 1–9 breaker leaves seeds for an account that can store them.
 
 At **6,000 stored blocks or below**, breakers help farm work: harvest if eligible and equipped, collect/transfer if level 10+, or plant if seeds and empty dirt are available. Above that threshold, breakers generally remain in BNS. An already assigned farm job finishes before the worker changes jobs.
+
+This low-stock rule also applies to level 1–9 Breakers. Being below level 10 permits planting as their only farm task; it does not send them planting while normal BNS stock is above 6,000. Draining mode can still assign empty dirt to be filled before focusing on breaking.
 
 ### Collector
 
@@ -153,6 +155,8 @@ While Botting runs, it saves its account's config snapshot, assigned job, planti
 The lowest active account ID is the current file coordinator. Active workers publish heartbeats, and farm assignments stay with their owner while the job runs. Short file-write gaps use the last valid data rather than immediately replacing a worker. A worker missing for about **90 seconds** can lose its lease and have unfinished work reassigned. An account returning with held transfer cargo unloads that cargo before accepting a different assignment.
 
 Routing and ordinary operation failures retry after five seconds. Storage or planting requests with an unconfirmed outcome retain their checkpoint for review. Check **Copy diagnostics** for the job, role, level, leader, teammate count and last error.
+
+Seed-refill trips use the saved BNS shortcut door. A failure while walking to the seed box leaves the stock phase retryable because no withdrawal has been sent. Older Botting saves marked that approach as `pickupPending`; if there is no unconfirmed storage record, the script refreshes inventory and resumes planting with held seeds or retries stock collection. A real unconfirmed storage request remains paused. The shortcut does not replace the need for a supported route from its exit to the saved seed-box standing tile.
 
 When upgrading from 0.1.40, update the loader on all team instances, then use **Resume saved Botting** if automatic execution is unavailable. Existing configs, roles and checkpoints are compatible; the update does not require resaving every location or clearing cargo evidence.
 

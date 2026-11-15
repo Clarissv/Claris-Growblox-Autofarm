@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.41"
+local VERSION = "0.1.42"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -1172,7 +1172,7 @@ end
 local function storageCount(point, id, companionId)
     return Core.storageCount(boxRows(point), id, companionId)
 end
-local function withdraw(point, id, token, companionId)
+local function withdraw(point, id, token, companionId, onReady)
     worldCheck(point.world, token)
     moveToPoint(point, token)
     if storageCount(point, id, companionId) == 0
@@ -1180,6 +1180,7 @@ local function withdraw(point, id, token, companionId)
     refreshInventory(token)
     assert(runtime().inventory:room(id) > 0, "Your backpack has no room for this block.")
     local before, companionBefore = count(id), companionId and count(companionId) or 0
+    if onReady then onReady(before) end -- Movement can fail before any storage request exists.
     if App.botting then App.botting.beforeStorage("withdraw", point, id, nil, companionId) end
     local ok, result = bounded(runtime().world.call, App.config.options.actionTimeout, token,
         "DisplayItem", point.x, point.y, nil)
@@ -3194,22 +3195,33 @@ local function runPlant(token, saved, lastWorldIndex)
         Core.checkSetup(App.config, "plant", runtime().items)
         local settings, id = App.config.planting, App.config.planting.seedId
         local state = saved and saved.state or {worldIndex = 1, phase = "farm", skipped = {}}
+        if state.phase == "pickupPending" and App.job == "botting" and App.botState
+            and not App.botState.storage and App.pending == 0 then
+            -- Botting saves a separate storage record immediately before each
+            -- RPC and clears it only for confirmed results or explicit refusal.
+            -- Older planting checkpoints also marked the approach as pending.
+            refreshInventory(token)
+            state.phase = count(id) > 0 and "farm" or "stock"
+            App.plantingRecovery = "Recovered Botting seed refill without an unconfirmed storage request: " .. state.phase
+        end
         assert(state.phase ~= "pickupPending", "A seed storage withdrawal was interrupted. Check the backpack and box, then clear saved planting.")
         savePlantResume(state)
         local lastWorld = lastWorldIndex or #settings.worlds
         while state.worldIndex <= lastWorld do
             checkpoint(token)
             if state.phase == "stock" then
-                enterPlantWorld(settings.storageWorld, state, token)
+                if App.job == "botting" then App.botting.api.go(settings.storageWorld, token)
+                else enterPlantWorld(settings.storageWorld, state, token) end
                 local box = App.config.points.plantBox
                 if storageCount(box, id) == 0 then
                     clearPlantResume()
                     setStatus("Planting stopped: the seed storage box is empty. Unfinished farm: " .. settings.worlds[state.worldIndex])
                     return false
                 end
-                state.phase = "pickupPending"
-                savePlantResume(state)
-                withdraw(box, id, token)
+                withdraw(box, id, token, nil, function()
+                    state.phase = "pickupPending"
+                    savePlantResume(state)
+                end)
                 state.phase = "farm"
                 savePlantResume(state)
             end

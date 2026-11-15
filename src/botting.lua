@@ -161,7 +161,7 @@ function Botting.schedule(previous, members, c, now)
             end
             -- Planting is last priority. A filling/draining farm still gets its
             -- empty dirt planted; low-level accounts are eligible for this only.
-            local canPlant = farmWorker or level < 10 or board.drain and member.role ~= "collector"
+            local canPlant = farmWorker or help and level < 10 or board.drain and member.role ~= "collector"
             if not assigned and canPlant and stockFresh and seeds > 0 and not board.seedDrain then
                 for _, world in ipairs(c.planting.worlds) do
                     local farm = board.farms[world]
