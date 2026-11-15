@@ -2,7 +2,7 @@
 local Core = {}
 Core.VERSION = 1
 Core.REPO = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/"
-Core.POINTS = { "pnb", "blockBox", "seedBox", "farmBox", "farmDoor", "breakDoor", "plantBox" }
+Core.POINTS = { "pnb", "blockBox", "seedBox", "farmBox", "moveBox", "farmDoor", "breakDoor", "plantBox" }
 Core.BOOL_OPTIONS = { "antiAFK", "autoRejoin", "moveAfterHarvest", "harvestRespawn", "fpsBooster", "harvestPlanting" }
 Core.LIMITS = {
     placeDelay = { 0.15, 2 }, punchDelay = { 0.22, 2 },
@@ -20,6 +20,7 @@ function Core.defaults()
             discordId = "", failureAlerts = true },
         planting = {seedId = 0, storageWorld = "", worlds = {}},
         harvesting = {method = "fist"},
+        moving = {item = "blocks"},
         rotation = {farms = {}},
     }
 end
@@ -124,6 +125,11 @@ function Core.validate(input)
     local out = Core.defaults()
     out.webhook = Core.validateWebhook(input.webhook)
     out.planting = Core.validatePlanting(input.planting)
+    if input.moving ~= nil then
+        assert(type(input.moving) == "table" and (input.moving.item == "blocks" or input.moving.item == "seeds"),
+            "Invalid Moving Drops item.")
+        out.moving.item = input.moving.item
+    end
     if input.harvesting ~= nil then
         assert(type(input.harvesting) == "table" and (input.harvesting.method == "fist" or input.harvesting.method == "tractor"),
             "Invalid harvesting method.")
@@ -347,6 +353,10 @@ function Core.ripeTrees(world, seedId, row, ripe)
     return result
 end
 
+function Core.transferDestination(config)
+    return config.points.moveBox or config.points[config.moving and config.moving.item == "seeds" and "seedBox" or "blockBox"]
+end
+
 function Core.checkSetup(config, mode, items)
     assert(mode == "pnb" or mode == "transfer" or mode == "harvest" or mode == "plant" or mode == "rotation", "Unknown farming task.")
     if mode == "rotation" then
@@ -373,7 +383,7 @@ function Core.checkSetup(config, mode, items)
     assert(Core.farmable(items[config.blockId]), "Choose a farmable block from your inventory.")
     local keys = mode == "pnb" and { "pnb", "blockBox", "seedBox" }
         or mode == "harvest" and { "farmBox" }
-        or { "farmBox", "farmDoor", "blockBox", "breakDoor" }
+        or { "farmBox" }
     for _, key in ipairs(keys) do
         assert(config.points[key], "Save this location first: " .. key)
     end
@@ -387,9 +397,10 @@ function Core.checkSetup(config, mode, items)
             "Layout must be: seed box, empty tile, player, empty tile, block box.")
         assert(p.pnb.x >= 2 and p.pnb.y >= 1, "PNB tile or storage layout is outside the world.")
     elseif mode == "transfer" then
-        assert(p.farmBox.world == p.farmDoor.world, "Farm storage and farm door must be in the same world.")
-        assert(p.blockBox.world == p.breakDoor.world, "Block storage and return door must be in the same world.")
-        assert(p.farmBox.world ~= p.blockBox.world, "Farm and breaking worlds must be different.")
+        Core.seedId(items, config.blockId)
+        local destination = Core.transferDestination(config)
+        assert(destination, "Save the destination Display Box on Moving Drops first.")
+        assert(p.farmBox.world ~= destination.world, "Farm and destination worlds must be different.")
     end
     return true
 end

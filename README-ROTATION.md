@@ -1,6 +1,6 @@
 # Full Rotation guide
 
-For **Claris Growblox 0.1.37**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
+For **Claris Growblox 0.1.38**. Full Rotation manages every world in your **Planting** farm list using your saved PNB setup and one harvest Display Box per farm.
 
 The usual flow is **fill planting space → collect existing farm stock if needed → PNB while trees grow → harvest a ready farm → transfer its blocks and seeds → replant that farm → repeat**. Planting and ready harvests normally take priority over breaking. When the planting seed supply is exhausted, rotation finishes the full PNB block stock first. A full farm skips planting even when seed storage contains thousands of seeds.
 
@@ -37,7 +37,7 @@ Keep the **PNB/seed-storage world outside the farm list**. For example, use `BRE
 
 Run the GitHub loader shown under [Save configuration and start](#save-configuration-and-start) to open the setup tabs. Keep tasks Off while saving your initial setup.
 
-Rotation enters worlds directly by name. Linked doors are required for standalone **Moving Drops**, but you do not need to save them for Full Rotation. Keep entrances, side platforms, and access to boxes clear.
+Rotation and standalone **Moving Drops** enter worlds directly by name; neither requires linked doors. Keep entrances, side platforms, and access to boxes clear. Standalone Moving Drops now needs only its Farm and destination Display Boxes, with a Blocks/Seeds choice. Full Rotation always transfers harvested blocks to its dedicated PNB block box and seeds to its PNB seed box, independently of the standalone choice or destination. See [Moving Drops setup](README.md#set-up-moving-drops) for manual transfers.
 
 ## Save the PNB layout
 
@@ -314,7 +314,7 @@ For each account:
 6. Check webhook settings and save that account's named profile.
 7. Start a fresh rotation.
 
-Use separate farms and storage for simultaneous accounts. The script does not coordinate shared harvesting, planting, or withdrawals. Each account needs world access and its own tractor for Tractor mode. Update linked doors too if using standalone Moving Drops.
+Use separate farms and storage for simultaneous accounts. The script does not coordinate shared harvesting, planting, or withdrawals. Each account needs world access and its own tractor for Tractor mode. For standalone Moving Drops, save that account's Farm and destination Display Boxes and choose Blocks or Seeds.
 
 From v0.1.29, sessions, named profiles, exports and all task checkpoints use **`ClarisGrowblox/accounts/<RobloxUserId>/`**. The user ID comes from the logged-in Roblox player, so no extra slot name or isolation setting is needed. Even identical profile names are separate. The loader's verified code cache remains shared. **Update both cloud-phone instances to v0.1.29 or newer.** In Settings > Copy diagnostics, compare Roblox account and Account data: the two IDs/folders must differ.
 

@@ -1,7 +1,7 @@
 -- Built by build.mjs. Use the generated loader.lua in Delta.
 local Core = __CLARIS_CORE__
 local Navigation = __CLARIS_NAV__
-local VERSION = "0.1.37"
+local VERSION = "0.1.38"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -21,6 +21,7 @@ local SESSION_FILE = ROOT .. "/session.json"
 local PLANT_RESUME_FILE = ROOT .. "/plant-resume.json"
 local ROTATION_RESUME_FILE = ROOT .. "/rotation-resume.json"
 local saveRotationResume
+local enterPlantWorld
 local queueWebhookEvent
 local restoreFPSBooster, pollFPSBooster
 local previousSession = env.ClarisGrowbloxApp
@@ -1238,15 +1239,18 @@ local function readPNBResume()
     record.config, record.profile = Core.validate(record.config), Core.profileName(record.profile)
     return record
 end
-local function saveResume(phase, cargo)
+local function saveResume(phase, cargo, item)
     saveSession()
+    item = item or (App.rotationState and "blocks" or App.config.moving.item)
+    local blockId, seedId = App.config.blockId, Core.seedId(runtime().items, App.config.blockId)
     local record = { version = 1, active = true, userId = ACCOUNT_ID, updatedAt = os.time(),
         config = Core.validate(App.config), profile = App.profile, phase = phase, cargo = cargo or 0,
-        seeds = count(Core.seedId(runtime().items, App.config.blockId)) }
+        item = item, companion = count(item == "seeds" and blockId or seedId), seeds = count(seedId) }
     writeJSON(RESUME_FILE, record)
     App.resume = record
     if App.rotationState then
-        App.rotationState.transfer = {phase = phase, cargo = cargo or 0, seeds = record.seeds}
+        App.rotationState.transfer = {phase = phase, cargo = cargo or 0, seeds = record.seeds,
+            item = item, companion = record.companion}
         saveRotationResume(App.rotationState)
     end
 end
@@ -2587,21 +2591,31 @@ end
 
 local function runTransfer(token, saved, travel)
     if not travel then Core.checkSetup(App.config, "transfer", runtime().items) end
-    local p, id = App.config.points, App.config.blockId
-    local seedId = Core.seedId(runtime().items, id)
+    local p, blockId = App.config.points, App.config.blockId
+    local seedId = Core.seedId(runtime().items, blockId)
+    local item = travel and "blocks" or saved and saved.item or App.config.moving.item
+    assert(item == "blocks" or item == "seeds", "Invalid saved Moving Drops item.")
+    local id, companionId = item == "seeds" and seedId or blockId, item == "seeds" and blockId or seedId
+    local companionName = item == "seeds" and "blocks" or "seeds"
+    local destination = travel and p.blockBox or Core.transferDestination(App.config)
     local phase = saved and saved.phase or "pickup"
     local cargo = saved and saved.cargo or 0
+    local function save(nextPhase, amount) saveResume(nextPhase, amount, item) end
+    local function go(name)
+        save(phase, cargo)
+        if travel then travel(name) else enterPlantWorld(name, nil, token, true) end
+    end
     assert(phase == "pickup" or phase == "deliver" or phase == "return" or phase == "returnSeeds", "Invalid transfer resume phase.")
     if saved then
         local expected = {[p.farmBox.world] = true}
-        if phase ~= "pickup" then expected[p.blockBox.world] = true end
+        if phase ~= "pickup" then expected[destination.world] = true end
         local deadline = os.clock() + App.config.options.actionTimeout + 15
         setStatus("Waiting for the transfer world and avatar...")
         while true do
             checkpoint(token)
             local r = runtime()
             assert(r.world.name == nil or r.world.name == "" or expected[r.world.name],
-                "The saved transfer arrived in an unexpected world. Check its doors and destination.")
+                "The saved transfer arrived in an unexpected world. Check its saved boxes.")
             if expected[r.world.name] then
                 if pickerOpen(r) then r.picker.complete() end
                 local state = r.body and r.body.state()
@@ -2610,66 +2624,65 @@ local function runTransfer(token, saved, travel)
             assert(os.clock() < deadline, "The transfer world or avatar did not become ready after loading.")
             pause(0.05, token)
         end
-        if saved.seeds then
+        if saved.companion or item == "blocks" and saved.seeds then
             refreshInventory(token)
-            assert(count(seedId) >= saved.seeds, "Some saved transfer seeds are missing. Check the backpack before resuming.")
+            assert(count(companionId) >= (saved.companion or saved.seeds),
+                "Some saved transfer " .. companionName .. " are missing. Check the backpack before resuming.")
         end
-    else worldCheck(p.farmBox.world, token) end
+    else go(p.farmBox.world) end
     while true do
         checkpoint(token)
         if phase == "pickup" then
             worldCheck(p.farmBox.world, token)
-            if storageCount(p.farmBox, id, seedId) == 0 then
+            if storageCount(p.farmBox, id, companionId) == 0 then
                 phase = "returnSeeds"
-                saveResume(phase, 0)
+                save(phase, 0)
             else
-                setStatus("Taking blocks from Farm storage; keeping up to 200 seeds for mixed-box transfers...")
-                saveResume("pickupPending", 0)
-                local taken, seeds = withdraw(p.farmBox, id, token, seedId)
-                assert(taken > 0 or seeds > 0 and count(seedId) <= 200, "No blocks or matching seeds were withdrawn.")
-                -- A box can return seeds first. Keep them so the next withdrawal has no seed room.
+                setStatus("Taking " .. item .. " from Farm storage; holding up to 200 " .. companionName .. " for mixed-box transfers...")
+                save("pickupPending", 0)
+                local taken, companion = withdraw(p.farmBox, id, token, companionId)
+                assert(taken > 0 or companion > 0 and count(companionId) <= 200, "No selected items or matching companion items were withdrawn.")
+                -- Keep the other item between trips so it cannot fill the next withdrawal.
                 cargo = taken
                 phase = taken > 0 and "deliver" or "pickup"
-                saveResume(phase, cargo)
+                save(phase, cargo)
             end
         elseif phase == "deliver" then
             if runtime().world.name == p.farmBox.world then
-                setStatus("Going through the door to the breaking world...")
-                if travel then travel(p.blockBox.world)
-                else enterDoor(p.farmDoor, p.blockBox, "deliver", cargo, token) end
+                setStatus("Going to the destination Display Box world...")
+                go(destination.world)
             end
-            worldCheck(p.blockBox.world, token)
-            setStatus("Putting the transported blocks into PNB storage...")
+            worldCheck(destination.world, token)
+            setStatus("Putting the transported " .. item .. " into destination storage...")
             -- Save the count before issuing a mutating request. An interrupted deposit is
             -- ambiguous; resume refuses to repeat it until the player checks the inventory.
-            local moved = deposit(p.blockBox, id, cargo, token, function(available)
+            local moved = deposit(destination, id, cargo, token, function(available)
                 assert(available >= cargo, "Some saved cargo is missing. Check your backpack before resuming.")
-                saveResume("depositPending", cargo)
-            end)
+                save("depositPending", cargo)
+            end, not travel and companionId or nil)
             App.stats.trips = App.stats.trips + 1
             App.stats.moved = App.stats.moved + moved
             cargo = 0
             phase = "return"
-            saveResume(phase, cargo)
+            save(phase, cargo)
         elseif phase == "return" then
-            if runtime().world.name == p.blockBox.world then
-                setStatus("Returning through the door to the farm world...")
-                if travel then travel(p.farmBox.world)
-                else enterDoor(p.breakDoor, p.farmBox, "return", 0, token) end
+            if runtime().world.name == destination.world then
+                setStatus("Returning to the Farm Display Box world...")
+                go(p.farmBox.world)
             end
             worldCheck(p.farmBox.world, token)
             phase = "pickup"
-            saveResume(phase, 0)
+            save(phase, 0)
         elseif phase == "returnSeeds" then
             worldCheck(p.farmBox.world, token)
-            if count(seedId) > 0 then
-                setStatus("Returning the held seeds to the Farm Display Box...")
-                deposit(p.farmBox, seedId, count(seedId), token, function()
-                    saveResume("seedReturnPending", 0)
+            if count(companionId) > 0 then
+                setStatus("Returning the held " .. companionName .. " to the Farm Display Box...")
+                deposit(p.farmBox, companionId, count(companionId), token, function()
+                    save("seedReturnPending", 0)
                 end, id)
             end
             clearResume()
-            setStatus("Finished: all Farm storage blocks moved; seeds returned to the same box.")
+            setStatus("Finished: all Farm storage " .. item .. " moved; held " .. companionName .. " returned to the same box.")
             return
         end
     end
@@ -2777,7 +2790,7 @@ local function readPlantResume(record)
     end
     return record
 end
-local function enterPlantWorld(name, state, token)
+enterPlantWorld = function(name, state, token, moving)
     suspendHarvestVehicle(token)
     local r = runtime()
     local attempts, nextEntry, stableSince = 0, 0, nil
@@ -2792,20 +2805,27 @@ local function enterPlantWorld(name, state, token)
         checkpoint(token)
         if (r.world.name ~= name or pickerOpen(r)) and os.clock() >= nextEntry then
             attempts = attempts + 1
-            assert(attempts <= 3, "Planting world repeatedly returned to the picker: " .. name)
+            assert(attempts <= 3, "World entry repeatedly returned to the picker: " .. name)
             assert(type(r.world.enter) == "function", "The world entry hook is unavailable.")
-            if App.rotationState then saveRotationResume(App.rotationState) else savePlantResume(state) end
+            if App.rotationState then saveRotationResume(App.rotationState)
+            elseif moving then
+                assert(App.resume, "Moving Drops checkpoint is missing before world entry.")
+                saveResume(App.resume.phase, App.resume.cargo, App.resume.item)
+            else savePlantResume(state) end
             local queued = queueResume()
             setStatus("Entering " .. name .. "...")
             local entered, message, teleport = bounded(r.world.enter, App.config.options.actionTimeout + 15, token, name)
             if teleport then
                 App.teleporting = true
-                setStatus(queued and (App.rotationState and "Changing servers; rotation will resume after loading." or "Changing servers; planting will resume after loading.")
+                setStatus(queued and (App.rotationState and "Changing servers; rotation will resume after loading."
+                        or moving and "Changing servers; Moving Drops will resume after loading." or "Changing servers; planting will resume after loading.")
                     or (App.rotationState and "Changing servers. Run the loader after arrival, then use Resume saved rotation."
+                        or moving and "Changing servers. Run the loader after arrival, then use Resume saved transfer."
                         or "Changing servers. Run the loader after arrival, then use Resume planting."))
                 local teleportDeadline = os.clock() + 45
                 while os.clock() < teleportDeadline do pause(0.2, token) end
                 error(App.rotationState and "Server teleport did not finish. Use Resume saved rotation after arrival."
+                    or moving and "Server teleport did not finish. Use Resume saved transfer after arrival."
                     or "Server teleport did not finish. Use Resume planting after arrival.")
             end
             if not entered then assert(attempts < 3, tostring(message or "Could not enter " .. name))
@@ -2817,9 +2837,9 @@ local function enterPlantWorld(name, state, token)
         if r.world.name == name and not pickerOpen(r) and avatar and avatar.active and not avatar.dead
             and not player:GetAttribute("Frozen") then
             stableSince = stableSince or os.clock()
-            if os.clock() - stableSince >= 1 then break end
+            if os.clock() - stableSince >= (moving and 0 or 1) then break end
         else stableSince = nil end
-        assert(os.clock() < deadline, "Planting world or avatar did not finish loading: " .. name)
+        assert(os.clock() < deadline, "World or avatar did not finish loading: " .. name)
         pause(0.1, token)
     end
     App.teleporting = false
@@ -2827,7 +2847,7 @@ local function enterPlantWorld(name, state, token)
     -- movement or returning to the unfinished planting/harvest position.
     suspendHarvestVehicle(token)
     takeControls()
-    refreshInventory(token)
+    if not moving then refreshInventory(token) end
 end
 local function deferPlantTile(state, point, reason)
     local key=point.x .. ":" .. point.y
@@ -3389,6 +3409,9 @@ local function readRotationResume()
             and type(t.cargo) == "number" and t.cargo >= 0 and t.cargo <= 200 and t.cargo == math.floor(t.cargo)
             and type(t.seeds) == "number" and t.seeds >= 0 and t.seeds <= 200 and t.seeds == math.floor(t.seeds),
             "Invalid saved rotation transfer.")
+        assert(t.item == nil or t.item == "blocks", "Rotation transfer must carry blocks.")
+        assert(t.companion == nil or type(t.companion) == "number" and t.companion >= 0
+            and t.companion <= 200 and t.companion == math.floor(t.companion), "Invalid saved rotation companion items.")
     end
     return record
 end
@@ -4301,7 +4324,7 @@ local function paragraphSet(paragraph, title, desc)
     end
 end
 local function pointText(key)
-    local point = App.config.points[key]
+    local point = key == "moveBox" and Core.transferDestination(App.config) or App.config.points[key]
     if not point then return "Not saved" end
     local text = point.world .. "  |  tile " .. point.x .. ", " .. point.y
     if point.standX then text = text .. "  |  stand " .. point.standX .. ", " .. point.standY end
@@ -4397,27 +4420,40 @@ local function refreshBlocks()
     end
     blockDropdown.Value = selectedLabel
     blockDropdown:Refresh(labels)
+    if ui.movingBlock then
+        ui.movingBlock.Value = selectedLabel
+        ui.movingBlock:Refresh(labels)
+    end
+end
+local function chooseBlock(label)
+    if App.syncingUI then return end
+    local id = blockLabels[label]
+    if id then
+        if App.job or App.configuring or App.pending > 0 then
+            notify("Stop the task before selecting another block.")
+            return
+        end
+        App.config.blockId = id
+        local previous = App.syncingUI
+        App.syncingUI = true
+        local ok, issue = pcall(function()
+            blockDropdown:Select(label)
+            if ui.movingBlock then ui.movingBlock:Select(label) end
+        end)
+        App.syncingUI = previous
+        if not ok then error(issue, 0) end
+    end
 end
 ui.points, ui.pointTitles = {}, {
     pnb = "PNB spot", blockBox = "Block storage (breaking world)", seedBox = "Seed storage (left box)",
     farmBox = "Farm storage", farmDoor = "Farm door to breaking world", breakDoor = "Breaking door to farm world",
-    plantBox = "Planting seed storage",
+    plantBox = "Planting seed storage", moveBox = "Destination Display Box",
 }
 ui.status = pnbTab:Paragraph({ Title = "Status", Desc = App.status })
 blockDropdown = pnbTab:Dropdown({
     Title = "Block to farm", Desc = "Select a block from your backpack; this also selects the Moving Drops block.",
     Values = {}, SearchBarEnabled = true,
-    Callback = function(label)
-        if App.syncingUI then return end
-        local id = blockLabels[label]
-        if id then
-            if App.job or App.configuring or App.pending > 0 then
-                notify("Stop the task before selecting another block.")
-                return
-            end
-            App.config.blockId = id
-        end
-    end,
+    Callback = chooseBlock,
 })
 pnbTab:Button({ Title = "Refresh inventory choices", Callback = uiAction(refreshBlocks) })
 pnbTab:Paragraph({ Title = "PNB layout", Desc = "Seed box - Empty - Player - Empty - Block box\nPlace one block directly above the player, break it, collect nearby drops, and repeat." })
@@ -4432,16 +4468,36 @@ App.runToggles.pnb = pnbTab:Toggle({ Title = "Place & Break", Value = false,
     Callback = function(enabled) setRunningEnabled("pnb", enabled) end })
 
 ui.transferStatus = transferTab:Paragraph({ Title = "Status", Desc = App.status })
-transferTab:Paragraph({ Title = "Moving Drops setup", Desc = "Use Harvest Drops to store blocks and matching seeds in Farm storage. Moving Drops carries blocks while holding up to 200 seeds, then returns seeds to the same box. Save both boxes and both linked doors. Start in the farm world." })
-for _, key in ipairs({ "farmBox", "farmDoor", "breakDoor" }) do
+transferTab:Paragraph({ Title = "Moving Drops setup", Desc = "Choose your crop and whether to move Blocks or Seeds. Save the Farm and destination Display Boxes. Moving Drops enters their worlds directly; start in either world. Mixed farm boxes are supported: only the chosen type reaches the destination, and held companion items return to the Farm box after the last trip." })
+ui.movingBlock = transferTab:Dropdown({ Title = "Crop to move", Values = {}, SearchBarEnabled = true,
+    Desc = "Uses the same selected crop as Place & Break and Harvest Drops.", Callback = chooseBlock })
+transferTab:Button({ Title = "Refresh crop choices", Callback = uiAction(refreshBlocks) })
+ui.movingItem = transferTab:Dropdown({ Title = "Item to move", Values = {"Blocks", "Seeds"},
+    Value = App.config.moving.item == "seeds" and "Seeds" or "Blocks",
+    Callback = function(value)
+        if type(value) == "table" then value = value[1] end
+        if App.syncingUI then return end
+        if App.job or App.configuring or App.pending > 0 then
+            notify("Stop the task before changing the transfer item.")
+            App.syncingUI = true
+            ui.movingItem:Select(App.config.moving.item == "seeds" and "Seeds" or "Blocks")
+            App.syncingUI = false
+            return
+        end
+        assert(value == "Blocks" or value == "Seeds", "Choose Blocks or Seeds.")
+        App.config.moving.item = value == "Seeds" and "seeds" or "blocks"
+        updatePoints()
+        saveSession()
+    end })
+for _, key in ipairs({ "farmBox", "moveBox" }) do
     ui.points[key] = transferTab:Paragraph({ Title = ui.pointTitles[key], Desc = "Not saved" })
     local pointKey = key
     transferTab:Button({ Title = "Save " .. ui.pointTitles[key], Desc = "Stand beside the target and press Save.",
-        Callback = uiAction(function() captureNearby(pointKey, pointKey == "farmBox" and "box" or "door") end) })
+        Callback = uiAction(function() captureNearby(pointKey, "box") end) })
 end
-transferTab:Paragraph({ Title = "Destination storage", Desc = "Use Save block storage on the Place & Break tab for the breaking world's destination box." })
+transferTab:Paragraph({ Title = "Destination storage", Desc = "Save the box you want to receive the chosen item. Existing configurations use PNB block storage for Blocks or PNB seed storage for Seeds until you save a destination here. Use separate PNB boxes for blocks and seeds when running Full Rotation." })
 App.runToggles.transfer = transferTab:Toggle({ Title = "Moving Drops", Value = false,
-    Desc = "On moves the blocks. Off stops it. Turns off automatically when the task ends.",
+    Desc = "On moves the chosen blocks or seeds. Off stops it. Turns off automatically when the task ends.",
     Callback = function(enabled) setRunningEnabled("transfer", enabled) end })
 
 local selectedProfile, profileNameInput, profileDropdown = nil, nil, nil
@@ -4469,7 +4525,7 @@ ui.harvestPoint = harvestTab:Paragraph({ Title = "Farm storage", Desc = pointTex
 harvestTab:Button({ Title = "Save Farm storage", Desc = "Stand beside the farm world's Display Box.",
     Callback = uiAction(function() captureNearby("farmBox", "box") end) })
 settingsControls.moveAfterHarvest = harvestTab:Toggle({ Title = "Start Moving Drops after collection", Value = App.config.options.moveAfterHarvest,
-    Desc = "Finish collecting every selected block, then begin the configured door transfer. Save both doors and destination storage first.",
+    Desc = "Finish harvest collection, then move the item selected on Moving Drops. Save the Farm and destination Display Boxes first.",
     Callback = function(value)
         if App.syncingUI then return end
         if App.job or App.configuring or App.pending > 0 then
@@ -4587,6 +4643,7 @@ local function syncUI()
                 control:Select(App.config.harvesting.method == "tractor" and "Dear John Tractor" or "Fist")
             else control:Set(App.config.options[key]) end
         end
+        ui.movingItem:Select(App.config.moving.item == "seeds" and "Seeds" or "Blocks")
         profileNameInput:Set(App.profile)
         if App.runtime then refreshBlocks() end
         refreshSeeds()
@@ -4752,8 +4809,17 @@ local function readResume()
         "Saved transfer is over six hours old. Check your backpack and clear it before restarting.")
     record.config = Core.validate(record.config)
     record.profile = Core.profileName(record.profile)
-    assert(type(record.cargo) == "number" and record.cargo >= 0 and record.cargo <= 200,
+    assert(type(record.cargo) == "number" and record.cargo >= 0 and record.cargo <= 200 and record.cargo == math.floor(record.cargo),
         "Invalid cargo in the saved transfer.")
+    assert(({pickup=true, deliver=true, returnSeeds=true, ["return"]=true,
+        pickupPending=true, depositPending=true, seedReturnPending=true})[record.phase], "Invalid saved transfer phase.")
+    record.item = record.item or record.config.moving.item
+    assert(record.item == "blocks" or record.item == "seeds", "Invalid saved Moving Drops item.")
+    for _, key in ipairs({"seeds", "companion"}) do
+        local value = record[key]
+        assert(value == nil or type(value) == "number" and value >= 0 and value <= 200 and value == math.floor(value),
+            "Invalid saved transfer " .. key .. ".")
+    end
     return record
 end
 local function resumeTransfer()
@@ -4909,6 +4975,7 @@ settingsTab:Button({ Title = "Copy diagnostics", Callback = function()
         .. "\nNavigation: " .. (App.navigationDebug or "no route requested")
         .. "\nLast refused harvest pickup: " .. (App.lastHarvestRefusal or "none")
         .. "\nHarvest collection recovery: " .. (App.harvestCollectionRecovery or "not requested")
+        .. "\nMoving Drops item: " .. App.config.moving.item .. "; destination: " .. pointText("moveBox")
         .. "\nHarvest storage return: " .. (App.harvestReturnDebug or "not requested")
         .. "\nRotation phase: " .. (App.rotationState and (App.rotationState.phase .. "; cycle " .. App.rotationState.cycle
             .. "; farm " .. App.rotationState.worldIndex .. "/" .. #App.config.planting.worlds) or "idle")

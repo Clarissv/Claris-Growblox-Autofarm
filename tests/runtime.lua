@@ -888,19 +888,20 @@ test("Missing saved cargo stops delivery instead of silently transferring less",
     rejects(function() f.hooks.runTransfer(1, {phase = "deliver", cargo = 50}) end, "cargo is missing")
     assert(f.app.stats.moved == 0 and f.app.resume == nil)
 end)
-test("A rejected return door preserves a usable return checkpoint", function()
+test("Rejected direct return-world entry preserves a usable return checkpoint", function()
     local f = fixture()
-    f.server = function(name)
-        assert(name == "UseDoor")
-        return false, "Door locked"
-    end
-    rejects(function() f.hooks.runTransfer(1, {phase = "return", cargo = 0}) end, "Door locked")
+    local entries = 0
+    f.world.enter = function(name) assert(name == "FARM"); entries=entries+1; return false,"World locked" end
+    f.server = function() error("Rejected world entry must not touch storage") end
+    rejects(function() f.hooks.runTransfer(1, {phase = "return", cargo = 0}) end, "World locked")
+    assert(entries == 3)
     assert(f.world.name == "BREAK" and f.app.resume.phase == "return" and f.app.resume.cargo == 0)
 end)
 test("Delivery transfers exact tracked cargo and preserves existing inventory", function()
     local f = fixture()
     f.inventory:add(954, 70)
     local serverCount, deposited = 70, 0
+    f.world.enter = function(name) assert(name == "FARM"); return false,"End test after delivery" end
     f.server = function(name, x, y, id, _, _, n)
         if name == "GetInventory" then return {slots = {{954, serverCount}}, capacity = 54} end
         if name == "DisplayItem" then
@@ -909,8 +910,7 @@ test("Delivery transfers exact tracked cargo and preserves existing inventory", 
             serverCount, deposited = serverCount - n, deposited + n
             return true, {}
         end
-        assert(name == "UseDoor")
-        return false, "End test after delivery"
+        error("Unexpected server request: " .. name)
     end
     rejects(function() f.hooks.runTransfer(1, {phase = "deliver", cargo = 50}) end, "End test after delivery")
     assert(deposited == 50 and f.inventory:count(954) == 20)
@@ -923,10 +923,10 @@ test("Moving Drops uses four inventory reads per trip and preserves existing blo
     f.world.name = "FARM"
     f.world.fg[8][21] = 12
     f.inventory:add(954, 20)
-    local held, reads, doors = 20, 0, 0
+    local held, reads, doors, entries = 20, 0, 0, 0
     local boxes = {FARM = {[20] = {{954, 300}}}, BREAK = {[12] = {}}}
     f.world.displays.get = function(x) return boxes[f.world.name][x] or {} end
-    f.world.enter = function(name) f.world.name = name; return true end
+    f.world.enter = function(name) entries=entries+1; f.world.name = name; return true end
     f.server = function(name, x, y, id, _, _, n)
         if name == "GetInventory" then
             reads = reads + 1
@@ -951,10 +951,10 @@ test("Moving Drops uses four inventory reads per trip and preserves existing blo
     end
     f.hooks.takeControls()
     f.hooks.runTransfer(1)
-    assert(f.app.stats.trips == 2 and f.app.stats.moved == 300 and doors == 4)
+    assert(f.app.stats.trips == 2 and f.app.stats.moved == 300 and doors == 0 and entries == 4)
     assert(held == 20 and f.inventory:count(954) == 20)
     assert(reads == 8, "Each withdrawal and deposit needs one before/after inventory pair, without outer repeats")
-    assert(os.clock() < 0.1, "Already-ready local door entries must not impose a fixed half-second wait")
+    assert(os.clock() < 0.1, "Already-ready direct entries must not impose a fixed delay")
 end)
 
 test("Door entry waits for destination readiness instead of a fixed delay", function()
@@ -971,6 +971,7 @@ test("A transfer resumed during avatar loading waits before touching storage", f
     f.avatar.active = false
     f.inventory:add(954, 50)
     local held, deposits = 50, 0
+    f.world.enter = function(name) assert(name == "FARM"); return false,"End after resumed delivery" end
     f.onWait = function() if os.clock() >= 0.15 then f.avatar.active = true end end
     f.server = function(name, x, y, id, _, _, n)
         assert(f.avatar.active and os.clock() >= 0.15, "No request should run before the arriving avatar is ready")
@@ -980,8 +981,7 @@ test("A transfer resumed during avatar loading waits before touching storage", f
             held, deposits = held - n, deposits + 1
             return true
         end
-        assert(name == "UseDoor")
-        return false, "End after resumed delivery"
+        error("Unexpected server request: " .. name)
     end
     rejects(function() f.hooks.runTransfer(1, {phase = "deliver", cargo = 50}) end, "End after resumed delivery")
     assert(deposits == 1 and f.app.stats.moved == 50 and held == 0)
@@ -3997,10 +3997,12 @@ local function harvestTransferFixture()
     f.app.config.points.farmDoor = {world = "FARM", x = 13, y = 8, standX = 10, standY = 8}
     f.app.config.points.blockBox.standX, f.app.config.points.breakDoor.standX = 10, 10
     f.worldBoxes = {FARM = {}, BREAK = {}}
-    f.doors = 0
+    f.doors, f.entries = 0, 0
     f.world.displays.get = function(x) return f.worldBoxes[f.world.name][x] or {} end
     f.world.enter = function(name)
         assert(name == "FARM" or name == "BREAK")
+        assert(f.app.stats.stashed > 0 and #f.drops == 0, "Transfer must wait for all harvest drops to be stored")
+        f.entries = f.entries+1
         f.world.name, f.avatar.active = name, true
         f.avatar.x, f.avatar.y = 10.5, 9
         return true
@@ -4035,7 +4037,7 @@ test("Harvest completion switches to Moving Drops and transports the stored harv
     local f = harvestTransferFixture()
     f.addDrop(1, 954, 23)
     f.hooks.start("harvest")
-    assert(not f.app.lastError and f.app.job == nil and f.doors == 2)
+    assert(not f.app.lastError and f.app.job == nil and f.doors == 0 and f.entries == 2)
     assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12], 954) == 23)
     assert(f.app.stats.harvested == 23 and f.app.stats.stashed == 23 and f.app.stats.moved == 23)
     assert(not f.app.runToggles.harvest.Value and not f.app.runToggles.transfer.Value)
@@ -5158,6 +5160,39 @@ test("Actual UI imports, loads, and resets profiles with the supported harvest d
     assert(not controls["Replant during harvest"].Value and not app.config.options.harvestPlanting)
 end)
 
+test("Moving Drops UI saves Seeds, restores it on import/load, and blocks changes during active cargo", function()
+    local f, app, controls, workers = actualUIFixture()
+    assert(not controls["Save Farm door to breaking world"] and not controls["Save Breaking door to farm world"])
+    assert(controls["Save Destination Display Box"] and controls["Save Farm storage"])
+    controls["Item to move"].Props.Callback({"Seeds"})
+    assert(app.config.moving.item == "seeds")
+    local session = f.services.HttpService:JSONDecode(f.files[app.dataFolder .. "/session.json"])
+    assert(session.config.moving.item == "seeds")
+    app.config.points.moveBox = {world="OTHER",x=4,y=8,standX=3,standY=8}
+    local record = f.hooks.Core.exportConfig(app.config,"Seed transfer","0.1.38")
+    controls["Configuration text"].Value = f.services.HttpService:JSONEncode(record)
+    controls["Import config"].Props.Callback()
+    workers[3]()
+    assert(app.config.moving.item == "seeds" and controls["Item to move"].Value == "Seeds")
+    assert(app.config.points.moveBox.world == "OTHER" and app.job == nil)
+    f.encoded[f.files[app.dataFolder .. "/profiles/Seed transfer.json"]] = f.hooks.Core.validate(app.config)
+    controls["Item to move"].Props.Callback("Blocks")
+    assert(app.config.moving.item == "blocks")
+    controls["Saved profiles"].Props.Callback("Seed transfer")
+    controls["Load selected profile"].Props.Callback()
+    workers[4]()
+    assert(app.config.moving.item == "seeds" and controls["Item to move"].Value == "Seeds")
+    app.job, app.pending, app.resume = "transfer",1,{phase="depositPending",item="seeds",cargo=100}
+    controls["Item to move"].Value = "Blocks"
+    controls["Item to move"].Props.Callback("Blocks")
+    assert(app.config.moving.item == "seeds" and controls["Item to move"].Value == "Seeds")
+    assert(app.pending == 1 and app.resume.cargo == 100 and not app.syncingUI)
+    app.job, app.pending, app.resume = nil,0,nil
+    controls["New empty configuration"].Props.Callback()
+    workers[5]()
+    assert(app.config.moving.item == "blocks" and controls["Item to move"].Value == "Blocks")
+end)
+
 test("Harvest replanting toggle preserves active rotation and honors UI synchronization", function()
     local f, app, controls = actualUIFixture()
     local toggle = controls["Replant during harvest"]
@@ -5411,6 +5446,111 @@ test("A seed-only Farm box finishes without withdrawing its seeds and returns se
     f.hooks.takeControls(); f.hooks.runTransfer(1)
     assert(f.withdrawals == 0 and f.app.stats.trips == 0 and f.serverItems[955] == 0)
     assert(f.hooks.Core.storageCount(f.worldBoxes.FARM[20],955) == 530)
+end)
+
+test("Seeds transfer from a mixed Farm box using only two saved boxes and return held blocks", function()
+    for _, blocksFirst in ipairs({false,true}) do
+        local f = mixedTransferFixture(true)
+        f.app.config.moving.item = "seeds"
+        f.app.config.points.moveBox = f.app.config.points.blockBox
+        f.app.config.points.pnb, f.app.config.points.blockBox, f.app.config.points.seedBox = nil,nil,nil
+        f.app.config.points.farmDoor, f.app.config.points.breakDoor = nil,nil
+        if blocksFirst then f.worldBoxes.FARM[20] = {{954,430},{955,450}} end
+        f.worldBoxes.BREAK[12] = {{954,100}} -- The destination can already contain the matching block.
+        f.serverItems[954], f.serverItems[955] = 25,20
+        f.inventory:add(954,25); f.inventory:add(955,20)
+        local entries, enter, server = {}, f.world.enter, f.server
+        f.world.enter = function(name) entries[#entries+1]=name; return enter(name) end
+        f.server = function(name, ...)
+            assert(name ~= "UseDoor", "Moving Drops must use direct world entry")
+            return server(name, ...)
+        end
+        f.beforeDeposit = function(id)
+            if f.world.name == "BREAK" then assert(id == 955, "Only selected seeds may reach the destination") end
+        end
+        f.hooks.takeControls(); f.hooks.runTransfer(1)
+        assert(f.hooks.Core.itemCount(f.worldBoxes.BREAK[12],955) == 450)
+        assert(f.hooks.Core.itemCount(f.worldBoxes.BREAK[12],954) == 100)
+        assert(f.hooks.Core.itemCount(f.worldBoxes.FARM[20],955) == 0)
+        assert(f.hooks.Core.itemCount(f.worldBoxes.FARM[20],954) == 455)
+        assert(f.serverItems[955] == 20 and f.serverItems[954] == 0 and f.app.stats.moved == 450)
+        assert(f.app.stats.trips == 3 and #entries == 6 and f.app.pending == 0 and not f.app.resume)
+    end
+end)
+
+test("Moving Drops starts in the destination world and visits its source directly without a PNB setup", function()
+    local f = mixedTransferFixture()
+    f.app.config.points.moveBox = f.app.config.points.blockBox
+    f.app.config.points.pnb, f.app.config.points.blockBox, f.app.config.points.seedBox = nil,nil,nil
+    f.app.config.points.farmDoor, f.app.config.points.breakDoor = nil,nil
+    f.world.name = "BREAK"
+    local first, enter = nil,f.world.enter
+    f.world.enter = function(name) first=first or name; return enter(name) end
+    f.hooks.takeControls(); f.hooks.runTransfer(1)
+    assert(first == "FARM" and f.world.name == "FARM" and f.app.stats.moved == 430)
+    assert(f.hooks.Core.itemCount(f.worldBoxes.FARM[20],955) == 450 and not f.app.plantState)
+    assert(not f.files[f.app.dataFolder .. "/plant-resume.json"], "Transfer entry must not create a planting checkpoint")
+end)
+
+test("A block-only farm box leaves blocks untouched when Seeds is selected", function()
+    local f = mixedTransferFixture()
+    f.app.config.moving.item = "seeds"
+    f.worldBoxes.FARM[20] = {{954,430}}
+    f.serverItems[954]=80; f.inventory:add(954,80)
+    f.hooks.takeControls(); f.hooks.runTransfer(1)
+    assert(f.withdrawals == 0 and f.app.stats.moved == 0 and f.serverItems[954] == 0)
+    assert(f.hooks.Core.itemCount(f.worldBoxes.FARM[20],954) == 510)
+end)
+
+test("A selected seed trip saves its cargo and companion blocks across a world-change script reload", function()
+    local f = mixedTransferFixture()
+    f.app.config.moving.item = "seeds"
+    f.app.config.points.moveBox = f.app.config.points.blockBox
+    f.app.config.points.farmDoor, f.app.config.points.breakDoor = nil,nil
+    f.app.job, f.app.jobToken = nil,nil
+    installToggles(f)
+    f.env.ClarisGrowbloxLoaderURL = "https://raw.githubusercontent.com/Clarissv/Claris-Growblox-Autofarm/main/loader.lua"
+    local queued, enter = 0,f.world.enter
+    queue_on_teleport = function(code)
+        assert(code:find("ClarisGrowbloxAutoResume",1,true)); queued=queued+1
+    end
+    f.world.enter = function(name)
+        enter(name)
+        if name == "BREAK" and f.app.stats.moved == 0 then return true,nil,true end
+        return true
+    end
+    f.onWait = function() if f.app.teleporting then f.app.alive=false end end
+    f.hooks.start("transfer")
+    local runtime = f.app.runtime
+    local saved = f.services.HttpService:JSONDecode(f.files[f.app.dataFolder .. "/resume.json"])
+    assert(queued == 1 and saved.item == "seeds" and saved.phase == "deliver" and saved.cargo == 200 and saved.companion == 200)
+    assert(saved.config.moving.item == "seeds" and saved.config.points.moveBox.world == "BREAK")
+    assert(f.hooks.Core.itemCount(f.worldBoxes.BREAK[12],955) == 0)
+    f.hooks = f.reload()
+    f.app = f.hooks.App
+    f.app.runtime, f.app.config, f.app.profile = runtime,saved.config,saved.profile
+    f.world.enter, f.onWait = enter,nil
+    f.hooks.start("transfer",saved)
+    queue_on_teleport = nil
+    assert(not f.app.lastError,f.app.lastError)
+    assert(f.app.stats.moved == 450 and f.hooks.Core.itemCount(f.worldBoxes.BREAK[12],955) == 450)
+    assert(f.hooks.Core.itemCount(f.worldBoxes.BREAK[12],954) == 0)
+    assert(f.hooks.Core.itemCount(f.worldBoxes.FARM[20],954) == 430 and f.serverItems[954] == 0)
+    assert(not f.app.resume and f.app.pending == 0 and not f.app.plantState)
+end)
+
+test("An interrupted selected seed deposit retains both item types and cannot replay its mutation", function()
+    local f = mixedTransferFixture()
+    f.app.config.moving.item = "seeds"
+    f.app.config.points.moveBox = f.app.config.points.blockBox
+    f.beforeDeposit = function(id)
+        if f.world.name == "BREAK" then assert(id == 955); error("Seed destination denied") end
+    end
+    f.hooks.takeControls()
+    rejects(function() f.hooks.runTransfer(1) end,"Seed destination denied")
+    assert(f.app.resume.item == "seeds" and f.app.resume.phase == "depositPending" and f.app.resume.cargo == 200)
+    assert(f.serverItems[955] == 200 and f.serverItems[954] == 200 and f.app.pending == 0)
+    rejects(function() f.hooks.runTransfer(1,f.app.resume) end,"Invalid transfer resume phase")
 end)
 
 test("An interrupted mixed withdrawal retains the pending checkpoint and both item types", function()
@@ -5821,6 +5961,20 @@ test("Combined rotation loads PNB seeds and replants both ripe farms during harv
     assert(not f.app.lastError,f.app.lastError)
     assert(#f.harvests==10 and #f.plants==10 and f.app.stats.planted==10 and f.pnbBlocks==0)
     assert(f.hooks.Core.storageCount(f.worldBoxes.BREAK[12],954)==410)
+end)
+
+test("Full Rotation transports blocks to PNB independently of standalone Seeds and destination settings", function()
+    local f = rotationFixture()
+    fillGrowingFarms(f,{FARM=0,FARM2=0})
+    f.app.config.moving.item = "seeds"
+    f.app.config.points.moveBox = f.app.config.points.farmBox
+    f.afterWait = function() if f.app.stats.cycles == 1 then f.app:stop() end end
+    f.hooks.start("rotation")
+    assert(not f.app.lastError,f.app.lastError)
+    assert(#f.harvests == 10 and f.app.stats.moved == 10)
+    assert(f.hooks.Core.itemCount(f.worldBoxes.BREAK[12],954) == 410)
+    assert(f.hooks.Core.itemCount(f.worldBoxes.BREAK[12],955) == 0)
+    assert(f.hooks.Core.itemCount(f.worldBoxes.FARM[0],954) == 0)
 end)
 
 test("Rotation retries combined harvest collection before leaving a newly replanted farm", function()

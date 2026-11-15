@@ -86,16 +86,45 @@ test("PNB requires both boxes in the same world and exact left/right layout", fu
     config.points.blockBox.y = 7
     rejects(function() Core.checkSetup(config, "pnb", items) end, "Layout")
 end)
-test("Transfer requires farm and breaking doors to match their own worlds", function()
+test("Moving Drops requires only two boxes in different worlds and ignores legacy doors", function()
     local config = setup()
     config.points.farmDoor.world = "BREAK"
-    rejects(function() Core.checkSetup(config, "transfer", items) end, "Farm storage")
+    assert(Core.checkSetup(config, "transfer", items))
     config = setup()
     config.points.breakDoor.world = "FARM"
-    rejects(function() Core.checkSetup(config, "transfer", items) end, "Block storage")
+    assert(Core.checkSetup(config, "transfer", items))
+    config.points.farmDoor, config.points.breakDoor, config.points.pnb, config.points.seedBox = nil,nil,nil,nil
+    assert(Core.checkSetup(config, "transfer", items))
     config = setup()
     config.points.farmBox.world, config.points.farmDoor.world = "BREAK", "BREAK"
     rejects(function() Core.checkSetup(config, "transfer", items) end, "different")
+end)
+
+test("Moving Drops preserves its item and destination through validation and older profiles default to blocks", function()
+    local config = setup()
+    config.moving.item = "seeds"
+    config.points.moveBox = box("DESTINATION",5,7)
+    config.points.pnb, config.points.blockBox, config.points.seedBox, config.points.farmDoor, config.points.breakDoor = nil,nil,nil,nil,nil
+    local saved = Core.validate(config)
+    assert(saved.moving.item == "seeds" and Core.transferDestination(saved).world == "DESTINATION")
+    assert(Core.checkSetup(saved,"transfer",items))
+    saved.points.moveBox.x = 9
+    assert(config.points.moveBox.x == 5)
+    config.moving = nil
+    assert(Core.validate(config).moving.item == "blocks")
+    config.moving = {item="gems"}
+    rejects(function() Core.validate(config) end,"Moving Drops item")
+end)
+
+test("Legacy Moving Drops destinations follow the selected item until an explicit box is saved", function()
+    local config = setup()
+    assert(Core.transferDestination(config) == config.points.blockBox)
+    config.moving.item = "seeds"
+    assert(Core.transferDestination(config) == config.points.seedBox)
+    config.points.seedBox = nil
+    rejects(function() Core.checkSetup(config,"transfer",items) end,"destination Display Box")
+    config.points.moveBox = box("OTHER",2,3)
+    assert(Core.checkSetup(config,"transfer",items))
 end)
 test("Incomplete setup and unknown blocks cannot start", function()
     local config = setup()
